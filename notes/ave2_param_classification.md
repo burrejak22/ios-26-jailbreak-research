@@ -45,33 +45,49 @@ is **mid-session encoder-type mutation**, not an out-of-range parameter like Alp
   Lak453). Fingerprint: AppleAVE2+0xDA78, far=0x59, fixed-offset constant fill, NO arbitrary
   read/write. Known distinct from our trigger.
 - **CVE-2026-112468 / 112469 / 112470** — OOB writes via VideoToolbox (Hcamael).
-- **CVE-2026-112466** — OOB READ / kernel memory disclosure — the KASLR-defeat stage the chain
-  needs. **Top Ghidra priority.**
+- **CVE-2026-112466** — OOB READ — **kernel memory disclosure. This is the KASLR-defeat stage
+  our chain needs.** Highest-priority Ghidra target.
 - **CVE-2026-112689** — OOB write (Belman).
 
 ### Why our trigger is distinct from the published NTL repro (112705)
 
 1. Different parameter (AlphaLayerID=255 vs NumberOfTemporalLayers~16463)
 2. Different panic fingerprint: our DVA lands in the 0x100007xxxxx window (structured region),
-   crashes hit different sub-allocations on different encoder write channels (AXI_ID 0xc0/0xc1)
-3. **Deferred firing** — DART fault lands well after the userspace callback; published NTL repros
-   are synchronous, deterministic, fixed-offset fills
-4. Trigger value 255 exceeds the VPS bitstream field width (6 bits) — truncation question open
+   two crashes ~25 pages apart on different encoder channels (0xc0/0xc1)
+3. **Deferred/deferred-race firing** — DART fault lands seconds after userspace error — the
+   published repros documented no such deferral
+4. Trigger value (255) exceeds the VPS bitstream field width (6 bits) — the mod-64 truncation
+   question is still open (see truncation test)
 
 ---
 
-## CRASH TABLE
+## AVE2 Trigger / Crash Table
+
+### Status: AlphaLayerID=255 CONFIRMED as isolated trigger (2026-11-13 reattribution)
+
+Prior attribution was timing-misattributed. Alpha=255 is the real trigger, confirmed by idle-delay test.
+The panic fired long after the userspace callback error (-17691) printed — the DART fault is a **deferred
+DMA write**, not synchronous with the encode error.
 
 | # | Date/Time | Trigger | DVA | AXI_ID | Attribution confidence |
 |---|-----------|---------|-----|--------|-----------------------|
-| 1 | 2026-11-12 ~23:55 | Escalation sweep (cumulative Alpha 0-255, multi-session) | 0x100007d2a80 | 0xc1 | Low — cumulative, not isolatable |
-| 2 | 2026-11-13 ~00:42 | AlphaLayerID=255 (suspect 1), deferred fault; initially misattributed to Alpha64+RepFmt10 | 0x100007ec500 | 0xc0 | HIGH — reattributed 2026-11-13 |
-| 3 | 2026-11-13 (idle-wait session) | AlphaLayerID=255, delayed fire during idle wait, no follow-up press | (fill from .ips) | (fill from .ips) | HIGH — clean isolated protocol |
+| 1 | 2026-11-12 ~23:55 | Escalation sweep (cumulative Alpha 0-255, multi-session) | 0x100007d2a80 | 0xc1 | Low — not isolatable |
+| 2 | 2026-11-13 ~00:42 | AlphaLayerID=255 (suspect 1), deferred fault; initially misattributed to Alpha64+RepFmt10 | 0x100007ec500 | 0xc0 | **HIGH — isolated trigger confirmed** |
+| 3 | 2026-11-13 (idle-wait) | AlphaLayerID=255, delayed fire during idle wait | (capture from .ips) | (capture) | **HIGH — same clean protocol** |
 
 **DVA delta crashes 1 vs 2: -0x1BD80 (~25 pages apart), same 0x100007xxxxx region, different
 AXI_ID channels (0xc0 vs 0xc1)** — different hardware write channels likely = different DMA paths
 (parameter-set/bitstream output vs frame-data). Different sub-allocations of a structured mapping
 region = control surface, not noise.
+
+**Key methodological finding:** userspace encode error != safety. DART faults may fire seconds after the
+callback returns. Encode failures (-17691) do not mean no DMA occurred. Any "elimination" based on
+callback error alone is invalid without the 120-second wait window.
+
+**Deferral mechanism hypothesis (to verify in Ghidra):** encode is submitted with the poison parameter,
+firmware/hardware sets up an invalid DMA descriptor, the encode fails and the callback errors, but the
+descriptor executes later (teardown/flush/idle) when the surface is unmapped or the session is recycled,
+and that's when hardware writes OOB and DART traps.
 
 **Alpha64+RepFmt10 status: UNTESTED** (the 11/13 00:42 crash attributed to it was actually
 Alpha=255's deferred fault). Back in the queue.
@@ -108,6 +124,16 @@ Record DVA + AXI_ID per crash — deterministic DVA vs input = steerable primiti
 ### 2D. Ghidra (offline)
 26.6.2 AppleAVE2 kext — consumer of AlphaLayerID / VPS-extension fields; write
 side (this panic) AND read-back side (112466-style leak candidate).
+
+### Open questions (drive the next experiments)
+
+1. **Truncation test:** does kernel consume raw IOKit value (255) or bitstream-truncated
+   (255 & 0x3F = 63)? Single test, 3 reboots each. Decides primitive quality:
+   - Only 63 panics -> 1-element OOB (could still be groomable)
+   - 127/191/255 all panic -> raw value path, wide possibly steerable OOB
+2. **Deterministic DVA vs Alpha value mapping** — steerable primitive vs crash-only
+3. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
+   read result back to userspace (via encoded output or IOKit get)?
 
 ---
 

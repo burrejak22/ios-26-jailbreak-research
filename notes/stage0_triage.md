@@ -10,27 +10,51 @@
 Entry (remote or local) → Sandbox Escape → Kernel Exploit → Post-Exploitation
 ```
 
-### Primary Chain A: Direct to Kernel (shortest)
+### Primary Chain A (revised 2026-11-13)
 
-| Stage | CVE | Component | Bug Class | Status |
-|-------|-----|-----------|-----------|--------|
-| **App → Kernel** | CVE-2026-84607 | AppleAVE2 | Input validation → kernel OOB | **CHARACTERIZED** — PoC written |
-| **Kernel R/W** | CVE-2026-86916 | Kernel | UAF → kernel code exec | PARTIAL (VM subsystem indicators) |
-| **Persistence** | CVE-2026-86886 | TCC | Protected file modification | TRIAGE |
+**Stage 1 — Infoleak / KASLR defeat: AVE2 OOB read (CVE-2026-112466 candidate)**
 
-CVE-2026-84607 goes sandbox→kernel directly via VideoToolbox. No sandbox escape needed.
+| Factor | Detail |
+|--------|--------|
+| Trigger surface | Alpha layer ID / VPS extension fields |
+| Status | Not yet triggered; read-back route to userspace unverified |
+| Priority | **Top Ghidra target on AppleAVE2 26.6.2** |
+| Rationale | Only stage of this family that reads back to userspace — the chain needs it for KASLR defeat more than another write |
 
-### Primary Chain B: WebKit Entry
+**Stage 2 — Kernel write: AVE2 OOB write (Hcamael-family: 112468/9/70, 112705-adjacent)**
+
+| Factor | Detail |
+|--------|--------|
+| Trigger | **AlphaLayerID=255 — CONFIRMED, isolated, reproduces ~1 in 2 presses** (hit rate TBD) |
+| Type | Deferred DART fault (frame encode errors at -17691, OOB write lands later during idle/teardown) |
+| Status | **Primitive characterization in progress** |
+| Open questions | Truncation (raw vs bitstream value), DVA determinism |
+
+**Stage 3 — Kernel R/W: CVE-2026-86916 (kernel UAF)**
+
+| Factor | Detail |
+|--------|--------|
+| Status | Pending Ghidra (read primitives / leak candidates first) |
+| Note | Keep CVE-2026-84607 in doc as separate candidate — its trigger shape is **mid-session encoder-type mutation** (race property change against in-flight frames, not a single set+encode). PoC is an entirely different form factor. |
+
+**Stage 4 — Persistence: CVE-2026-86886 (TCC path traversal)**
+
+| Factor | Detail |
+|--------|--------|
+| Status | TRIAGE |
+
+### Chain B: WebKit Entry (WEAKENED — needs different sandbox escape)
 
 | Stage | CVE | Component | Bug Class | Status |
 |-------|-----|-----------|-----------|--------|
 | **Entry** | CVE-2026-112659 | WebKit/JSC | Type confusion → RCE | ANALYZED (Ghidra + candidate sites) |
-| **Sandbox Escape** | CVE-2026-43689 | XNU Kernel | chroot entitlement bypass | **CHARACTERIZED** — PoC written, needs device test |
+| **Sandbox Escape** | ~~CVE-2026-43689~~ | ~~XNU Kernel~~ | ~~chroot entitlement bypass~~ | **DEVICE TESTED: EPERM (uid 501)** |
 | **Kernel R/W** | CVE-2026-86916 | Kernel | UAF → kernel code exec | PARTIAL |
 | **Persistence** | CVE-2026-86886 | TCC | Protected file modification | TRIAGE |
 
-CVE-2026-43689 is reclassified as candidate sandbox escape (not direct root).
-chroot(2) buys sandbox path confusion on 26.6.2 — PoC must verify on device.
+CVE-2026-43689 **ruled out as sandbox escape** — device test confirmed EPERM for uid 501 apps.
+chroot(2) requires root (suser() gate). Demoted to post-root persistence aid. Chain B needs a
+different sandbox escape mechanism or must rely on Chain A's kernel entry.
 
 ### Alternate Entries
 
@@ -114,32 +138,30 @@ chroot(2) buys sandbox path confusion on 26.6.2 — PoC must verify on device.
 
 ---
 
-### CVE-2026-84607 — AVEVideoEncoder Race Condition → Kernel [PRIORITY 1]
+### CVE-2026-84607 — AVEVideoEncoder Race Condition → Kernel [DEPRIORITIZED]
 
 **Component:** AVEVideoEncoder (kernel driver)  
-**Bug class:** Race condition  
+**Bug class:** Race condition / state-consistency  
 **Impact:** Kernel code execution from sandboxed app  
 **Credit:** Ruslan Dautov  
 **Patched in:** iOS 26.7
 
-**Reachability:** YES — AVEVideoEncoder is accessible via VideoToolbox framework from sandboxed apps. Any app that can encode video can reach this driver. Key advantage: goes directly from sandbox to kernel, eliminating the need for a separate sandbox escape.
+**CORRECTION (2026-11-13):** 84607's actual fix is a per-frame **eEncType vs
+sSessionCfg.sEnc.eType state-consistency guard** — a race/type-confusion between encoder types
+("improved state management"). Its trigger shape is **mid-session encoder-type mutation**, not an
+out-of-range parameter value. The AlphaLayerID panic trigger is NOT this CVE — it belongs to the
+Hcamael-family bounds-validation batch (112468/9/70 candidates).
 
-**PoC derivability from patch diff:** MEDIUM-HIGH
-- Race conditions require understanding the timing window
-- The patch will show where locking was added or where the race was eliminated
-- AVEVideoEncoder is a hardware driver (IOKit user client), accessible via IOKit
-- Need to identify the specific IOExternalMethod or IOUserClient call that has the race
+**PoC form factor:** Race property change against in-flight frames (entirely different from the
+single set+encode pattern used for AlphaLayerID).
 
-**Exploitation complexity on arm64e:** MEDIUM
-- Race conditions require winning the race, but kernel races on iOS are often wide enough
-- Once won, gives kernel memory corruption → standard kernel exploit techniques
-- The driver runs in kernel context, so corruption gives direct kernel access
-- PAC protects kernel function pointers, but data-only attacks can bypass this
+**Status:** Deprioritized — Chain A Stage 2 now uses the confirmed AlphaLayerID OOB write
+(Hcamael-family). 84607 remains a viable alternative if the Hcamael trigger proves
+non-exploitable, but requires a dedicated race PoC.
 
-**Binary:** AVEVideoEncoder is a kernel extension (kext), NOT in dyld_shared_cache.  
-**Action:** Need to extract kernelcache from IPSW/OTA to get this kext.
+**Binary:** AVEVideoEncoder kext in kernelcache.
 
-**Verdict:** ✅ PROCEED — Critical chain component. Skip sandbox escape entirely.
+**Verdict:** HOLD — different PoC form factor needed. Not the confirmed panic trigger.
 
 ---
 

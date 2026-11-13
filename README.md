@@ -8,27 +8,30 @@ Security research targeting iOS 26.6.2 on iPhone 17 Pro (A19/t8150, arm64e) unde
 
 | CVE | Component | Bug Class | Chain Role | Status |
 |-----|-----------|-----------|------------|--------|
-| CVE-2026-84607 | AppleAVE2 | Input validation bypass | App → Kernel | PoC written |
+| CVE-2026-112466 | AppleAVE2 | OOB read | KASLR defeat (infoleak) | **Top Ghidra priority** |
+| CVE-2026-1124xx | AppleAVE2 | OOB write (Hcamael-family) | Kernel write primitive | **KERNEL PANIC CONFIRMED** |
+| CVE-2026-84607 | AppleAVE2 | Race/state-consistency | App → Kernel (alt) | Deprioritized — different trigger shape |
 | CVE-2026-43689 | XNU Kernel | chroot entitlement bypass | Post-root persistence | **DEVICE TESTED (EPERM)** |
 | CVE-2026-112659 | WebKit/JSC | Type confusion | Entry (Safari) | Analyzed |
 | CVE-2026-86916 | Kernel | UAF | Kernel R/W | Partial |
 | CVE-2026-86886 | TCC | Path traversal | Persistence | Under analysis |
 
-## Chain Architecture (Revised 2026-11-12)
+## Chain Architecture (Revised 2026-11-13)
 
-**Device testing confirmed CVE-2026-43689 requires root (uid 0) — NOT a sandbox escape.**
+**CVE attribution corrected:** The AlphaLayerID=255 kernel panic is NOT CVE-2026-84607.
+84607 is a mid-session encoder-type mutation race. Our trigger belongs to the Hcamael-family
+bounds-validation batch (CVE-2026-112468/9/70 candidates, fixed in 26.7.2).
 
 ```
 Chain A (PRIMARY):
-  CVE-2026-84607 (AppleAVE2, app → kernel via VideoToolbox)
-    → CVE-2026-86916 (kernel UAF → full R/W)
-    → Root (modify credentials)
-    → CVE-2026-43689 (chroot path confusion, post-root only)
-    → CVE-2026-86886 (TCC file writes for persistence)
+  Stage 1: CVE-2026-112466 (AppleAVE2 OOB read → KASLR defeat)  [NOT YET TRIGGERED]
+  Stage 2: Hcamael-family OOB write (AlphaLayerID=255 → deferred DART fault)  [CONFIRMED]
+  Stage 3: CVE-2026-86916 (kernel UAF → full R/W)
+  Stage 4: CVE-2026-43689 (chroot, post-root only) + CVE-2026-86886 (TCC persistence)
 
 Chain B (WEAKENED — needs different sandbox escape):
   CVE-2026-112659 (WebKit type confusion)
-    → [sandbox escape TBD — chroot ruled out]
+    → [sandbox escape TBD — chroot ruled out for uid 501]
     → CVE-2026-86916 (kernel UAF)
 ```
 
@@ -67,7 +70,7 @@ See [mac-scripts/RESULTS_GUIDE.md](mac-scripts/RESULTS_GUIDE.md) for interpretin
 ## Key Findings
 
 - **CVE-2026-43689 (DEVICE TESTED):** iOS 26.6.2 kernel lacks entitlement check but retains `suser()` root-uid gate. Sandboxed apps (uid 501) get EPERM. **Not a sandbox escape** — only exploitable from root-but-unentitled processes. Demoted to post-root persistence aid.
-- **CVE-2026-84607:** 97 new validation strings added in 26.7, 3 new checking functions. Unchecked H.265 VPS/SPS/PPS parameters used for kernel buffer sizing.
+- **AVE2 OOB (Hcamael-family):** AlphaLayerID=255 triggers deferred DART fault (kernel panic). NOT CVE-2026-84607 (which is a mid-session race). 97 new validation strings in 26.7.2, 3 new checking functions. Truncation test pending: does kernel consume raw IOKit value (wide OOB) or 6-bit bitstream value (narrow)?
 - **CVE-2026-112659:** DFG Spread optimization type confusion. `canDoFastSpread` receives Spread node directly; `globalObjectFor` resolves from CodeOrigin, not operand — cross-realm type confusion pattern matching bug 321705.
 - **A19 SPTM+MIE:** Memory Integrity Enforcement is new on A19, protecting kernel allocator backing store. Raises the bar significantly vs A15-A18.
 

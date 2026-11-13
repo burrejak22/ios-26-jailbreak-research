@@ -173,14 +173,21 @@ static NSMutableString *g_logBuffer = nil;
 static UITextView *g_logView = nil;
 static dispatch_queue_t g_logQueue = nil;
 
+static NSString *wallClock(void) {
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    return [fmt stringFromDate:[NSDate date]];
+}
+
 static void pocLog(NSString *msg) {
     if (!g_logBuffer) g_logBuffer = [NSMutableString new];
     if (!g_logQueue) g_logQueue = dispatch_queue_create("poc.log", DISPATCH_QUEUE_SERIAL);
 
-    NSLog(@"%@", msg);
+    NSString *stamped = [NSString stringWithFormat:@"[%@] %@", wallClock(), msg];
+    NSLog(@"%@", stamped);
 
     dispatch_async(g_logQueue, ^{
-        [g_logBuffer appendString:msg];
+        [g_logBuffer appendString:stamped];
         [g_logBuffer appendString:@"\n"];
         NSString *snapshot = [g_logBuffer copy];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -2136,9 +2143,20 @@ static void runNarrowPanic(void) {
 
     pocLog(@"");
     if (survived) {
-        PASS(@"=== %@: SURVIVED (frame delivered, no DART fault) ===", testLabel);
+        INFO(@"=== %@: encode callback received ===", testLabel);
     } else {
-        FAIL(@"=== %@: NO OUTPUT (encode failed, not a clean test) ===", testLabel);
+        INFO(@"=== %@: encode error (does NOT clear suspect) ===", testLabel);
+    }
+    pocLog(@"");
+
+    LOG(@"*** MANDATORY 120-SECOND IDLE WAIT ***");
+    LOG(@"Encode error does NOT mean safe. DART fault is deferred.");
+    idleWait(120, [NSString stringWithFormat:@"narrow test: %@", testLabel]);
+
+    if (survived) {
+        PASS(@"=== %@: SURVIVED 120s idle — likely safe ===", testLabel);
+    } else {
+        PASS(@"=== %@: SURVIVED 120s idle (encode errored, no deferred fault) ===", testLabel);
     }
 
     int next_idx = g_narrowIndex % (int)testLabels.count;
@@ -2219,17 +2237,25 @@ static BOOL phase2Encode(int alphaID, NSString *label) {
 }
 
 static void idleWait(int seconds, NSString *reason) {
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    NSString *startTime = [fmt stringFromDate:[NSDate date]];
+    NSDate *endDate = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    NSString *endTime = [fmt stringFromDate:endDate];
+
     INFO(@"=== IDLE WAIT: %ds (%@) ===", seconds, reason);
+    INFO(@"Started: %@  Expected end: %@", startTime, endTime);
     INFO(@"Deferred DART fault fires during this wait if triggered.");
     INFO(@"If phone reboots during countdown, the previous encode was the trigger.");
     pocLog(@"");
     for (int i = seconds; i > 0; i--) {
-        if (i % 10 == 0 || i <= 5) {
+        if (i % 30 == 0 || i <= 5) {
             INFO(@"... %ds remaining (no panic so far)", i);
         }
         [NSThread sleepForTimeInterval:1.0];
     }
-    PASS(@"=== IDLE WAIT COMPLETE: no DART fault in %ds ===", seconds);
+    PASS(@"=== IDLE WAIT COMPLETE: no DART fault in %ds (ended %@) ===",
+        seconds, [fmt stringFromDate:[NSDate date]]);
     pocLog(@"");
 }
 
@@ -2274,16 +2300,44 @@ static void runPhase2_IdleWait(void) {
     }
     pocLog(@"");
 
-    LOG(@"*** 120-SECOND IDLE WAIT BEGINS NOW ***");
+    LOG(@"*** 5-MINUTE IDLE WAIT BEGINS NOW ***");
     LOG(@"DO NOT TOUCH THE PHONE. DO NOT PRESS ANY BUTTON.");
     LOG(@"If panic fires during this wait = CONFIRMED deferred DART.");
     pocLog(@"");
 
-    idleWait(120, @"deferred DART window for Alpha=255");
+    idleWait(300, @"deferred DART window for Alpha=255 (5 min)");
 
-    PASS(@"=== SURVIVED 120s — no deferred fault this run ===");
-    INFO(@"Note: the DART fault is probabilistic (race condition).");
-    INFO(@"Run this test 5x total to establish reliability.");
+    PASS(@"=== SURVIVED 300s idle — no deferred fault ===");
+    INFO(@"Now testing: create/teardown one compression session...");
+    INFO(@"If panic fires NOW = fault armed by encode, fired by lifecycle.");
+    pocLog(@"");
+
+    {
+        VTCompressionSessionRef probeSession = NULL;
+        NSDictionary *probeSpec = @{
+            (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+            (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+        };
+        OSStatus probeStatus = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)probeSpec, NULL, kCFAllocatorDefault,
+            narrowCallback, NULL, &probeSession);
+        if (probeStatus == noErr) {
+            INFO(@"Probe session created — invalidating now...");
+            VTCompressionSessionInvalidate(probeSession);
+            CFRelease(probeSession);
+            INFO(@"Probe session destroyed. Waiting 60s for lifecycle-triggered fault...");
+            idleWait(60, @"post-lifecycle DART window");
+            PASS(@"=== No lifecycle-triggered fault ===");
+        } else {
+            FAIL(@"Probe session creation failed: %d (AVE2 may be wedged)", (int)probeStatus);
+        }
+    }
+    pocLog(@"");
+
+    INFO(@"RESULT: Alpha=255 did NOT panic this run.");
+    INFO(@"The DART fault is probabilistic (race condition).");
+    INFO(@"Run this test 5x total. Record hit rate + time-to-panic.");
     INFO(@"Collect .ips logs after any reboot during the wait.");
     pocLog(@"");
 
