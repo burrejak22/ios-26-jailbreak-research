@@ -69,16 +69,22 @@ Prior attribution was timing-misattributed. Alpha=255 is the real trigger, confi
 The panic fired long after the userspace callback error (-17691) printed — the DART fault is a **deferred
 DMA write**, not synchronous with the encode error.
 
-| # | Date/Time | Trigger | DVA | AXI_ID | Attribution confidence |
-|---|-----------|---------|-----|--------|-----------------------|
-| 1 | 2026-11-12 ~23:55 | Escalation sweep (cumulative Alpha 0-255, multi-session) | 0x100007d2a80 | 0xc1 | Low — not isolatable |
-| 2 | 2026-11-13 ~00:42 | AlphaLayerID=255 (suspect 1), deferred fault; initially misattributed to Alpha64+RepFmt10 | 0x100007ec500 | 0xc0 | **HIGH — isolated trigger confirmed** |
-| 3 | 2026-11-13 (idle-wait) | AlphaLayerID=255, delayed fire during idle wait | (capture from .ips) | (capture) | **HIGH — same clean protocol** |
+| # | Date/Time | Trigger | DVA | PTE | AXI_ID | Delay post-encode | Attribution confidence |
+|---|-----------|---------|-----|-----|--------|-------------------|----------------------|
+| 1 | 2026-11-12 ~23:55 | Escalation sweep (cumulative Alpha 0-255, multi-session) | 0x100007d2a80 | — | 0xc1 | unknown | Low — not isolatable |
+| 2 | 2026-11-13 ~00:42 | AlphaLayerID=255, deferred fault | 0x100007ec500 | — | 0xc0 | unknown | **HIGH — isolated** |
+| 3 | 2026-11-13 10:34 | AlphaLayerID=255, idle-wait protocol | 0x100007ecc00 | 0x1fb | 0xc0 | ~90s | **HIGH — .ips captured** |
+| 4 | 2026-11-13 10:43 | AlphaLayerID=255, idle-wait protocol | 0x10000710080 | 0x1c4 | 0xc0 | ~130s | **HIGH — .ips captured** |
 
-**DVA delta crashes 1 vs 2: -0x1BD80 (~25 pages apart), same 0x100007xxxxx region, different
-AXI_ID channels (0xc0 vs 0xc1)** — different hardware write channels likely = different DMA paths
-(parameter-set/bitstream output vs frame-data). Different sub-allocations of a structured mapping
-region = control surface, not noise.
+**All 4 DVAs in 0x100007xxxxx region** (~900KB span). PTE delta crashes 3 vs 4: 55 PTEs (55 pages).
+AXI_ID 0xc0 in 3 of 4 runs — likely the parameter-set/bitstream DMA channel.
+All faults are **PTE invalid exception on write** from `dart-ave` at `AppleT8110DART.cpp:2369`.
+
+**Deferral timing is variable** (90s and 130s post-encode) — confirms race/async trigger, not fixed timer.
+The DMA descriptor fires on some internal kernel event (flush/teardown/idle GC).
+
+**Panic string template (both identical except DVA/PTE):**
+`dart-ave: DART(DART) error: SID 0 PTE invalid exception on write of DVA <addr> (CTE 0x10 SEG 0 PTE <pte>) ERROR_SID_SUMMARY 0x00003100 AXI_ID 0xc0`
 
 **Key methodological finding:** userspace encode error != safety. DART faults may fire seconds after the
 callback returns. Encode failures (-17691) do not mean no DMA occurred. Any "elimination" based on
