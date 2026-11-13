@@ -830,9 +830,11 @@ echo "[3/6] Compiling for arm64 (iPhone)..."
     -framework Foundation \
     -framework VideoToolbox \
     -framework CoreMedia \
+    -framework CoreVideo \
     -framework AVFoundation \
     -framework IOKit \
     -fobjc-arc \
+    -Wno-deprecated-declarations \
     -O2 \
     -o "$WORK/JBPoC.app/JBPoC" \
     "$WORK/main.m"
