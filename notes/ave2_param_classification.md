@@ -124,12 +124,40 @@ NumberOfSlices:     1-16 OK, 64+ REJECTED (VT validates)
 ChromaQPOffset:     ALL REJECTED (not settable on this config)
 ```
 
+## Honest State of Play (Post-Tier 2 Probe)
+
+**Lesson from NumberOfTemporalLayers: SET OK ≠ stored, stored ≠ delivered.**
+
+| Property | Set OK | Readback Verified | Bitstream Verified | Status |
+|----------|--------|-------------------|-------------------|--------|
+| NTL=8 | YES | **NO (clamped to 1)** | n/a | **Dead** |
+| AlphaLayerID=255 | YES | pending | pending | Candidate |
+| RepFormatIndex=255 | YES | pending | pending | Candidate |
+| log2_max_minus4=13 | **NO** | n/a | n/a | **Dead** (VT rejects) |
+| NumberOfSlices=64 | **NO** | n/a | n/a | **Dead** (VT rejects) |
+| ChromaQPOffset=* | **NO** | n/a | n/a | **Dead** (all rejected) |
+| MVHEVCVideoLayerIDs | untested | pending | pending | Next candidate |
+| UserRPSForFaceTime | untested | pending | pending | Next candidate |
+| UserDPBFramesForFaceTime | untested | pending | pending | Next candidate |
+| UserParameterSetsIds | untested | pending | pending | Next candidate |
+
+**`Required*` properties may be match/filter constraints** ("find me the SPS with this ID") rather than construction inputs ("build the VPS with this ID"). The encoder may just fail to match or construct valid defaults regardless. Only bitstream analysis can distinguish.
+
+**Struct-typed properties (CFArrays)** are harder for VideoToolbox to silently clamp and flow closer to raw delivery. If the `Required*` pair turns out clamped, these are the next real candidates.
+
+## Verification Flow ("Verify Oracle" button)
+
+The new verification PoC:
+1. **BASELINE**: Encode with defaults, capture VPS/SPS hex dump
+2. **Test A**: Set AlphaLayerID=64, readback, encode, capture VPS/SPS hex
+3. **Test B**: Set RepFormatIndex=10, readback, encode, capture SPS hex
+4. **Test C**: Set struct-typed properties (MVHEVCVideoLayerIDs, UserDPB, UserRPS, UserParameterSets), readback, encode
+
+**Decision criteria:**
+- If VPS/SPS hex DIFFERS from baseline → value reached the bitstream → proven delivered to kernel
+- If IDENTICAL to baseline → encoder ignored the property (match filter or clamped internally)
+- Only properties passing BOTH readback AND bitstream verification are valid OOB targets
+
 ## Next Step
 
-**OOB VPS/SPS PoC** (added to deploy script as "OOB VPS/SPS" button):
-1. Set `AlphaLayerID = 64` (modest OOB, 1 past limit) + check readback
-2. Encode frame → if it reaches the kernel unclamped, kernel OOB
-3. Set `RepFormatIndex = 10` (5x past limit) + encode
-4. If no panic: escalate to higher values or try multi-view HEVC mode
-
-Have `.ips` log pulling ready — this is the real panic test.
+Run **"Verify Oracle"** button (cyan, safe — just encodes and parses output). Send back the full log. Properties that pass both checks become the real panic-test candidates.
