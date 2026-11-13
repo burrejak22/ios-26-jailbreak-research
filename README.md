@@ -9,17 +9,27 @@ Security research targeting iOS 26.6.2 on iPhone 17 Pro (A19/t8150, arm64e) unde
 | CVE | Component | Bug Class | Chain Role | Status |
 |-----|-----------|-----------|------------|--------|
 | CVE-2026-84607 | AppleAVE2 | Input validation bypass | App → Kernel | PoC written |
-| CVE-2026-43689 | XNU Kernel | chroot entitlement bypass | Sandbox escape | PoC written |
+| CVE-2026-43689 | XNU Kernel | chroot entitlement bypass | Post-root persistence | **DEVICE TESTED (EPERM)** |
 | CVE-2026-112659 | WebKit/JSC | Type confusion | Entry (Safari) | Analyzed |
 | CVE-2026-86916 | Kernel | UAF | Kernel R/W | Partial |
 | CVE-2026-86886 | TCC | Path traversal | Persistence | Under analysis |
 
-## Chain Architecture
+## Chain Architecture (Revised 2026-11-12)
+
+**Device testing confirmed CVE-2026-43689 requires root (uid 0) — NOT a sandbox escape.**
 
 ```
-Chain A (direct): CVE-2026-84607 (AppleAVE2) → CVE-2026-86916 (kernel UAF)
-Chain B (WebKit): CVE-2026-112659 → CVE-2026-43689 → CVE-2026-86916
-Persistence:      CVE-2026-86886 (TCC file modification)
+Chain A (PRIMARY):
+  CVE-2026-84607 (AppleAVE2, app → kernel via VideoToolbox)
+    → CVE-2026-86916 (kernel UAF → full R/W)
+    → Root (modify credentials)
+    → CVE-2026-43689 (chroot path confusion, post-root only)
+    → CVE-2026-86886 (TCC file writes for persistence)
+
+Chain B (WEAKENED — needs different sandbox escape):
+  CVE-2026-112659 (WebKit type confusion)
+    → [sandbox escape TBD — chroot ruled out]
+    → CVE-2026-86916 (kernel UAF)
 ```
 
 ## Structure
@@ -56,7 +66,7 @@ See [mac-scripts/RESULTS_GUIDE.md](mac-scripts/RESULTS_GUIDE.md) for interpretin
 
 ## Key Findings
 
-- **CVE-2026-43689:** iOS 26.6.2 kernel lacks `com.apple.private.vfs.chroot` entitlement check. Reclassified as sandbox escape (not root) — chroot only affects calling process. Real primitive is Seatbelt path confusion post-chroot.
+- **CVE-2026-43689 (DEVICE TESTED):** iOS 26.6.2 kernel lacks entitlement check but retains `suser()` root-uid gate. Sandboxed apps (uid 501) get EPERM. **Not a sandbox escape** — only exploitable from root-but-unentitled processes. Demoted to post-root persistence aid.
 - **CVE-2026-84607:** 97 new validation strings added in 26.7, 3 new checking functions. Unchecked H.265 VPS/SPS/PPS parameters used for kernel buffer sizing.
 - **CVE-2026-112659:** DFG Spread optimization type confusion. `canDoFastSpread` receives Spread node directly; `globalObjectFor` resolves from CodeOrigin, not operand — cross-realm type confusion pattern matching bug 321705.
 - **A19 SPTM+MIE:** Memory Integrity Enforcement is new on A19, protecting kernel allocator backing store. Raises the bar significantly vs A15-A18.

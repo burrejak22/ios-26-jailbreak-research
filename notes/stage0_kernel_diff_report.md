@@ -38,10 +38,23 @@ Binary diffing of kernelcaches and kexts between iOS 26.6.2 and 26.7.2 identifie
 
 ## CVE-2026-43689 — chroot(2) Entitlement Bypass
 
-**Status:** FULLY CHARACTERIZED  
-**Impact:** Root privileges from sandboxed app  
+**Status:** DEVICE TESTED — EPERM (2026-11-12)  
+**Impact:** ~~Root privileges from sandboxed app~~ Post-root persistence only  
 **Complexity:** Trivial (logic bug, no memory corruption)  
-**Chain role:** Stage 2 (Root)
+**Chain role:** ~~Stage 2 (Sandbox escape)~~ → Stage 4 (Post-root persistence aid)
+
+### Device Test Result
+
+Tested on iPhone 17 Pro, iOS 26.6.2, uid 501 sandboxed app:
+```
+chroot(2) FAILED: errno=1 (Operation not permitted)
+```
+
+**Two gates exist on chroot(2):**
+1. `suser()` root-uid check — requires uid 0. BLOCKS sandboxed apps (uid 501).
+2. Entitlement check — MISSING on 26.6.2 (added in 26.7.2).
+
+Sandboxed apps hit the root check first → EPERM. Bug is only exploitable from root-but-unentitled processes (system daemons). **NOT a sandbox escape.**
 
 ### Patch
 New strings in 26.7.2 kernel:
@@ -49,8 +62,6 @@ New strings in 26.7.2 kernel:
 com.apple.private.vfs.chroot
 %s: proc %s[%d] calls chroot(2) without entitlement
 ```
-
-The fix adds an entitlement check before allowing `chroot(2)`. On 26.6.2, any process can call chroot without the entitlement → directory-based privilege escalation.
 
 **Detailed analysis:** [CVE-2026-43689_analysis.md](CVE-2026-43689_analysis.md)
 
@@ -125,38 +136,40 @@ Cannot extract userspace binaries (WebKit, JSC, ImageIO, etc.) from 26.7.2 OTA o
 ### WebKit/JSC Source
 CVE-2026-112659 fix (Bugzilla 321982) under embargo. Not yet in WebKit open source.
 
-## Chain Architecture
+## Chain Architecture (Revised 2026-11-12 — post device test)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  JAILBREAK EXPLOIT CHAIN — iOS 26.6.2 iPhone 17 Pro    │
+│  Updated after CVE-2026-43689 device test (EPERM)       │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
-│  CHAIN A — Direct to kernel (shortest):                 │
+│  CHAIN A — PRIMARY (direct app → kernel):               │
 │  ┌─ CVE-2026-84607 (AppleAVE2) ★ CHARACTERIZED         │
 │  │  App → kernel OOB via VideoToolbox (no sandbox esc)  │
-│  └─→ CVE-2026-86916 (kernel UAF) PARTIAL               │
-│     Kernel heap corruption → full kernel R/W            │
+│  ├─→ CVE-2026-86916 (kernel UAF) PARTIAL               │
+│  │   Kernel heap corruption → full kernel R/W → root    │
+│  ├─→ CVE-2026-43689 (chroot) ★ DEVICE TESTED           │
+│  │   Post-root path confusion (requires uid 0 first)   │
+│  └─→ CVE-2026-86886 (TCC path traversal)               │
+│      Protected file writes → untethered persistence     │
 │                                                         │
-│  CHAIN B — WebKit entry:                                │
-│  ┌─ CVE-2026-112659 (WebKit/JSC) ANALYZED               │
+│  CHAIN B — WEAKENED (WebKit entry):                     │
+│  ┌─ CVE-2026-112659 (WebKit/JSC) ANALYZED              │
 │  │  Safari → arbitrary code exec in WebContent          │
-│  ├─ CVE-2026-43689 (chroot) ★ CHARACTERIZED             │
-│  │  Sandbox escape via Seatbelt path confusion           │
-│  │  (needs device test: Q1 chroot callable? Q2 confused?)│
-│  └─→ CVE-2026-86916 (kernel UAF) PARTIAL               │
+│  ├─ [SANDBOX ESCAPE TBD — chroot RULED OUT]             │
+│  │  Need alternative escape from WebContent sandbox     │
+│  └─→ CVE-2026-86916 (kernel UAF)                       │
 │     Kernel R/W from escaped context                     │
 │                                                         │
-│  PERSISTENCE (both chains):                             │
-│  └─ CVE-2026-86886 (TCC path traversal) UNDER ANALYSIS │
-│     Write to protected files → untethered jailbreak     │
-│     Calif.io used this for untethered JB on iOS 27.0.1  │
+│  KEY FINDING: CVE-2026-43689 has TWO gates:             │
+│  1. suser() root-uid check — blocks uid 501 (EPERM)    │
+│  2. Entitlement check — missing on 26.6.2 (the bug)    │
+│  Result: Only exploitable AFTER kernel → root.          │
 │                                                         │
-│  NOTE on CVE-2026-43689:                                │
-│  chroot(2) only affects the calling process.            │
-│  It does NOT give root. The real primitive is sandbox   │
-│  path confusion — Seatbelt rules may mis-resolve paths  │
-│  post-chroot. Must be verified on device.               │
+│  Calif.io used CVE-2026-86886 for untethered JB on     │
+│  iOS 27.0.1 at Hexacon (October 2026). Unpatched on    │
+│  26.6.2 — our best persistence primitive.               │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
