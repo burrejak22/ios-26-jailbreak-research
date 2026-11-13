@@ -220,13 +220,29 @@ SET OK, readback [0,100] (unclamped), but Test C's encode produced no callback o
 
 UserDPBFramesForFaceTime and UserRPSForFaceTime were rejected — "ForFaceTime" suffix suggests they need RealTime/low-latency session configuration.
 
-## Escalation Test Plan ("Escalate" button)
+## Escalation Test Plan ("Escalate" button) — COMPLETED
 
-1. **AlphaLayerID sweep** (0, 32, 62, 63, 64, 100, 200, 255):
-   - Bit-accurate VPS parser extracts `vps_max_layer_id` (6-bit field)
-   - If emitted `vps_max_layer_id` tracks the set value → the exact unchecked kernel consumer from the patch diff is being fed attacker-controlled data
-2. **Dedicated MVHEVCVideoLayerIDs oracle** — own session, own encode
-3. **RepFormatIndex + AlphaLayerID combined** — multi-layer mode may activate RepFormatIndex delivery
-4. **FaceTime mode retry** — RealTime + low-latency config for UserDPB/UserRPS
+1. **AlphaLayerID sweep** (0, 32, 62, 63, 64, 100, 200, 255): DONE — mod-64 wrapping confirmed
+2. **Dedicated MVHEVCVideoLayerIDs oracle**: DONE — no encode output (needs isolation)
+3. **RepFormatIndex + AlphaLayerID combined**: DONE — RepFormatIndex ignored in single-layer
+4. **FaceTime mode retry**: DONE — UserDPB/UserRPS rejected
 
-**Next after escalation:** If `vps_max_layer_id=255` when `AlphaLayerID=255` → panic-capable encode. Then Ghidra: find the consumer of `vps_max_layer_id` in the 26.6.2 kext and the array it indexes.
+**Result:** Escalation sweep triggered DART panic (kernel crash). See above.
+
+## Narrow Isolation Test ("Narrow Panic" button) — REBUILT (2026-11-13)
+
+**Problem:** First Narrow test (8 presses, all AlphaLayerID-only) produced NO data — AVE2 was wedged after the Escalation sweep's DART fault. All encodes failed with -12912.
+
+**Fix applied:** Rebuilt with three critical improvements:
+
+1. **Canary encode:** Before each suspect value, encodes with AlphaLayerID=0. If canary fails → "AVE2 is wedged, reboot phone." No false data from broken encoder.
+2. **Serialization:** `g_narrowRunning` flag prevents overlapping tests from rapid button presses.
+3. **Expanded suspect list** (ordered by likelihood):
+   - AlphaLayerID=255 (largest OOB if kernel uses raw value)
+   - Alpha64+RepFmt10 combined (multi-layer mode may activate RepFormatIndex consumer)
+   - MVHEVCVideoLayerIDs=[0,100] (dedicated encode, value 100 > 63 limit)
+   - AlphaLayerID=63/200/128/64/32 (individual isolation)
+
+**Protocol:** Reboot phone → deploy → press Narrow once → wait for "CANARY OK" + suspect result → press again for next. If phone reboots, the last-printed suspect label is the trigger. Compare DVA addresses across crashes for determinism.
+
+**Key insight from failed run:** The panic might NOT be from a single AlphaLayerID. Could be: combined AlphaLayerID+RepFormatIndex activating a VPS extension consumer, MVHEVCVideoLayerIDs, or cumulative multi-session heap pressure pushing a wild write past DART mapping boundary.
