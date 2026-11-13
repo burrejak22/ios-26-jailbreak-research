@@ -167,23 +167,104 @@ sentinel that the driver treats as "invalid/reserved."
 Phase 2A already confirmed the fault is live with 3/3 panics at variable deferral (90–130s).
 Phase 2C confirmed 254 (one below) never panics. No further control needed.
 
-### 2E. Ghidra (offline) — NEXT PRIORITY
-26.6.2 AppleAVE2 kext — the search target is now maximally narrowed:
-1. Find the `== 0xFF` (or `== 255`) comparison on AlphaLayerID in the encode path
-2. Trace the -17691 error/rejection branch from that comparison
-3. Identify where the DMA descriptor cleanup fails — the armed descriptor that fires
-   during idle causing the deferred DART fault
-4. CVE-2026-112466 (OOB READ for KASLR defeat) — trace whether any encode error path
-   leaks kernel pointers back to userspace via IOKit get or encoded output buffer
+### 2E-0. Session Teardown Test — NEXT ON-DEVICE EXPERIMENT
+**Goal:** Collapse the 90–130s deferral window and identify the exact trigger mechanism.
+
+After the failed Alpha=255 encode (-17691 returned), instead of waiting idle:
+
+- **Run A:** Immediately `VTCompressionSessionInvalidate` / destroy the session, wait 30s.
+- **Run B:** Encode a clean frame on the same session (valid AlphaLayerID), then wait.
+- **Run C:** Leave idle (existing baseline, 90–130s panic).
+
+**Prediction table:**
+
+| Result | Meaning |
+|--------|---------|
+| A panics quickly (~seconds after invalidate) | Descriptor fires on teardown → armed-descriptor confirmed, deferral becomes deterministic and fast (~10s test cycle) |
+| A never panics, B panics | Descriptor fires on next-use/flush → the "wait" is really "next descriptor submission" |
+| Only C panics | True idle timer (power-state / DPB drain / firmware GC) → check whether idle sleep event correlates |
+
+If A works, the test protocol drops from 120s to ~10s — massive throughput improvement for all
+downstream testing including regression checks during Ghidra analysis.
+
+### 2E-1. Output Buffer Diff (infoleak test) — ON-DEVICE, NO GHIDRA NEEDED
+**Goal:** Test whether the -17691 error path leaks stale firmware/kernel data to userspace.
+
+After a failed Alpha=255 encode, dump every output buffer / metadata the session exposes:
+- CMSampleBuffer output (if any partial data returned)
+- IOSurface backing the output pixel buffer
+- Any IOKit properties readable post-failure
+
+Diff byte-by-byte against a clean-failure baseline (e.g., an encode that fails for a different
+reason like invalid dimensions). If the abort path leaves stale firmware-written data in an
+output surface, that's the CVE-2026-112466 infoleak — KASLR defeat without Ghidra.
+
+### 2E. Ghidra (offline) — AFTER ON-DEVICE TESTS
+26.6.2 AppleAVE2 kext — the search target is maximally narrowed.
+
+**Setup:** Extract kext from kernelcache (kmutil/ipsw/ktool, target com.apple.driver.AppleAVE2
+from iPhone18,1 23G90 kernelcollection). Load arm64 binary in Ghidra, auto-analyze.
+
+**Three search anchors (priority order):**
+
+1. **The 0xFF compare** — search for `CMP Wn, #0xFF` (or #255) near property-parse code.
+   The AlphaLayerID path is VideoToolbox → IOKit property route, so look near OSNumber /
+   property getter calls. The check is on the full 8-bit value (254 survives = not a mask).
+
+2. **The -17691 constant** — signed 32-bit: 0xFFFFBB6D, immediate: 0xBB6D. Search for
+   `MOV W, #0xBB6D` or `MVN` pattern. The function returning this is the error site —
+   walk backward to the 0xFF check that routes there.
+
+3. **The deferred trigger** — 90–130s consistency suggests timer/watchdog/reclaim callback.
+   Search for `IOInterruptEventSource` / `IOTimerEventSource` setup, or thread-call
+   timeouts in the ~2-minute range touching AVE2 DMA descriptors on the error path.
+
+**The money question:** Compare success-path teardown (after clean 254 encode) vs -17691
+error-path teardown. The diff contains a descriptor free / channel disarm / interrupt-disable
+that the error path skips — that's the bug and the exploit primitive.
+
+**Sentinel semantics caveat:** 0xFF as a reserved marker may mean "driver thinks this field is
+unset" — firmware config may contain an uninitialized/stale layer pointer rather than an OOB
+index. At the == 0xFF cmp, trace what value flows into the descriptor on that branch:
+"uninitialized struct field" and "OOB index" produce the same DART fault but different
+exploitability profiles.
+
+**Firmware caveat:** If the 0xFF check isn't in the kext, the hunt moves to
+VideoToolbox.framework (userspace) or the AVE firmware binary (encoder's own processor).
+Start with the kext — smallest surface.
+
+### DVA Structure Observation (from crash logs)
+Crashes 2 and 3 on AXI_ID 0xc0 with ~55 PTEs apart; crash 1 on 0xc1 ~25 pages from crash 2.
+Two channels + consistent DVA region strongly suggests both channels write the same fixed offset
+from different base allocations. In Ghidra, look for a shared cleanup routine taking the channel
+context as an argument — that's one bug in two instantiations, not two separate bugs.
+
+### Exploitability Assessment (current state)
+**Current primitive:** A deferred, fixed-target OOB write. DVAs cluster in a ~900KB window with
+25-page spacing on two channels. If the write offset is a fixed constant relative to a buffer
+(like CVE-2026-112705's far=0x59 fixed-offset fill), this alone may not be arbitrarily
+controllable.
+
+Alpha=255 is a single value — it can't steer anything by itself. For offset control, a second
+parameter (RepFormatIndex? MVHEVCVideoLayerIDs?) would need to change the layout the descriptor
+indexes into. This is testable but lower priority than the infoleak.
+
+**The leak is the milestone:** CVE-2026-112466 (OOB read) remains top priority for KASLR defeat
+/ Chain A Stage 1. The output buffer diff test (2E-1) may find it without Ghidra.
 
 ### Open questions (updated after boundary sweep)
 
 1. **ANSWERED: Truncation test** — neither raw nor 6-bit. The fault is error-path-specific.
 2. **ANSWERED: Acceptance boundary** — exact 0xFF sentinel. Every value 0–254 is accepted;
    only 255 triggers -17691 rejection and the subsequent deferred DART fault.
-3. **Error-path anatomy:** what does the -17691 abort path do differently with DMA descriptors
+3. **Deferral mechanism:** is it teardown-triggered, next-use-triggered, or idle-timer-triggered?
+   (2E-0 test — on-device, fast)
+4. **Infoleak:** does the -17691 abort path leave stale firmware data in userspace-accessible
+   buffers? (2E-1 test — on-device, no Ghidra needed)
+5. **Error-path anatomy:** what does the -17691 abort path do differently with DMA descriptors
    vs the clean encode path? (Ghidra target — maximally narrowed)
-4. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
+6. **Offset controllability:** can a second parameter steer the OOB write target? (post-Ghidra)
+7. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
    read result back to userspace (via encoded output or IOKit get)?
 
 ---
