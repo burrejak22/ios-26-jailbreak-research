@@ -1,0 +1,29 @@
+# Raw binaries (too large for git)
+binaries/
+*.aea
+*.ipsw
+*.dmg
+*.kernelcache
+
+# Ghidra project database (537MB+)
+ghidra/*.rep/
+ghidra/*.gpr
+ghidra/*.lock
+ghidra/*.lock~
+
+# Decompiled output (7MB)
+diffs/jsc_type_confusion_decompiled.c
+
+# Symbol dumps (10MB+)
+jsc_symbols.txt
+imcore_symbols.txt
+cache_images.txt
+
+# macOS artifacts
+.DS_Store
+__MACOSX/
+
+# Build artifacts
+*.o
+*.app/
+*.ipa
