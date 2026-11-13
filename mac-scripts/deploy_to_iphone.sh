@@ -2427,7 +2427,7 @@ static void runPhase2_Boundary(void) {
     // Known: 255 panics (deferred), 32/64 don't panic in 3s tests
     // Binary search: test mid-points with 120s waits
     // User runs this repeatedly; it cycles through the boundary values
-    static int boundaryValues[] = {128, 192, 160, 144, 136, 224, 240, 248};
+    static int boundaryValues[] = {254, 253, 252, 250, 245, 235, 200, 128};
     static int g_boundIdx = 0;
     int idx = g_boundIdx % 8;
     g_boundIdx++;
