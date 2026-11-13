@@ -680,6 +680,263 @@ static void testAVE2_IOKit(void) {
     IOServiceClose(conn);
 }
 
+// ============================================================
+// AVE2 Property Dictionary Dump
+// Enumerates all settable VTCompressionSession properties
+// to classify which of the 97 unchecked params are reachable.
+// ZERO RISK — read-only query, no encoding.
+// ============================================================
+
+static void dumpPropertyValue(NSString *key, CFTypeRef value, int indent) {
+    NSString *pad = [@"" stringByPaddingToLength:indent*2 withString:@" " startingAtIndex:0];
+    if (!value) {
+        INFO(@"%@%@: (null)", pad, key);
+        return;
+    }
+    CFTypeID tid = CFGetTypeID(value);
+    if (tid == CFStringGetTypeID()) {
+        INFO(@"%@%@: \"%@\"", pad, key, (__bridge NSString *)value);
+    } else if (tid == CFNumberGetTypeID()) {
+        double d;
+        CFNumberGetValue(value, kCFNumberFloat64Type, &d);
+        if (d == (long long)d) {
+            INFO(@"%@%@: %lld", pad, key, (long long)d);
+        } else {
+            INFO(@"%@%@: %g", pad, key, d);
+        }
+    } else if (tid == CFBooleanGetTypeID()) {
+        INFO(@"%@%@: %s", pad, key, CFBooleanGetValue(value) ? "YES" : "NO");
+    } else if (tid == CFDictionaryGetTypeID()) {
+        NSDictionary *dict = (__bridge NSDictionary *)value;
+        INFO(@"%@%@: {", pad, key);
+        for (NSString *k in dict) {
+            dumpPropertyValue(k, (__bridge CFTypeRef)dict[k], indent + 1);
+        }
+        INFO(@"%@}", pad);
+    } else if (tid == CFArrayGetTypeID()) {
+        NSArray *arr = (__bridge NSArray *)value;
+        INFO(@"%@%@: [%lu items]", pad, key, (unsigned long)arr.count);
+        int i = 0;
+        for (id item in arr) {
+            if (i >= 10) { INFO(@"%@  ... (%lu more)", pad, (unsigned long)(arr.count - 10)); break; }
+            dumpPropertyValue([NSString stringWithFormat:@"[%d]", i], (__bridge CFTypeRef)item, indent + 1);
+            i++;
+        }
+    } else {
+        INFO(@"%@%@: <%@>", pad, key, [(__bridge id)value description]);
+    }
+}
+
+static void runPropertyDump(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  AVE2 Property Dictionary Dump        ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+
+    INFO(@"Dumping all settable HEVC encoder properties...");
+    INFO(@"This classifies which params the app can control.");
+    pocLog(@"");
+
+    // Create HEVC session (same as PoC)
+    VTCompressionSessionRef session = NULL;
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 1920, 1080, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        compressionOutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Cannot create HEVC session: %d", (int)status);
+        return;
+    }
+    PASS(@"HEVC session created for property enumeration");
+
+    // 1. Dump supported properties dictionary
+    LOG(@"=== Supported Properties ===");
+    CFDictionaryRef propDict = NULL;
+    status = VTSessionCopySupportedPropertyDictionary(session, &propDict);
+    if (status != noErr || !propDict) {
+        FAIL(@"VTSessionCopySupportedPropertyDictionary failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    NSDictionary *props = (__bridge NSDictionary *)propDict;
+    INFO(@"Total settable properties: %lu", (unsigned long)props.count);
+    pocLog(@"");
+
+    // Sort keys for consistent output
+    NSArray *sortedKeys = [[props allKeys] sortedArrayUsingSelector:@selector(compare:)];
+
+    int classA = 0, classMaybe = 0;
+    for (NSString *key in sortedKeys) {
+        NSDictionary *info = props[key];
+        NSString *type = info[@"PropertyType"] ?: @"unknown";
+        NSNumber *readWriteStatus = info[@"ReadWriteStatus"];
+        NSString *rwStr = @"?";
+        if ([readWriteStatus isKindOfClass:[NSNumber class]]) {
+            int rw = readWriteStatus.intValue;
+            rwStr = (rw == 1) ? @"ReadOnly" : (rw == 3) ? @"ReadWrite" : [NSString stringWithFormat:@"0x%x", rw];
+        } else if ([readWriteStatus isKindOfClass:[NSString class]]) {
+            rwStr = (NSString *)readWriteStatus;
+        }
+
+        NSString *docStr = info[@"Documentation"] ?: @"";
+        NSNumber *minVal = info[@"MinimumValue"];
+        NSNumber *maxVal = info[@"MaximumValue"];
+
+        INFO(@"PROP: %@", key);
+        INFO(@"  Type: %@  RW: %@", type, rwStr);
+        if (minVal || maxVal) {
+            INFO(@"  Range: [%@ .. %@]", minVal ?: @"?", maxVal ?: @"?");
+        }
+        if (docStr.length > 0 && docStr.length < 200) {
+            INFO(@"  Doc: %@", docStr);
+        }
+
+        // Check for sub-properties
+        NSDictionary *subProps = info[@"SupportedValueList"];
+        if (subProps) {
+            NSArray *vals = (NSArray *)subProps;
+            if ([vals isKindOfClass:[NSArray class]] && vals.count <= 20) {
+                NSMutableString *valStr = [NSMutableString string];
+                for (id v in vals) {
+                    if (valStr.length > 0) [valStr appendString:@", "];
+                    [valStr appendFormat:@"%@", v];
+                }
+                INFO(@"  Values: [%@]", valStr);
+            }
+        }
+
+        // Classify
+        NSString *lk = [key lowercaseString];
+        if ([lk containsString:@"temporal"] || [lk containsString:@"bframe"] ||
+            [lk containsString:@"gop"] || [lk containsString:@"slice"] ||
+            [lk containsString:@"tile"] || [lk containsString:@"reference"] ||
+            [lk containsString:@"reorder"] || [lk containsString:@"layer"] ||
+            [lk containsString:@"max"] || [lk containsString:@"num"]) {
+            classA++;
+            INFO(@"  ** CLASSIFICATION: Likely Class A (session config, CVE-relevant) **");
+        }
+
+        pocLog(@"");
+    }
+
+    INFO(@"=== SUMMARY ===");
+    INFO(@"Total properties: %lu", (unsigned long)props.count);
+    INFO(@"CVE-relevant (Class A candidates): %d", classA);
+    pocLog(@"");
+
+    // 2. Also query current values of key properties we know about
+    LOG(@"=== Current Values of Key Properties ===");
+
+    NSArray *keyProps = @[
+        @"MaxKeyFrameInterval",
+        @"MaxKeyFrameIntervalDuration",
+        @"AllowFrameReordering",
+        @"MaxFrameDelayCount",
+        @"ProfileLevel",
+        @"H264EntropyMode",
+        @"RealTime",
+        @"MaxH264SliceBytes",
+        @"MaximizePowerEfficiency",
+        @"AllowTemporalCompression",
+        @"AllowOpenGOP",
+        @"AverageBitRate",
+        @"MoreFramesBeforeStart",
+        @"MoreFramesAfterEnd",
+        @"Quality",
+    ];
+
+    for (NSString *shortKey in keyProps) {
+        NSString *fullKey = [NSString stringWithFormat:@"com.apple.videotoolbox.videoencoder.%@", shortKey];
+        CFTypeRef val = NULL;
+        status = VTSessionCopyProperty(session, (__bridge CFStringRef)fullKey, kCFAllocatorDefault, &val);
+        if (status == noErr && val) {
+            dumpPropertyValue(shortKey, val, 0);
+            CFRelease(val);
+        }
+        // Also try without prefix
+        val = NULL;
+        status = VTSessionCopyProperty(session, (__bridge CFStringRef)shortKey, kCFAllocatorDefault, &val);
+        if (status == noErr && val) {
+            dumpPropertyValue(shortKey, val, 0);
+            CFRelease(val);
+        }
+    }
+
+    // 3. Try setting and reading TemporalLayer count (the off-by-one)
+    pocLog(@"");
+    LOG(@"=== Off-by-One Test: Temporal Layer Count ===");
+
+    // Try known property keys for temporal layers
+    NSArray *temporalKeys = @[
+        @"TemporalLayerCount",
+        @"MaxTemporalLayers",
+        @"NumberOfTemporalLayers",
+        @"BaseLayerFrameRate",
+        @"BaseLayerFrameRateFraction",
+    ];
+
+    for (NSString *tk in temporalKeys) {
+        for (int prefix = 0; prefix < 3; prefix++) {
+            NSString *fullKey;
+            if (prefix == 0) fullKey = tk;
+            else if (prefix == 1) fullKey = [NSString stringWithFormat:@"com.apple.videotoolbox.videoencoder.%@", tk];
+            else fullKey = [NSString stringWithFormat:@"TemporalCompression_%@", tk];
+
+            // Try to read
+            CFTypeRef val = NULL;
+            status = VTSessionCopyProperty(session, (__bridge CFStringRef)fullKey, kCFAllocatorDefault, &val);
+            if (status == noErr) {
+                if (val) {
+                    INFO(@"FOUND: %@ = %@", fullKey, (__bridge id)val);
+                    CFRelease(val);
+                } else {
+                    INFO(@"FOUND: %@ = (no value)", fullKey);
+                }
+            }
+
+            // Try to set various values including the off-by-one boundary
+            for (int testVal = 1; testVal <= 9; testVal++) {
+                status = VTSessionSetProperty(session, (__bridge CFStringRef)fullKey,
+                    (__bridge CFTypeRef)@(testVal));
+                if (status == noErr) {
+                    INFO(@"SET OK: %@ = %d %s", fullKey, testVal,
+                        testVal >= 8 ? "*** OVER PATCHED LIMIT ***" : "");
+                }
+            }
+        }
+    }
+
+    // 4. Check for any property with "tile" in the name (num_tile_columns_minus1 target)
+    pocLog(@"");
+    LOG(@"=== Tile/Slice Properties ===");
+    for (NSString *key in sortedKeys) {
+        NSString *lk = [key lowercaseString];
+        if ([lk containsString:@"tile"] || [lk containsString:@"slice"] ||
+            [lk containsString:@"entropy"]) {
+            NSDictionary *info = props[key];
+            INFO(@"TILE/SLICE: %@", key);
+            INFO(@"  Type: %@ RW: %@", info[@"PropertyType"] ?: @"?", info[@"ReadWriteStatus"] ?: @"?");
+        }
+    }
+
+    CFRelease(propDict);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    pocLog(@"");
+    INFO(@"Property dump complete. Copy logs for analysis.");
+    INFO(@"Long-press log → Select All → Copy");
+}
+
 static void runAVE2PoC(void) {
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════╗");
@@ -712,6 +969,7 @@ static void runAVE2PoC(void) {
 @property (strong) UIButton *chrootBtn;
 @property (strong) UIButton *ave2Btn;
 @property (strong) UIButton *bothBtn;
+@property (strong) UIButton *propDumpBtn;
 @property (strong) UIButton *exportBtn;
 @end
 
@@ -726,7 +984,7 @@ static void runAVE2PoC(void) {
     CGFloat btnH = 44;
     CGFloat gap = 8;
     CGFloat pad = 16;
-    CGFloat btnW = (w - pad * 2 - gap * 2) / 3;
+    CGFloat btnW = (w - pad * 2 - gap) / 2;
 
     self.chrootBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     self.chrootBtn.frame = CGRectMake(pad, top, btnW, btnH);
@@ -746,8 +1004,19 @@ static void runAVE2PoC(void) {
     [self.ave2Btn addTarget:self action:@selector(runAVE2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.ave2Btn];
 
+    CGFloat row2 = top + btnH + gap;
+
+    self.propDumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.propDumpBtn.frame = CGRectMake(pad, row2, btnW, btnH);
+    [self.propDumpBtn setTitle:@"Dump Props" forState:UIControlStateNormal];
+    self.propDumpBtn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
+    self.propDumpBtn.layer.cornerRadius = 8;
+    [self.propDumpBtn setTitleColor:UIColor.yellowColor forState:UIControlStateNormal];
+    [self.propDumpBtn addTarget:self action:@selector(runPropDump) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.propDumpBtn];
+
     self.bothBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.bothBtn.frame = CGRectMake(pad + (btnW + gap) * 2, top, btnW, btnH);
+    self.bothBtn.frame = CGRectMake(pad + btnW + gap, row2, btnW, btnH);
     [self.bothBtn setTitle:@"Run Both" forState:UIControlStateNormal];
     self.bothBtn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
     self.bothBtn.layer.cornerRadius = 8;
@@ -755,7 +1024,7 @@ static void runAVE2PoC(void) {
     [self.bothBtn addTarget:self action:@selector(runBoth) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.bothBtn];
 
-    CGFloat logTop = top + btnH + gap;
+    CGFloat logTop = row2 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -782,6 +1051,12 @@ static void runAVE2PoC(void) {
 - (void)runAVE2 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runAVE2PoC();
+    });
+}
+
+- (void)runPropDump {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runPropertyDump();
     });
 }
 
