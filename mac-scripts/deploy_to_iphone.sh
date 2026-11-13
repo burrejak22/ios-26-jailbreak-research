@@ -2069,6 +2069,8 @@ static BOOL narrowEncode(NSDictionary *spec, int alphaID, int repFmtIdx,
     return ok;
 }
 
+static void idleWait(int seconds, NSString *reason);
+
 static void runNarrowPanic(void) {
     if (g_narrowRunning) {
         INFO(@"Previous test still running — wait for it to finish.");
