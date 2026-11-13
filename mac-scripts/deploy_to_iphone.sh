@@ -1118,7 +1118,25 @@ static void dumpParamSetHex(const uint8_t *data, size_t len, NSString *label) {
     INFO(@"%@ (%zu bytes):\n          %@", label, len, hex);
 }
 
-// === Bit-accurate HEVC VPS parser ===
+// === Bit-accurate HEVC VPS parser with emulation prevention removal ===
+
+static uint8_t *strip_emulation_prevention(const uint8_t *src, size_t src_len, size_t *out_len) {
+    uint8_t *dst = (uint8_t *)malloc(src_len);
+    if (!dst) { *out_len = 0; return NULL; }
+    size_t di = 0;
+    for (size_t si = 0; si < src_len; si++) {
+        if (si + 2 < src_len && src[si] == 0 && src[si+1] == 0 && src[si+2] == 3) {
+            dst[di++] = 0;
+            dst[di++] = 0;
+            si += 2;
+        } else {
+            dst[di++] = src[si];
+        }
+    }
+    *out_len = di;
+    return dst;
+}
+
 typedef struct { const uint8_t *data; size_t len; size_t bit_pos; } BitReader;
 
 static uint32_t br_read(BitReader *br, int n) {
@@ -1142,9 +1160,17 @@ static uint32_t br_read_ue(BitReader *br) {
     return (1u << lz) - 1 + br_read(br, lz);
 }
 
-static void parseHEVCVPS(const uint8_t *data, size_t len) {
-    if (len < 6) { INFO(@"  VPS too short"); return; }
-    BitReader br = {data, len, 0};
+static void parseHEVCVPS(const uint8_t *raw, size_t raw_len) {
+    if (raw_len < 6) { INFO(@"  VPS too short"); return; }
+
+    size_t rbsp_len = 0;
+    uint8_t *rbsp = strip_emulation_prevention(raw, raw_len, &rbsp_len);
+    if (!rbsp) { INFO(@"  RBSP alloc failed"); return; }
+
+    INFO(@"  (raw %zu bytes → RBSP %zu bytes, %zu EP bytes removed)",
+        raw_len, rbsp_len, raw_len - rbsp_len);
+
+    BitReader br = {rbsp, rbsp_len, 0};
 
     br_read(&br, 1);
     uint32_t nal_type = br_read(&br, 6);
@@ -1153,8 +1179,8 @@ static void parseHEVCVPS(const uint8_t *data, size_t len) {
     INFO(@"  NAL type: %u (expect 32=VPS)", nal_type);
 
     uint32_t vps_id = br_read(&br, 4);
-    uint32_t base_internal = br_read(&br, 1);
-    uint32_t base_available = br_read(&br, 1);
+    br_read(&br, 1);
+    br_read(&br, 1);
     uint32_t max_layers_minus1 = br_read(&br, 6);
     uint32_t max_sub_layers_minus1 = br_read(&br, 3);
     uint32_t temporal_nesting = br_read(&br, 1);
@@ -1185,9 +1211,10 @@ static void parseHEVCVPS(const uint8_t *data, size_t len) {
     uint32_t ordering_present = br_read(&br, 1);
     uint32_t start_i = ordering_present ? 0 : max_sub_layers_minus1;
     for (uint32_t i = start_i; i <= max_sub_layers_minus1; i++) {
-        br_read_ue(&br);
-        br_read_ue(&br);
-        br_read_ue(&br);
+        uint32_t dpb = br_read_ue(&br);
+        uint32_t reorder = br_read_ue(&br);
+        uint32_t latency = br_read_ue(&br);
+        INFO(@"  sublayer[%u]: dpb=%u reorder=%u latency=%u", i, dpb, reorder, latency);
     }
 
     uint32_t vps_max_layer_id = br_read(&br, 6);
@@ -1200,15 +1227,58 @@ static void parseHEVCVPS(const uint8_t *data, size_t len) {
         PASS(@"  >>> OVER PATCH LIMIT! vps_max_layer_id=%u >= 63 <<<", vps_max_layer_id);
     }
 
-    for (uint32_t i = 1; i <= vps_num_layer_sets_minus1; i++)
+    for (uint32_t i = 1; i <= vps_num_layer_sets_minus1 && i < 64; i++)
         for (uint32_t j = 0; j <= vps_max_layer_id && j < 64; j++)
             br_read(&br, 1);
 
     uint32_t timing_present = br_read(&br, 1);
+    INFO(@"  vps_timing_info_present_flag: %u", timing_present);
+
     if (!timing_present) {
         uint32_t ext_flag = br_read(&br, 1);
         INFO(@"  vps_extension_flag: %u", ext_flag);
+
+        if (ext_flag && max_layers_minus1 > 0) {
+            INFO(@"  --- VPS Extension (multi-layer) ---");
+            if (br.bit_pos / 8 < rbsp_len) {
+                size_t ext_start = br.bit_pos;
+                uint32_t ext_alignment = br_read(&br, 1);
+                uint32_t splitting_flag = br_read(&br, 1);
+                INFO(@"  vps_extension_alignment: %u", ext_alignment);
+                INFO(@"  splitting_flag: %u", splitting_flag);
+
+                uint32_t num_scalability_types = 0;
+                uint32_t scalability_mask = 0;
+                for (int d = 0; d < 16; d++) {
+                    uint32_t bit = br_read(&br, 1);
+                    scalability_mask |= (bit << d);
+                    num_scalability_types += bit;
+                }
+                INFO(@"  scalability_mask: 0x%04x (%u types)", scalability_mask, num_scalability_types);
+
+                if (!splitting_flag) {
+                    for (uint32_t d = 0; d < num_scalability_types - 1 && d < 15; d++) {
+                        uint32_t dim_id_len = br_read(&br, 3);
+                        INFO(@"  dimension_id_len[%u]: %u", d, dim_id_len);
+                    }
+                }
+
+                uint32_t nuh_layer_id_present = br_read(&br, 1);
+                INFO(@"  vps_nuh_layer_id_present_flag: %u", nuh_layer_id_present);
+
+                for (uint32_t i = 1; i <= max_layers_minus1 && i < 64; i++) {
+                    uint32_t layer_nuh_id = 0;
+                    if (nuh_layer_id_present)
+                        layer_nuh_id = br_read(&br, 6);
+                    INFO(@"  layer_id_in_nuh[%u]: %u", i, layer_nuh_id);
+                }
+
+                INFO(@"  (parsed %zu extension bits)", br.bit_pos - ext_start);
+            }
+        }
     }
+
+    free(rbsp);
 }
 
 // Parse HEVC SPS header and extract key fields

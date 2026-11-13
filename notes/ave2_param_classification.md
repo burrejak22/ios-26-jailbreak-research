@@ -154,7 +154,31 @@ AlphaLayerID=64 VPS (39 bytes): 40 01 0c 11 ff ff 01 60 ...
 
 **Full chain:** property set → stored (readback 64) → structurally consumed (VPS reshaped, layers 0→1) → value-derived structure emitted. The encoder builds FROM AlphaLayerID, it doesn't just match-filter it.
 
-**Critical precision note:** The VPS shows `vps_max_layers_minus1=1` consistent with using AlphaLayerID as a layer id, but `vps_max_layer_id` (6 bits after sub-layer ordering) must be extracted bit-accurately to confirm it carries the attacker-controlled value. Per the patch diff, `vps_max_layer_id < 63` is the unchecked consumer.
+### Escalation Sweep Results (AlphaLayerID 0..255)
+
+**Parser bug found and fixed:** original parser didn't strip HEVC emulation prevention bytes (`00 00 03`), causing bit misalignment. Fixed parser strips EP bytes before parsing RBSP.
+
+**Raw hex analysis reveals mod-64 wrapping:**
+
+| AlphaLayerID | Byte 22 | Value (& 0x3F) | vps_max_layer_id (6-bit field) |
+|---|---|---|---|
+| 0 | c0 | 0 | 0 |
+| 32 | e0 | 32 | 32 |
+| 62 | fe | 62 | 62 |
+| 63 | ff | 63 | 63 |
+| 64 | c0 | 0 (wraps!) | 0 |
+| 100 | e4 | 36 | 36 |
+| 200 | c8 | 8 | 8 |
+| 255 | ? | 63 | 63 (predicted: 255 & 0x3F) |
+
+Pattern: `byte22 = 0xC0 | (AlphaLayerID & 0x3F) << 1`. The VPS `vps_max_layer_id` is a 6-bit field — values >=64 are truncated to 6 bits (mod 64).
+
+**Implication for OOB:** The VPS bitstream path can only deliver values 0-63. The patch bounds `vps_max_layer_id < 63`, so only value 63 triggers OOB — a **single-element OOB** through this path (index 63 in a 63-element array). However:
+1. The kernel might receive the FULL unclamped value through the IOKit config struct separately from the VPS bitstream
+2. The VPS extension (the extra 15 bytes) contains `layer_id_in_nuh[]` and other fields that may carry the value differently
+3. `AVE_HEVC_CheckVPSExtBounds` processes the VPS extension specifically — Ghidra analysis needed to determine the actual consumer
+
+**Next critical step:** Ghidra analysis of unpatched AppleAVE2 kext to find what array `vps_max_layer_id` indexes, and whether the kernel uses the VPS bitstream value or the IOKit config struct value.
 
 ### RepFormatIndex=10: Stored But Not Consumed
 
