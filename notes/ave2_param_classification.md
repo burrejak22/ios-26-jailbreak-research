@@ -104,41 +104,63 @@ Alpha=255's deferred fault). Back in the queue.
 
 **Code deployed: deploy_to_iphone.sh Phase 2 buttons (Idle Wait, Truncation, Boundary)**
 
-### 2A. Idle Wait (Alpha=255 repeatability)
-**Button: "Idle Wait"**
-Protocol: canary -> 15s cooldown -> Alpha=255 encode -> 120s countdown -> done.
-Run 5x. Record: time-to-panic (if any), .ips DVA+AXI_ID per crash.
-Goal: establish panic-rate probability and time-to-fire distribution.
-If panic fires during idle = race characterization (DMA descriptor executes on teardown/flush/idle).
-If no panic in 5x = the earlier panics were sequence-dependent, not value-dependent.
+### 2A. Idle Wait (Alpha=255 repeatability) — COMPLETE
+**Result: 2/2 panics. 100% panic rate with idle-wait protocol.**
+- Run 1: encode callback 10:32:27, panic ~10:34:00 (~90s delay)
+- Run 2: encode callback 10:41:18, panic 10:43:28 (~130s delay)
+- Both: DVA in 0x100007xxxxx, AXI_ID 0xc0, PTE invalid on write
+- Variable deferral (90s vs 130s) = async trigger, not fixed timer
+- .ips logs saved in `crashes/`
 
-### 2B. Truncation Test (raw vs 6-bit kernel consumption)
-**Button: "Truncation" (cycles through 63, 127, 191)**
-Protocol: canary -> 10s cooldown -> Alpha=N encode -> 120s wait.
-One value per button press. Reboot between panics.
-All three reduce to 63 in the 6-bit VPS field:
-- ALL panic -> kernel consumes the raw IOKit value -> wide OOB (~192 elements), steerable
-- Only 63 panics -> kernel consumes bitstream-truncated value -> single-element OOB
-- None panic (but 255 does) -> trigger requires the -17691 error path specifically
+### 2B. Truncation Test (raw vs 6-bit kernel consumption) — COMPLETE
+**Result: NONE panic → trigger requires the -17691 error path specifically.**
 
-### 2C. Boundary Sweep (minimum panicking value)
-**Button: "Boundary" (cycles through 128, 192, 160, 144, 136, 224, 240, 248)**
-Protocol: canary -> 10s cooldown -> Alpha=N encode -> 120s wait.
-Known: 255 panics, <=64 survives. Binary search for the threshold.
-Record DVA + AXI_ID per crash — deterministic DVA vs input = steerable primitive.
+| Value | mod-64 | Encode result | VPS vps_max_layer_id | Panic? |
+|-------|--------|---------------|---------------------|--------|
+| 63 | 63 | clean, callback OK | 63 (over limit) | NO |
+| 127 | 63 | clean, callback OK | 63 (over limit) | NO |
+| 191 | 63 | clean, callback OK | 63 (over limit) | NO |
+| 255 | 63 | **-17691 rejection** | not emitted | **YES (100%)** |
 
-### 2D. Ghidra (offline)
-26.6.2 AppleAVE2 kext — consumer of AlphaLayerID / VPS-extension fields; write
-side (this panic) AND read-back side (112466-style leak candidate).
+All three test values produced identical abnormal multi-layer VPS (vps_max_layer_id=63,
+vps_extension_flag=1, splitting_flag=1, scalability_mask=0x8007) — none triggered a DART fault.
 
-### Open questions (drive the next experiments)
+**Conclusion:** The DART fault is NOT caused by the VPS bitstream value or the layer-ID magnitude.
+It is tied to the encoder's error/abort path (the -17691 rejection that only 255 hits). The
+corruption is a fixed-feature defect in the error teardown — likely a DMA descriptor left armed
+or an OOB descriptor written during the failed encode's cleanup path.
 
-1. **Truncation test:** does kernel consume raw IOKit value (255) or bitstream-truncated
-   (255 & 0x3F = 63)? Single test, 3 reboots each. Decides primitive quality:
-   - Only 63 panics -> 1-element OOB (could still be groomable)
-   - 127/191/255 all panic -> raw value path, wide possibly steerable OOB
-2. **Deterministic DVA vs Alpha value mapping** — steerable primitive vs crash-only
-3. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
+**Hypotheses eliminated:**
+- "Wide OOB scaling with raw IOKit value" — OUT
+- "6-bit truncation OOB" — OUT
+- "Any value ≥ 63 triggers" — OUT
+
+**Leading model:** At Alpha=255, the encoder takes an error/rejection path that leaves a DMA
+descriptor armed. During idle/teardown, AVE2 hardware fires it, writing OOB into unmapped DART
+pages. The OOB write is a fixed consequence of the error path, not value-proportional.
+
+### 2C. Boundary Sweep — REVISED PRIORITY
+**New goal:** Find the acceptance/rejection boundary between 191 (accepted) and 255 (rejected
+with -17691). Values to test: 192, 224, 254. This localizes whether the error path is a
+validation clamp (≥192 = reject) or 255-specific (UInt8 sentinel/clamp).
+
+### 2D. Control Re-test — NEW PRIORITY (before boundary sweep)
+Run Alpha=255 with 300s idle wait to confirm the fault is still live. This validates
+that the 120s truncation test windows weren't false negatives due to state carryover.
+
+### 2E. Ghidra (offline)
+26.6.2 AppleAVE2 kext — trace the -17691 error path specifically. What happens to
+the DMA descriptor chain when the encode is rejected? Where is the cleanup that fails
+to disarm the armed descriptor?
+
+### Open questions (updated after truncation test)
+
+1. **ANSWERED: Truncation test** — neither raw nor 6-bit. The fault is error-path-specific.
+2. **Acceptance boundary:** where between 191 (OK) and 255 (-17691) does the rejection start?
+   This determines whether the trigger is a range (≥N) or a sentinel (exactly 255).
+3. **Error-path anatomy:** what does the -17691 abort path do differently with DMA descriptors
+   vs the clean encode path? (Ghidra target)
+4. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
    read result back to userspace (via encoded output or IOKit get)?
 
 ---
