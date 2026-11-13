@@ -124,40 +124,57 @@ NumberOfSlices:     1-16 OK, 64+ REJECTED (VT validates)
 ChromaQPOffset:     ALL REJECTED (not settable on this config)
 ```
 
-## Honest State of Play (Post-Tier 2 Probe)
+## Definitive Verified State (Post-Oracle, 2026-11-12)
 
-**Lesson from NumberOfTemporalLayers: SET OK ≠ stored, stored ≠ delivered.**
+Three-layer verification: SET return code → readback → bitstream oracle.
 
-| Property | Set OK | Readback Verified | Bitstream Verified | Status |
-|----------|--------|-------------------|-------------------|--------|
-| NTL=8 | YES | **NO (clamped to 1)** | n/a | **Dead** |
-| AlphaLayerID=255 | YES | pending | pending | Candidate |
-| RepFormatIndex=255 | YES | pending | pending | Candidate |
-| log2_max_minus4=13 | **NO** | n/a | n/a | **Dead** (VT rejects) |
-| NumberOfSlices=64 | **NO** | n/a | n/a | **Dead** (VT rejects) |
-| ChromaQPOffset=* | **NO** | n/a | n/a | **Dead** (all rejected) |
-| MVHEVCVideoLayerIDs | untested | pending | pending | Next candidate |
-| UserRPSForFaceTime | untested | pending | pending | Next candidate |
-| UserDPBFramesForFaceTime | untested | pending | pending | Next candidate |
-| UserParameterSetsIds | untested | pending | pending | Next candidate |
+| Property | Set OK | Readback | Bitstream | Status |
+|----------|--------|----------|-----------|--------|
+| NTL=8 | YES | **1 (clamped)** | n/a | **DEAD** |
+| **AlphaLayerID=64** | YES | **64 (stored)** | **VPS CHANGED (24→39 bytes)** | **VERIFIED ✅** |
+| RepFormatIndex=10 | YES | **10 (stored)** | **IDENTICAL to baseline** | **Dead (single-layer)** |
+| log2_max_minus4=13 | **NO** | n/a | n/a | **DEAD** (VT rejects) |
+| NumberOfSlices=64 | **NO** | n/a | n/a | **DEAD** (VT rejects) |
+| ChromaQPOffset=* | **NO** | n/a | n/a | **DEAD** (all rejected) |
+| MVHEVCVideoLayerIDs=[0,100] | YES | **[0,100] (stored)** | ⏳ no encode output | **Candidate** |
+| UserDPBFramesForFaceTime=20 | **NO** | n/a | n/a | **Rejected** (retry FT mode) |
+| UserRPSForFaceTime=100 | **NO** | n/a | n/a | **Rejected** (retry FT mode) |
+| UserParameterSetsIds=50 | YES | **[0,0,0] (clamped)** | n/a | **DEAD** |
 
-**`Required*` properties may be match/filter constraints** ("find me the SPS with this ID") rather than construction inputs ("build the VPS with this ID"). The encoder may just fail to match or construct valid defaults regardless. Only bitstream analysis can distinguish.
+### AlphaLayerID=64: Full Delivery Chain Proven
 
-**Struct-typed properties (CFArrays)** are harder for VideoToolbox to silently clamp and flow closer to raw delivery. If the `Required*` pair turns out clamped, these are the next real candidates.
+```
+BASELINE VPS (24 bytes): 40 01 0c 01 ff ff 01 60 ...
+  vps_max_layers_minus1: 0
 
-## Verification Flow ("Verify Oracle" button)
+AlphaLayerID=64 VPS (39 bytes): 40 01 0c 11 ff ff 01 60 ...
+  vps_max_layers_minus1: 1   ← encoder honored the value
+  VPS extension appended: bf 00 08 00 08 10 28 53 80 a0 00 78 50 07 15 e9
+```
 
-The new verification PoC:
-1. **BASELINE**: Encode with defaults, capture VPS/SPS hex dump
-2. **Test A**: Set AlphaLayerID=64, readback, encode, capture VPS/SPS hex
-3. **Test B**: Set RepFormatIndex=10, readback, encode, capture SPS hex
-4. **Test C**: Set struct-typed properties (MVHEVCVideoLayerIDs, UserDPB, UserRPS, UserParameterSets), readback, encode
+**Full chain:** property set → stored (readback 64) → structurally consumed (VPS reshaped, layers 0→1) → value-derived structure emitted. The encoder builds FROM AlphaLayerID, it doesn't just match-filter it.
 
-**Decision criteria:**
-- If VPS/SPS hex DIFFERS from baseline → value reached the bitstream → proven delivered to kernel
-- If IDENTICAL to baseline → encoder ignored the property (match filter or clamped internally)
-- Only properties passing BOTH readback AND bitstream verification are valid OOB targets
+**Critical precision note:** The VPS shows `vps_max_layers_minus1=1` consistent with using AlphaLayerID as a layer id, but `vps_max_layer_id` (6 bits after sub-layer ordering) must be extracted bit-accurately to confirm it carries the attacker-controlled value. Per the patch diff, `vps_max_layer_id < 63` is the unchecked consumer.
 
-## Next Step
+### RepFormatIndex=10: Stored But Not Consumed
 
-Run **"Verify Oracle"** button (cyan, safe — just encodes and parses output). Send back the full log. Properties that pass both checks become the real panic-test candidates.
+Readback held (10), but emitted VPS/SPS byte-identical to baseline. This is exactly the readback-vs-bitstream distinction the oracle catches. May activate in multi-layer mode when combined with AlphaLayerID.
+
+### MVHEVCVideoLayerIDs=[0,100]: Candidate, Needs Dedicated Oracle
+
+SET OK, readback [0,100] (unclamped), but Test C's encode produced no callback output. Needs its own session with dedicated encode. Value 100 > 63 patch limit if consumed as layer_id.
+
+### FaceTime-Scoped Properties: Retry Under FaceTime Usage
+
+UserDPBFramesForFaceTime and UserRPSForFaceTime were rejected — "ForFaceTime" suffix suggests they need RealTime/low-latency session configuration.
+
+## Escalation Test Plan ("Escalate" button)
+
+1. **AlphaLayerID sweep** (0, 32, 62, 63, 64, 100, 200, 255):
+   - Bit-accurate VPS parser extracts `vps_max_layer_id` (6-bit field)
+   - If emitted `vps_max_layer_id` tracks the set value → the exact unchecked kernel consumer from the patch diff is being fed attacker-controlled data
+2. **Dedicated MVHEVCVideoLayerIDs oracle** — own session, own encode
+3. **RepFormatIndex + AlphaLayerID combined** — multi-layer mode may activate RepFormatIndex delivery
+4. **FaceTime mode retry** — RealTime + low-latency config for UserDPB/UserRPS
+
+**Next after escalation:** If `vps_max_layer_id=255` when `AlphaLayerID=255` → panic-capable encode. Then Ghidra: find the consumer of `vps_max_layer_id` in the 26.6.2 kext and the array it indexes.

