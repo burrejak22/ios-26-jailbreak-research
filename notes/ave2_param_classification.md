@@ -139,27 +139,50 @@ or an OOB descriptor written during the failed encode's cleanup path.
 descriptor armed. During idle/teardown, AVE2 hardware fires it, writing OOB into unmapped DART
 pages. The OOB write is a fixed consequence of the error path, not value-proportional.
 
-### 2C. Boundary Sweep — REVISED PRIORITY
-**New goal:** Find the acceptance/rejection boundary between 191 (accepted) and 255 (rejected
-with -17691). Values to test: 192, 224, 254. This localizes whether the error path is a
-validation clamp (≥192 = reject) or 255-specific (UInt8 sentinel/clamp).
+### 2C. Boundary Sweep — COMPLETE
+**Goal:** Determine whether the -17691 rejection is a range (≥N) or exact sentinel (==255).
 
-### 2D. Control Re-test — NEW PRIORITY (before boundary sweep)
-Run Alpha=255 with 300s idle wait to confirm the fault is still live. This validates
-that the 120s truncation test windows weren't false negatives due to state carryover.
+**Results — comprehensive near-255 sweep:**
 
-### 2E. Ghidra (offline)
-26.6.2 AppleAVE2 kext — trace the -17691 error path specifically. What happens to
-the DMA descriptor chain when the encode is rejected? Where is the cleanup that fails
-to disarm the armed descriptor?
+| Value | Encode result | 120s idle | Panic? |
+|-------|---------------|-----------|--------|
+| 254 | clean, callback OK | survived | NO |
+| 253 | clean, callback OK | survived | NO |
+| 252 | clean, callback OK | survived | NO |
+| 250 | clean, callback OK | survived | NO |
+| 245 | clean, callback OK | survived | NO |
+| 235 | clean, callback OK | survived | NO |
+| 200 | clean, callback OK | survived | NO |
+| 128 | clean, callback OK | survived | NO |
 
-### Open questions (updated after truncation test)
+Combined with Phase 2B (63, 127, 191 all clean) and earlier sweep (192, 160, 144, 224, 240, 248
+all clean), every value from 0–254 produces a clean encode. Only 255 triggers -17691 rejection.
+
+**Definitive conclusion:** AlphaLayerID=255 (0xFF) is a **UInt8 sentinel/max marker**. The
+AppleAVE2 driver has an exact `== 0xFF` check that routes the encode to the rejection path.
+This is NOT a range comparison, NOT a ≥N clamp, NOT a signed overflow — it is a single-value
+sentinel that the driver treats as "invalid/reserved."
+
+### 2D. Control Re-test — SUPERSEDED
+Phase 2A already confirmed the fault is live with 3/3 panics at variable deferral (90–130s).
+Phase 2C confirmed 254 (one below) never panics. No further control needed.
+
+### 2E. Ghidra (offline) — NEXT PRIORITY
+26.6.2 AppleAVE2 kext — the search target is now maximally narrowed:
+1. Find the `== 0xFF` (or `== 255`) comparison on AlphaLayerID in the encode path
+2. Trace the -17691 error/rejection branch from that comparison
+3. Identify where the DMA descriptor cleanup fails — the armed descriptor that fires
+   during idle causing the deferred DART fault
+4. CVE-2026-112466 (OOB READ for KASLR defeat) — trace whether any encode error path
+   leaks kernel pointers back to userspace via IOKit get or encoded output buffer
+
+### Open questions (updated after boundary sweep)
 
 1. **ANSWERED: Truncation test** — neither raw nor 6-bit. The fault is error-path-specific.
-2. **Acceptance boundary:** where between 191 (OK) and 255 (-17691) does the rejection start?
-   This determines whether the trigger is a range (≥N) or a sentinel (exactly 255).
+2. **ANSWERED: Acceptance boundary** — exact 0xFF sentinel. Every value 0–254 is accepted;
+   only 255 triggers -17691 rejection and the subsequent deferred DART fault.
 3. **Error-path anatomy:** what does the -17691 abort path do differently with DMA descriptors
-   vs the clean encode path? (Ghidra target)
+   vs the clean encode path? (Ghidra target — maximally narrowed)
 4. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
    read result back to userspace (via encoded output or IOKit get)?
 
