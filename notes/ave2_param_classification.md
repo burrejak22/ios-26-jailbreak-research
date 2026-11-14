@@ -17,12 +17,15 @@ an error (-17691), during the wait before the next action, with no follow-up pre
 seconds-to-minutes after the callback. A failed encode does NOT mean no DMA occurred. No suspect
 is eliminated on callback error alone.
 
-**Deferral mechanism (updated after 2E-0 Run A):** encode submitted with poison parameter ->
+**Deferral mechanism (updated after Run B, 2026-11-14):** encode submitted with poison parameter ->
 firmware arms an invalid DMA descriptor -> encode fails (userspace sees -17691) -> **descriptor
-survives session destruction** -> descriptor executes on firmware-internal timer/event (~90-160s)
--> OOB write traps in DART. The descriptor is firmware/hardware state, NOT kernel session state.
-Session invalidation does not accelerate or prevent the fault. **The armed descriptor is a time
-bomb — a process can arm it, destroy all userspace evidence, and the OOB write still fires.**
+is firmware/hardware state, NOT in the kext's delayed-release queue** -> PTE remains valid until
+the session/daemon is torn down -> daemon termination bulk-invalidates DART PTEs ->
+stale firmware DMA descriptor fires into now-unmapped DVA -> DART fault. **The 90-160s deferral
+corresponds to videocodecd daemon idle-lifetime, not a firmware timer.** Run B proved that clean
+encodes on the same session do NOT flush the stale descriptor (it's not in the kext's cleanup
+queue). The armed descriptor is a time bomb — it fires when the PTE is removed, regardless of
+what userspace or the kext does in between.
 
 **Required protocol from now on:** canary -> set suspect -> encode -> observe callback
 (success OR error) -> WAIT 120 SECONDS, do nothing, do not recreate session -> only then
@@ -79,13 +82,16 @@ DMA write**, not synchronous with the encode error.
 | 4 | 2026-11-13 10:43 | AlphaLayerID=255, idle-wait protocol | 0x10000710080 | 0x1c4 | 0xc0 | ~130s | **HIGH — .ips captured** |
 | 5 | 2026-11-13 12:33 | AlphaLayerID=255, 2E-0 teardown test | 0x10000ed4080 | 0x3b5 | 0xc0 | TBD | **HIGH — .ips captured** |
 | 6 | 2026-11-13 ~20:08 | AlphaLayerID=255, 2E-0 **Run A** (immediate invalidate) | 0x1000082d500 | 0x20b | 0xc0 | ~160s | **HIGH — Run A result** |
+| 7 | 2026-11-14 12:50 | AlphaLayerID=255, **Run B v2** (arm + 10 clean encodes) | 0x1000082d4c0 | 0x20b | 0xc0 | ~78s post-app-idle | **HIGH — Run B result** |
 
 **DVA analysis (6 panics):**
 - Panics 1-4: DVAs in `0x100007xxxxx` region (~900KB span, PTE 452-507)
 - Panic 5: DVA at `0x10000ed4080` — **PTE 949**, nearly 2x the previous PTEs
 - **Panic 6: DVA at `0x1000082d500` — PTE 0x20b (523)** — back in the mid-range
-- **DVA REPEAT: Panic 6 DVA (0x1000082d500) matches a prior panic** — suggests deterministic
-  descriptor slot when the session is invalidated (same DMA descriptor target address)
+- **Panic 7: DVA at `0x1000082d4c0` — PTE 0x20b (523)** — SAME PTE as panic 6, DVA differs by only 0x40
+- **DVA REPEAT: Panics 6+7 share PTE 0x20b and nearly identical DVAs (0x1000082d500 vs 0x1000082d4c0)**
+  — strongly suggests deterministic descriptor slot; the 0x40 offset may be a different sub-surface
+  or alignment within the same DART mapping region
 - AXI_ID 0xc0 in 5 of 6 runs (one 0xc1) — primary encoder write channel
 - All faults are **PTE invalid exception on write** from `dart-ave` at `AppleT8110DART.cpp:2369`
 - DVAs shift with kernel slide and heap state per boot, but descriptor slot may be fixed
@@ -230,8 +236,8 @@ DVA 0x1000082d500 PTE 0x20b AXI_ID 0xc0 — **identical to Panic #3**.
 | Run | Result | Meaning |
 |-----|--------|---------|
 | **A** | **Panic at 160s** | **CONFIRMED: Stale DMA descriptor fires after delayed surface release unmaps PTE** |
-| B | TBD | Does a clean encode on the same session flush/redirect the armed descriptor? |
-| C | Known baseline (90–130s) | Pure idle reference |
+| **B** | **Panic at ~78s idle, during videocodecd teardown** | **Clean encodes don't trigger via EncodeSubmit path — stale descriptor is firmware-only state, PTE invalidated via daemon teardown** |
+| C | TBD | Does explicit session close / daemon termination produce fast deterministic panic? |
 
 **Corrected mechanism (from Ghidra):** The deferral is the session lifecycle delay — how long
 until the surface manager runs its delayed release. AVE_SurfaceMgr_ReleaseDelayed calls
@@ -288,6 +294,84 @@ contents → clean-encode to trigger the walk → watch which surface's bytes ch
 bytes. Any diff = the write primitive observed firsthand, value/offset/data all captured.
 Don't need the output-surface index first — match all four shapes and the diff tells you
 empirically which one got written.
+
+**Run B v2 Result (2026-11-14 12:50:59 EST) — PANIC #7:**
+
+Panic file: `crashes/panic-7-runB-teardown-125059.ips`
+
+**Panic details:**
+```
+dart-ave: DART(DART) error: SID 0 PTE invalid exception on write of DVA 0x1000082d4c0
+(CTE 0x10 SEG 0 PTE 0x20b) ERROR_SID_SUMMARY 0x00003100 AXI_ID 0xc0
+@AppleT8110DART.cpp:2369
+```
+
+**DVA/PTE:** 0x1000082d4c0 / PTE 0x20b — **SAME PTE as Panic #6** (Run A), DVA differs by
+only 0x40 bytes (0x1000082d500 → 0x1000082d4c0). This confirms the DART descriptor target
+is deterministic per-boot-session and tied to the same mapping region.
+
+**Process state at panic (from stackshot):**
+- **JBPoC (PID 7468):** Main thread TH_WAIT, `lastRunTime: 77.6s` before stackshot — app had
+  finished encoding and was idle for ~78 seconds before the panic
+- **videocodecd (PID 287):** `terminatedSnapshot` flag, `suspendCount: 2`, thread 659547 was
+  `TH_RUN` + `TH_SFLAG_ABORT` + `kThreadOnCore` with deep kernel frames — **the XPC video
+  codec daemon was actively being torn down at the exact moment of the DART fault**
+- **debugserver (PID 7469):** attached to JBPoC, TH_WAIT
+
+**Run B v2 Outcome: MODIFIED OUTCOME 3 — Session-teardown path, not EncodeSubmit**
+
+The panic did NOT fire during or immediately after a clean encode submission (which would have
+been Outcome 1/2). Instead, the JBPoC app completed its encode sequence and went idle for ~78s,
+then the panic fired when videocodecd was being terminated by the system. This is the
+**session-teardown-at-zero path** (Path 3 from the Ghidra model):
+
+`videocodecd termination → AVE_ClientClose → count==0 → AVE_SessionDestroy →
+AVE_SurfaceMgr_Cleanup → ReleaseDelayed → DARTUnmapSurface_TwoPhase → PTE invalidated →
+stale firmware DMA fires → DART fault`
+
+**Why Run B didn't trigger via the EncodeSubmit path (possible explanations):**
+1. **+0xf8 was cleared by the Alpha=255 error** — despite the Ghidra analysis showing firmware
+   errors don't call AVE_SetEncodeActiveState, the kext may clear it through a different
+   mechanism (e.g., the error handler in AVE_ProcessCommandResult may reset pipeline state)
+2. **The delayed-release queue wasn't populated by the failed encode** — the surface for the
+   Alpha=255 encode may not have been added to the delayed-release queue because the firmware
+   aborted before reaching the stage that queues surfaces for deferred release. The queue
+   entry condition `(flags & 0xf0000) == 0` may not have been met
+3. **The clean encodes DID trigger TriggerCleanup, but there was nothing to clean** — the
+   stale descriptor is firmware/hardware state, not a surface in the kext's delayed-release
+   queue. TriggerCleanup walked an empty queue, while the real time bomb is the firmware
+   DMA descriptor that only fires when the DART PTE is invalidated through session teardown
+
+**Critical insight from Panic 7:** The 78s timing + videocodecd teardown state strongly suggests
+explanation #3. The stale DMA descriptor is NOT in the kext's delayed-release queue — it's
+firmware-internal state. The kext's ReleaseAllDelayed (EncodeSubmit path) has nothing to
+release because the firmware aborted before queueing the surface. The PTE invalidation
+happens later via a DIFFERENT path — when the entire session/daemon is torn down and ALL
+DART mappings are bulk-invalidated.
+
+**Updated model (v3.2):**
+- The stale firmware DMA descriptor is armed during the failed Alpha=255 encode
+- The descriptor persists in firmware/hardware, independent of kext session state
+- The PTE invalidation that triggers the panic comes from session/daemon teardown,
+  NOT from the delayed-release queue walk during normal encode cycles
+- The 90-160s deferral window corresponds to how long the system keeps videocodecd alive
+  after the last encode activity, not a fixed firmware timer
+- This means **the fastest attacker-controlled timing is explicit videocodecd termination**,
+  not clean-encode-triggered delayed release
+
+**Next experiment: Run C — Explicit daemon termination**
+Goal: Test whether explicitly closing all AVE2 sessions (to trigger AVE_ClientClose → count==0
+→ session destroy → bulk DART unmap) produces a fast, deterministic panic.
+Protocol:
+1. Fresh reboot → canary → arm Alpha=255 → -17691
+2. Close VTCompressionSession, release all IOSurfaces
+3. Wait for videocodecd to exit (or try to kill it — may need entitlement)
+4. Measure time from session close to panic
+
+If Run C panics within seconds of session close, the timing IS attacker-controlled — just
+through the teardown path rather than the encode-submission path. The re-claim experiment
+(3.0) proceeds with this timing mechanism: arm → close session → spray physical pages →
+daemon teardown fires stale DMA into sprayed pages.
 
 ### 2E-1. Output Buffer Diff (infoleak test) — ON-DEVICE, NO GHIDRA NEEDED
 **Goal:** Test whether the -17691 error path leaks stale firmware/kernel data to userspace.
