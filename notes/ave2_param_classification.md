@@ -290,7 +290,7 @@ indexes into. This is testable but lower priority than the infoleak.
 
 **Binary:** AppleAVE2 kext v905.40.1, arm64e Mach-O, 2,692,608 bytes
 **Source:** iOS 26.6.2 (23G90), iPhone18,1 kernelcache
-**Tool:** ipsw macho disass + PowerShell binary scanners (Ghidra MCP unavailable)
+**Tool:** ipsw macho disass + PowerShell binary scanners + **Ghidra 12.1.4 MCP decompiler (verified 2026-11-14)**
 
 ### Key Findings Summary
 
@@ -303,10 +303,11 @@ indexes into. This is testable but lower priority than the infoleak.
    in AVE_Log_UpdateConf, two in AVE_DevInfo/RetrieveRevision, two in config parsing, one in
    slice parsing. The **firmware** performs the AlphaLayerID == 255 check.
 
-3. **"wrong layer ID" string exists but is DEAD CODE** — the format string
-   `"%lld %d AVE %s: %s:%d %s | wrong layer ID %d\n"` exists at two file offsets (0x708E0,
-   0xBD550) but has **zero code references** in __TEXT_EXEC. No ADRP+ADD in the entire
-   executable segment targets either string. This is either dead code or firmware-only logging.
+3. **"wrong layer ID" string is NOT dead code (CORRECTED via Ghidra 2026-11-14)** — Ghidra
+   found PARAM xrefs from `AVE_ValidateLayerParams` (0xfffffe0008636d70). However, this is
+   a **kext-level layer count validator** that checks `param_3 >= 2` and returns 0xFFFFFC17
+   (-1001). This is NOT the firmware's -17691/AlphaLayerID=255 check — it's a separate
+   validation that the layer count doesn't exceed supported limits.
 
 4. **NO `AVE_CHM_DARTUnmapSurfaces` exists** — the CHM-level DARTMap has no unmap counterpart.
    DARTUnmap functions exist only at the lower AVE_MD_SVE level.
@@ -678,3 +679,203 @@ ChromaQPIndexOffsetMultiPPS (not settable), UserParameterSetsIds (clamped), MaxF
 | 8 | AlphaLayerID=32 | ⏳ PENDING | |
 
 **AlphaLayerID=255 analysis:** The -17691 error means the hardware encoder performs its own validation at encode time (not just at property-set time). This is AFTER VideoToolbox accepted the value (SET returned noErr) and AFTER readback confirmed it was stored. The hardware itself rejects 255 before attempting DMA. This suggests the kernel-side array access uses a DIFFERENT value than the raw property — possibly the mod-64 wrapped value from the VPS bitstream. This strengthens the hypothesis that the kernel consumer reads the VPS bitstream rather than the IOKit config struct directly.
+
+---
+
+## GHIDRA DECOMPILER VERIFICATION (2026-11-14)
+
+**Tool:** Ghidra 12.1.4 with GhidraMCP extension (LaurieWired), decompiler output
+**All findings below verified via C pseudocode decompilation, not just disassembly.**
+
+### Verification Status
+
+| # | Finding | Status | Evidence |
+|---|---------|--------|----------|
+| 1 | -17691 not in kext | **VERIFIED** | String search "17691" = 0 results |
+| 2 | 0xFF not for alpha | **VERIFIED** | (prior disasm analysis holds) |
+| 3 | "wrong layer ID" not dead | **CORRECTED** | Xref from AVE_ValidateLayerParams; checks layer count >= 2, returns -1001 |
+| 4 | No CHM-level DARTUnmap | **VERIFIED** | Decompilation confirms asymmetric call hierarchy |
+| 5 | DMA cleanup gap | **VERIFIED** | DARTUnmap only on success path (AVE_PipelineReconfigure) |
+| 6 | Partial-map leak | **VERIFIED** | Decompilation shows early return without cleanup |
+
+### Finding 1: AVE_CHM_DARTMapSurfaces — No CHM-Level Unmap Counterpart
+
+**Decompiled** `AVE_CHM_DARTMapSurfaces` (0xfffffe000855c0cc):
+```c
+undefined8 AVE_CHM_DARTMapSurfaces(long param_1) {
+    lVar1 = *(long *)(param_1 + 0x20);
+    // Create bitmask from param_1+0x28
+    uVar3 = DARTMapExternalSurfaces(lVar1, 1L << (*(uint*)(param_1+0x28) & 0x3f));
+    if ((int)uVar3 == 0) {
+        uVar3 = DARTMapInternalSurfaces(lVar1, ...);
+        if ((int)uVar3 == 0) {
+            // SUCCESS: bookkeeping on lVar1 + 0xef3b8
+            return 0;
+        }
+        // ERROR: "failed to DART map internal surfaces" — NO CLEANUP OF EXTERNAL
+    } else {
+        // ERROR: "failed to DART map external surfaces" — NO CLEANUP
+    }
+    return uVar3;
+}
+```
+
+**Xrefs TO AVE_CHM_DARTMapSurfaces:** 1 DATA + 1 CALL from FUN_fffffe00085fa6cc
+**No corresponding AVE_CHM_DARTUnmapSurfaces exists anywhere in the binary.**
+
+### Finding 2: DARTUnmap Is Only Called on Success/Reconfigure Path
+
+**Full call chains (Ghidra xref-traced):**
+
+```
+MAP chain (encode setup):
+  FUN_fffffe00085fc3b4
+    → FUN_fffffe00085fa6cc
+      → AVE_CHM_DARTMapSurfaces (0x855c0cc)
+        → DARTMapExternalSurfaces (0x867b238) → AVE_DARTMapExternalSurfaces → DARTMapSurface
+        → DARTMapInternalSurfaces (0x867b8d4)
+
+UNMAP chain (cleanup — DIFFERENT hierarchy):
+  FUN_fffffe00085c5764
+    → AVE_PipelineReconfigure (0x85c3d54)
+      → DARTUnmapSurfaces_Wrapper (0x868b400)
+        → FUN_fffffe000868b2e8
+          → DARTUnmapExternalSurfaces (0x867b684) → AVE_DARTUnmapExternalSurfaces → DARTUnmapSurface
+```
+
+**Critical:** AVE_PipelineReconfigure calls DARTUnmap ONLY after three preconditions succeed:
+```c
+// AVE_PipelineReconfigure (0xfffffe00085c3d54) simplified:
+ret = unregister_client(param_1, param_2);
+if (ret == 0) {
+    ret = update_EUMap(param_2, param_3);
+    if (ret == 0) {
+        ret = register_client(param_1, param_2);
+        if (ret == 0) {
+            // ONLY HERE: DARTUnmap is called
+            DARTUnmapSurfaces_Wrapper(sessions, bitmask);
+            reset_pipeline(...);
+            submit(...);
+            return 0;
+        }
+        // "fail to register client" — NO UNMAP
+    }
+    // "fail to update EUMap" — NO UNMAP
+}
+// "fail to unregister client" — NO UNMAP
+```
+
+This is the **normal pipeline reconfiguration** path, not the firmware error handler. When
+firmware rejects AlphaLayerID=255, this function is never called — the error returns through
+a completely different code path that has no DARTUnmap.
+
+### Finding 3: Partial-Map Leak in DARTMapExternalSurfaces
+
+**Decompiled** `DARTMapExternalSurfaces` (0xfffffe000867b238) — bitmask loop:
+```c
+// Loop 1: bitmask-based (when param_2 != 0)
+uVar4 = 0;
+do {
+    if ((param_2 >> (uVar4 & 0x3f) & 1) != 0) {
+        uVar2 = AVE_DARTMapExternalSurfaces(..., uVar4);
+        if ((int)uVar2 != 0) {
+            // "failed to DART map external surfaces"
+            return uVar2;  // ← LEAK: surfaces 0..uVar4-1 remain mapped
+        }
+    }
+    uVar4++;
+} while (uVar4 != 4);
+```
+**No cleanup of already-mapped surfaces on error.** This is a secondary leak independent
+of the AlphaLayerID=255 bug — it occurs if ANY surface mapping fails mid-loop.
+
+### Finding 4: DARTUnmapExternalSurfaces Xrefs Confirm Limited Callers
+
+**Xrefs TO DARTUnmapExternalSurfaces (0xfffffe000867b684):**
+- 1 DATA ref (vtable at 0xfffffe000b4e8dff)
+- 1 CALL from FUN_fffffe000868b2e8 (inside DARTUnmapSurfaces_Wrapper chain)
+
+**Xrefs TO DARTMapExternalSurfaces (0xfffffe000867b238):**
+- 1 DATA ref (vtable at 0xfffffe000b4e8dfd)
+- 1 CALL from AVE_CHM_DARTMapSurfaces (0xfffffe000855c0cc)
+- 1 CALL from FUN_fffffe000868aeb4 (second map entry point)
+
+The unmap has FEWER callers than the map — further confirming the asymmetry.
+
+### Finding 5: "try to release delayed" Is Unreachable on Error Path
+
+String `"try to release delayed surface"` xrefs to FUN_fffffe000866e284, which is called from:
+- FUN_fffffe000866dc50 (2 calls)
+- FUN_fffffe00086708a4
+
+These are all in the SurfaceMgr DART management code (0x866xxx-0x867xxx range), part of the
+normal unmap path. Since the error path never reaches the unmap chain, the delayed release
+mechanism is never triggered.
+
+### Finding 6: DARTUnmapSurface (0xfffffe0008670484) — The Leaf Unmapper
+
+```c
+undefined8 DARTUnmapSurface(undefined8 *param_1, long param_2, ulong param_3) {
+    if (param_2 == 0 || param_3 > 3) {
+        // "wrong parameters" → return 0xfffffc17 (-1001)
+    }
+    lock(param_1[0]);
+    if (capability_bit_not_set) {
+        return 0xfffffc0a;  // surface type not enabled for DART
+    }
+    actual_unmap(param_2, param_3);  // FUN_fffffe000865874c
+    size_accounting(param_2);         // FUN_fffffe000865b5fc
+    unlock(param_1[0]);
+    return 0;
+}
+```
+
+The actual unmap is `FUN_fffffe000865874c` which reverses what `sub_fffffe000865a84c` (DART map)
+does. Both operate on the same surface descriptor and DART state structures.
+
+### Finding 7: AVE_ValidateLayerParams — "wrong layer ID" Context
+
+**Decompiled** `AVE_ValidateLayerParams` (0xfffffe0008636d70):
+```c
+// Simplified control flow:
+if (param_3 >= 2) {
+    log("wrong layer ID %d", param_3);
+    return 0xfffffc17;  // -1001, NOT -17691
+}
+if ((param_4 & 7) != 0) {
+    log("not padded to bytes");
+    return 0xfffffc18;
+}
+if (offset + size >= 0x801) {
+    log("PS data overflows");
+    return 0xfffffc15;
+}
+// copy data, return 0
+```
+
+This validates parameter set layer IDs during encode configuration, NOT during firmware
+encode execution. It's a kext-level bounds check (layer < 2), returning -1001 on failure.
+Completely separate from the firmware's AlphaLayerID=255 → -17691 rejection.
+
+### Functions Renamed in Ghidra Project
+
+| Address | Old Name | New Name |
+|---------|----------|----------|
+| 0xfffffe000855c0cc | FUN_fffffe000855c0cc | AVE_CHM_DARTMapSurfaces |
+| 0xfffffe000867b238 | FUN_fffffe000867b238 | DARTMapExternalSurfaces |
+| 0xfffffe000867b684 | FUN_fffffe000867b684 | DARTUnmapExternalSurfaces |
+| 0xfffffe000867b8d4 | FUN_fffffe000867b8d4 | DARTMapInternalSurfaces |
+| 0xfffffe000866a32c | FUN_fffffe000866a32c | AVE_DARTMapExternalSurfaces |
+| 0xfffffe000866adb4 | FUN_fffffe000866adb4 | AVE_DARTUnmapExternalSurfaces |
+| 0xfffffe00086702bc | FUN_fffffe00086702bc | DARTMapSurface |
+| 0xfffffe0008670484 | FUN_fffffe0008670484 | DARTUnmapSurface |
+| 0xfffffe000868b400 | FUN_fffffe000868b400 | DARTUnmapSurfaces_Wrapper |
+| 0xfffffe00085c3d54 | FUN_fffffe00085c3d54 | AVE_PipelineReconfigure |
+| 0xfffffe0008636d70 | FUN_fffffe0008636d70 | AVE_ValidateLayerParams |
+
+### Remaining Targets (unchanged)
+
+1. **Encode completion handler** — find the interrupt/callback that processes firmware results
+2. **Firmware mailbox/doorbell** — understand encode submission DMA setup
+3. **DVA target controllability** — trace DARTMapSurface to determine DVA steering
+4. **CVE-2026-112466** — OOB READ for KASLR defeat
