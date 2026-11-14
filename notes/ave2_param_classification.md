@@ -172,14 +172,15 @@ sentinel that the driver treats as "invalid/reserved."
 Phase 2A already confirmed the fault is live with 3/3 panics at variable deferral (90–130s).
 Phase 2C confirmed 254 (one below) never panics. No further control needed.
 
-### 2E-0. Session Teardown Test — NEXT ON-DEVICE EXPERIMENT
+### 2E-0. Session Teardown Test — IN PROGRESS
+
 **Goal:** Collapse the 90–130s deferral window and identify the exact trigger mechanism.
 
 After the failed Alpha=255 encode (-17691 returned), instead of waiting idle:
 
-- **Run A:** Immediately `VTCompressionSessionInvalidate` / destroy the session, wait 30s.
-- **Run B:** Encode a clean frame on the same session (valid AlphaLayerID), then wait.
-- **Run C:** Leave idle (existing baseline, 90–130s panic).
+- **Run A:** Immediately `VTCompressionSessionInvalidate` / destroy the session, wait 60s.
+- **Run B:** Encode a clean frame on the same session (valid AlphaLayerID), then wait 60s.
+- **Run C:** Leave idle 180s with session alive, then invalidate + 60s.
 
 **Prediction table:**
 
@@ -188,6 +189,20 @@ After the failed Alpha=255 encode (-17691 returned), instead of waiting idle:
 | A panics quickly (~seconds after invalidate) | Descriptor fires on teardown → armed-descriptor confirmed, deferral becomes deterministic and fast (~10s test cycle) |
 | A never panics, B panics | Descriptor fires on next-use/flush → the "wait" is really "next descriptor submission" |
 | Only C panics | True idle timer (power-state / DPB drain / firmware GC) → check whether idle sleep event correlates |
+
+**Results (2026-11-13):**
+
+| Run | Result | Timing | Notes |
+|-----|--------|--------|-------|
+| A   | **PANIC** | ~40-50s after encode, ~20-30s after invalidate completed | Session invalidated at 20:06:10-20:06:20; phone rebooted during 60s idle wait. Log shows 30s-remaining tick at 20:06:50 before panic. |
+| B   | PENDING | — | Skipping to B next (counter patched to start at B) |
+| C   | PENDING | — | — |
+
+**Run A analysis:** The panic still fires after immediate session invalidation. The ~40-50s
+deferral (vs. 90-130s in Phase 2A idle tests) suggests invalidation may *accelerate* the fault
+rather than prevent it, but the fault is NOT synchronous with teardown. The armed DMA descriptor
+survives session destruction and fires later — consistent with hardware-level (DART/firmware)
+state that kernel teardown does not clean up.
 
 If A works, the test protocol drops from 120s to ~10s — massive throughput improvement for all
 downstream testing including regression checks during Ghidra analysis.
