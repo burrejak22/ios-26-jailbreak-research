@@ -2494,7 +2494,7 @@ static void runPhase2_Boundary(void) {
 //   C) Idle timer (existing baseline)
 // ============================================================
 
-static int g_teardownRunIdx = 1; // skip Run A (already confirmed panic)
+static int g_teardownRunIdx = 2; // skip to Run C (A=panic@160s, B=unclear, C=panic@~30s?)
 
 static void runPhase2_Teardown(void) {
     if (g_phase2Running) {
