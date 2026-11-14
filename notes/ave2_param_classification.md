@@ -1674,3 +1674,169 @@ kernel-side memcpy to exploit). The read primitive, if it exists on this trigger
 in the stale-descriptor write landing in a re-claimed readable surface = read-back via 3.0
 Outcome A, or is an entirely separate code path. **Deprioritize further Ghidra work on the
 output processing chain accordingly.**
+
+---
+
+## JAILBREAK ROADMAP — iPhone 17 Pro (T8150) / iOS 26.6.2 (2026-11-14)
+
+**Current state:** 8 confirmed kernel panics from AlphaLayerID=255 DART fault. Reproducible
+one-shot panic from unprivileged app. Trigger: idle-timer PTE unmap (~160s) after arming stale
+firmware DMA descriptor. Not yet an exploit.
+
+### Phase 1: Weaponize the DART race (Experiment 3.0)
+
+**Goal:** Convert panic into a controlled DMA write into attacker-readable memory.
+
+**Mechanism:** The firmware has a stale DMA descriptor that fires a write into a DVA whose
+PTE gets invalidated ~160s later. Instead of letting the write fault, re-claim the freed
+PTE slot with a sprayed IOSurface so the write lands in memory you can read back. Success
+criterion: arm → spray → wait ~160s → **NO PANIC** → one of your surfaces has unexpected
+data written by firmware DMA.
+
+**Three unknowns to resolve:**
+
+1. **Race window size** — The ~160s idle timer is the arming-to-unmap delay. The critical
+   window is unmap-to-firmware-write. If the firmware write fires during the same teardown
+   sequence as the unmap, the window is microseconds (too tight to race). If the write fires
+   on a separate firmware timer/interrupt, there may be a usable gap.
+
+   **Experiment 3.0a:** Arm + spray IOSurfaces BEFORE idle timer fires. If surfaces are
+   already occupying nearby PTE slots when the unmap happens, the DART allocator may re-use
+   the freed slot for your next allocation. Keep a background thread continuously allocating
+   and checksumming IOSurfaces throughout the 160s window.
+
+   **Experiment 3.0b (if 3.0a fails):** Arm + DON'T exit. Instead, trigger the unmap by
+   calling VTCompressionSessionInvalidateAllFrames (session invalidation). This puts the
+   unmap under your control. Immediately after invalidation, spray IOSurfaces to re-claim
+   the freed DVA slots before the firmware descriptor fires.
+
+2. **Firmware write contents** — What does the stale descriptor actually write?
+   - If it writes a constant/known pattern → info leak of DART layout
+   - If it writes a pointer (e.g., next descriptor address) → potential kernel pointer leak
+   - If it writes data derived from encode parameters you set → controllable write primitive
+   - **Determined by:** reading back the sprayed surface after a successful re-claim (no-panic run)
+
+3. **PTE slot prediction** — Panics cluster at PTEs 0x1c4-0x20b. The spray must cover this
+   neighborhood. 320×240 NV12 surfaces = 320×240×1.5 = 115,200 bytes = ~28 DART pages (4KB each).
+   The encode output surface is ~28 PTEs wide, matching the observed PTE spread.
+   **Spray strategy:** Allocate ~50-100 IOSurfaces at 320×240 NV12 to saturate the DART
+   allocator region. Each surface has a unique 32-bit checksum in a known offset.
+
+**Concrete code for Experiment 3.0 (new button: "D: Re-claim Race"):**
+```
+1. Canary encode (verify hardware works)
+2. Arm: Alpha=255 encode → -17691 error → stale descriptor live
+3. Spray: allocate N IOSurfaces (320×240 NV12), fill each with pattern = surface_index
+   - Use IOSurfaceCreate() directly, matching the encode surface properties
+   - Lock each surface, write checksum, unlock — keep all refs alive
+4. Hold: stay alive for 180s (past the idle timer)
+5. Read-back: lock each surface, scan for unexpected writes
+   - If any surface has data NOT matching its original checksum → HIT
+   - Log which surface, which offset, what was written
+6. If no hit → panic would have happened; adjust spray density/timing
+```
+
+**Possible outcomes:**
+- **No panic + surface hit** → PRIMITIVE ACHIEVED. Firmware DMA writes into user-readable memory.
+  Proceed to Phase 2.
+- **No panic + no surface hit** → spray landed in wrong PTE region. Adjust surface count/shape.
+- **Panic anyway** → spray didn't cover the target PTE. Widen spray or adjust timing.
+- **Panic but different DVA** → spray displaced the fault to a different slot. Getting closer.
+
+### Phase 2: Characterize and strengthen the primitive
+
+Once a successful re-claim is achieved:
+
+1. **Map the write:** What offset in the surface? What data? How many bytes?
+   - Run re-claim multiple times, vary encode parameters, observe write changes
+   - Determine if write contents are attacker-influenced (encode params → write data)
+
+2. **Reliability:** How often does re-claim succeed vs panic?
+   - Target: >50% success rate for practical exploitation
+   - Tune spray count, surface shape, timing
+
+3. **Primitive classification:**
+   - **Best case:** Controllable write (attacker chooses data) into user-readable memory
+     → arbitrary kernel write after finding a kernel object to target
+   - **Good case:** Fixed firmware data into user-readable memory → info leak
+     (pointer values reveal KASLR slide, heap layout)
+   - **Minimum case:** Opaque firmware write, no control → still an info leak of firmware
+     state, may reveal DART layout for further attacks
+
+4. **Repeatability:** Can you arm → re-claim → read multiple times without reboot?
+   - If yes: iterate the primitive for multi-shot exploitation
+   - If no: single-shot → must chain everything in one go
+
+### Phase 3: Build the exploit chain
+
+**Target:** kernel_task port (tfp0) or equivalent kernel R/W primitive.
+
+Depending on primitive quality from Phase 2:
+
+**Path A — Controllable write primitive:**
+1. Spray IOKit objects (e.g., OSData, IOSurface properties) in kernel heap
+2. Use DART write to corrupt a kernel object's size/pointer field
+3. Read back via IOKit → kernel heap read primitive
+4. Iterate: kernel read + kernel write = game over
+
+**Path B — Info leak only (no write control):**
+1. Use DART leak to defeat KASLR (kernel slide from pointer values)
+2. Pair with a second vulnerability for write (look for IOKit UAF, integer overflow in
+   another kext, or a second DART primitive on a different AVE surface)
+3. Combined: leak + write = kernel R/W
+
+**Path C — Opaque write, no control:**
+1. The write still corrupts kernel-mapped memory → potential panic-oracle attacks
+2. Binary search kernel heap layout by observing which sprayed object gets corrupted
+3. May need to chain with a separate info leak vulnerability
+
+**Key advantage: DART DMA bypasses PAC.** The write goes through IOMMU hardware directly
+to physical memory. CPU pointer authentication never sees it. This sidesteps the primary
+arm64e mitigation that makes most kernel exploits difficult on A-series chips.
+
+### Phase 4: Post-exploitation — iOS 26.6.2 on T8150
+
+Assuming kernel R/W from Phase 3:
+
+1. **KASLR defeat** — already done if Phase 2 leaks pointers; otherwise read kernel
+   __TEXT base from a known kernel object
+2. **PPL bypass** — Page Protection Layer protects page tables. On iOS 26.x, likely need:
+   - PPL-registered data structure corruption (pmap manipulation)
+   - Or: find a PPL vulnerability (these are rare but not impossible)
+   - Or: use the DART primitive to write to physical pages directly, bypassing PPL
+     (DART writes to physical memory; PPL protects virtual→physical mappings but the
+     DART is a separate translation unit — this is an open research question for T8150)
+3. **KTRR/CTRR bypass** — Kernel text is hardware-locked read-only. Don't try to patch
+   kernel code. Instead: data-only attacks (overwrite function pointers in data segments,
+   corrupt process credentials, manipulate trust caches)
+4. **Rootfs remount** — iOS 26 sealed system volume. Need to:
+   - Modify trust cache to allow unsigned binaries, OR
+   - Use kernel R/W to patch sandbox/AMFI checks in memory (non-persistent), OR
+   - Mount a separate writable volume and redirect lookups
+5. **Bootstrap** — Load a payload (jailbreak daemon, tweak injection library):
+   - Inject into trust cache (if writable)
+   - Or: patch AMFI/AppleMobileFileIntegrity to allow ad-hoc signed binaries
+   - Or: use the kernel write to set TF_PLATFORM on a process
+6. **Persistence (optional)** — Survive reboot:
+   - Checkm8 is not available on T8150 (A19 Pro, post-A11)
+   - Boot-time exploit would need a separate iBoot vulnerability
+   - Semi-untethered: re-run exploit from an app after each reboot
+   - The DART bug fires from an unprivileged app → good semi-untethered candidate
+
+### Immediate next actions (priority order)
+
+1. **Run C2** — Does daemon-kill produce a faster panic? If <10s, C2 gives a tighter,
+   more controllable trigger for the spray. If ~160s like C1, the idle timer is the only
+   path and you use C1's timing.
+
+2. **Build Experiment 3.0 (Re-claim Race)** — New button in deploy script:
+   - "D: Re-claim Race" — arm + spray + hold + read-back
+   - IOSurface spray code with checksummed patterns
+   - 180s hold loop with continuous surface allocation
+   - Post-hold read-back and diff
+
+3. **Run 3.0 on device** — First attempt at converting panic to primitive.
+   - Outcome determines whether Phase 2 or model revision is next.
+
+4. **Kext diff 26.6.2 → 26.7.2** — If Apple patched the idle-timer path, understanding
+   the fix reveals the exact code path and may suggest refinements.
