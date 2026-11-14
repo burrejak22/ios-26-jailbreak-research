@@ -190,19 +190,20 @@ After the failed Alpha=255 encode (-17691 returned), instead of waiting idle:
 | A never panics, B panics | Descriptor fires on next-use/flush → the "wait" is really "next descriptor submission" |
 | Only C panics | True idle timer (power-state / DPB drain / firmware GC) → check whether idle sleep event correlates |
 
-**Results (2026-11-13):**
+**Results (2026-11-13/14):**
 
 | Run | Result | Timing | Notes |
 |-----|--------|--------|-------|
-| A   | **PANIC** | ~40-50s after encode, ~20-30s after invalidate completed | Session invalidated at 20:06:10-20:06:20; phone rebooted during 60s idle wait. Log shows 30s-remaining tick at 20:06:50 before panic. |
+| A   | **PANIC** | ~160s after encode, ~148s after invalidate | Encode 20:06:08, invalidate 20:06:10-20:06:20, panic 20:08:48. 60s idle wait completed with NO panic; crashed ~100s after wait ended. DVA 0x1000082d500 PTE 0x20b AXI_ID 0xc0 — identical to Panic #3. |
 | B   | PENDING | — | Skipping to B next (counter patched to start at B) |
 | C   | PENDING | — | — |
 
-**Run A analysis:** The panic still fires after immediate session invalidation. The ~40-50s
-deferral (vs. 90-130s in Phase 2A idle tests) suggests invalidation may *accelerate* the fault
-rather than prevent it, but the fault is NOT synchronous with teardown. The armed DMA descriptor
-survives session destruction and fires later — consistent with hardware-level (DART/firmware)
-state that kernel teardown does not clean up.
+**Run A analysis:** Session invalidation does NOT accelerate the fault. The 160s deferral is
+*longer* than the 90-130s baseline, and the panic outlasted the entire 60s post-invalidation
+watch window. The armed DMA descriptor survives session destruction completely — the fault is
+a true hardware/firmware timer, not tied to kernel session lifecycle. This also means the DVA
+address is deterministic: Panic #3 and #6 hit identical DVA 0x1000082d500 / PTE 0x20b, suggesting
+the hardware channel re-arms the same descriptor slot across sessions.
 
 If A works, the test protocol drops from 120s to ~10s — massive throughput improvement for all
 downstream testing including regression checks during Ghidra analysis.
