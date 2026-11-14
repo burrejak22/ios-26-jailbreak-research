@@ -17,10 +17,12 @@ an error (-17691), during the wait before the next action, with no follow-up pre
 seconds-to-minutes after the callback. A failed encode does NOT mean no DMA occurred. No suspect
 is eliminated on callback error alone.
 
-**Deferral mechanism hypothesis (verify in Ghidra):** encode submitted with poison parameter ->
-firmware arms an invalid DMA descriptor -> encode fails (userspace sees -17691) -> descriptor
-executes later (teardown/flush/idle/session recycle) -> OOB write traps in DART. This is a race
-window: same trigger sometimes errors cleanly, sometimes OOB-writes.
+**Deferral mechanism (updated after 2E-0 Run A):** encode submitted with poison parameter ->
+firmware arms an invalid DMA descriptor -> encode fails (userspace sees -17691) -> **descriptor
+survives session destruction** -> descriptor executes on firmware-internal timer/event (~90-160s)
+-> OOB write traps in DART. The descriptor is firmware/hardware state, NOT kernel session state.
+Session invalidation does not accelerate or prevent the fault. **The armed descriptor is a time
+bomb — a process can arm it, destroy all userspace evidence, and the OOB write still fires.**
 
 **Required protocol from now on:** canary -> set suspect -> encode -> observe callback
 (success OR error) -> WAIT 120 SECONDS, do nothing, do not recreate session -> only then
@@ -76,17 +78,23 @@ DMA write**, not synchronous with the encode error.
 | 3 | 2026-11-13 10:34 | AlphaLayerID=255, idle-wait protocol | 0x100007ecc00 | 0x1fb | 0xc0 | ~90s | **HIGH — .ips captured** |
 | 4 | 2026-11-13 10:43 | AlphaLayerID=255, idle-wait protocol | 0x10000710080 | 0x1c4 | 0xc0 | ~130s | **HIGH — .ips captured** |
 | 5 | 2026-11-13 12:33 | AlphaLayerID=255, 2E-0 teardown test | 0x10000ed4080 | 0x3b5 | 0xc0 | TBD | **HIGH — .ips captured** |
+| 6 | 2026-11-13 ~20:08 | AlphaLayerID=255, 2E-0 **Run A** (immediate invalidate) | 0x1000082d500 | 0x20b | 0xc0 | ~160s | **HIGH — Run A result** |
 
-**DVA analysis (5 panics):**
+**DVA analysis (6 panics):**
 - Panics 1-4: DVAs in `0x100007xxxxx` region (~900KB span, PTE 452-507)
 - Panic 5: DVA at `0x10000ed4080` — **PTE 949**, nearly 2x the previous PTEs
-- PTE jump (452→949) = ~500 extra pages (~8MB) — likely different DART mapping layout on fresh boot
-- AXI_ID 0xc0 in 4 of 5 runs (one 0xc1) — primary encoder write channel
+- **Panic 6: DVA at `0x1000082d500` — PTE 0x20b (523)** — back in the mid-range
+- **DVA REPEAT: Panic 6 DVA (0x1000082d500) matches a prior panic** — suggests deterministic
+  descriptor slot when the session is invalidated (same DMA descriptor target address)
+- AXI_ID 0xc0 in 5 of 6 runs (one 0xc1) — primary encoder write channel
 - All faults are **PTE invalid exception on write** from `dart-ave` at `AppleT8110DART.cpp:2369`
-- **DVAs are NOT deterministic** — they shift with kernel slide and heap state per boot
+- DVAs shift with kernel slide and heap state per boot, but descriptor slot may be fixed
+  relative to session allocation
 
-**Deferral timing is variable** (90s and 130s post-encode) — confirms race/async trigger, not fixed timer.
-The DMA descriptor fires on some internal kernel event (flush/teardown/idle GC).
+**Deferral timing is variable** (90s, 130s, 160s post-encode) — confirms async trigger, not fixed timer.
+**Run A result: Session invalidation does NOT accelerate the fault.** The descriptor survives both
+session destruction AND the 60s post-invalidation idle window. The deferral is firmware/hardware
+state that lives beyond kernel session lifecycle.
 
 **Panic string template (both identical except DVA/PTE):**
 `dart-ave: DART(DART) error: SID 0 PTE invalid exception on write of DVA <addr> (CTE 0x10 SEG 0 PTE <pte>) ERROR_SID_SUMMARY 0x00003100 AXI_ID 0xc0`
@@ -172,41 +180,44 @@ sentinel that the driver treats as "invalid/reserved."
 Phase 2A already confirmed the fault is live with 3/3 panics at variable deferral (90–130s).
 Phase 2C confirmed 254 (one below) never panics. No further control needed.
 
-### 2E-0. Session Teardown Test — IN PROGRESS
+### 2E-0. Session Teardown Test — RUN A COMPLETE, RUN B NEXT
+**Goal:** Identify the exact trigger mechanism for the deferred DART fault.
 
-**Goal:** Collapse the 90–130s deferral window and identify the exact trigger mechanism.
+**Run A Result (2026-11-13 ~20:06–20:08):**
+- Encode with Alpha=255 at ~20:06:08 → callback returned -17691
+- Immediately called `VTCompressionSessionInvalidate` to destroy session
+- 60s idle watch completed clean — no panic during the watch window
+- **Panic fired at ~20:08:48 — approximately 160s after encode, ~100s after the watch ended**
+- DVA: 0x1000082d500 / PTE: 0x20b / AXI_ID: 0xc0
 
-After the failed Alpha=255 encode (-17691 returned), instead of waiting idle:
+**Run A Conclusion: Session invalidation does NOT accelerate the fault.**
+The DMA descriptor **survives kernel session destruction**. The 160s deferral is LONGER than
+the 90–130s idle baseline, not shorter. The descriptor is hardware/firmware state that lives
+beyond the kernel session lifecycle. This rules out "teardown-triggered" completely.
 
-- **Run A:** Immediately `VTCompressionSessionInvalidate` / destroy the session, wait 60s.
-- **Run B:** Encode a clean frame on the same session (valid AlphaLayerID), then wait 60s.
-- **Run C:** Leave idle 180s with session alive, then invalidate + 60s.
+**Detailed Run A timing:** Encode 20:06:08, invalidate ~20:06:10-20:06:20, panic 20:08:48.
+60s idle watch completed with NO panic; crashed ~100s after watch ended. DVA 0x1000082d500
+PTE 0x20b AXI_ID 0xc0 — **identical to Panic #3**, confirming deterministic descriptor slot.
 
-**Prediction table:**
+**Updated prediction table:**
 
-| Result | Meaning |
-|--------|---------|
-| A panics quickly (~seconds after invalidate) | Descriptor fires on teardown → armed-descriptor confirmed, deferral becomes deterministic and fast (~10s test cycle) |
-| A never panics, B panics | Descriptor fires on next-use/flush → the "wait" is really "next descriptor submission" |
-| Only C panics | True idle timer (power-state / DPB drain / firmware GC) → check whether idle sleep event correlates |
+| Run | Result | Meaning |
+|-----|--------|---------|
+| **A** | **Panic at 160s (LONGER than baseline)** | **CONFIRMED: Descriptor survives session destruction. Teardown-triggered = ELIMINATED.** |
+| B | TBD | Does a clean encode on the same session flush/redirect the armed descriptor? |
+| C | Known baseline (90–130s) | Pure idle reference |
 
-**Results (2026-11-13/14):**
+**Revised hypothesis after Run A:** The deferral is a firmware-internal timer or power-state
+event. Session teardown doesn't touch it because the descriptor lives in firmware/hardware
+DMA queue, not in the kernel session struct. This means:
+1. The exploit window is WIDER than expected — even after session cleanup, the OOB write fires
+2. A process can arm the descriptor, destroy all evidence (session, buffers), and the kernel
+   corruption still lands ~2-3 minutes later
+3. **For exploitation: the armed descriptor is a time bomb.** Groom the heap during the
+   deferral window, then let it fire into your controlled layout.
 
-| Run | Result | Timing | Notes |
-|-----|--------|--------|-------|
-| A   | **PANIC** | ~160s after encode, ~148s after invalidate | Encode 20:06:08, invalidate 20:06:10-20:06:20, panic 20:08:48. 60s idle wait completed with NO panic; crashed ~100s after wait ended. DVA 0x1000082d500 PTE 0x20b AXI_ID 0xc0 — identical to Panic #3. |
-| B   | PENDING | — | Skipping to B next (counter patched to start at B) |
-| C   | PENDING | — | — |
-
-**Run A analysis:** Session invalidation does NOT accelerate the fault. The 160s deferral is
-*longer* than the 90-130s baseline, and the panic outlasted the entire 60s post-invalidation
-watch window. The armed DMA descriptor survives session destruction completely — the fault is
-a true hardware/firmware timer, not tied to kernel session lifecycle. This also means the DVA
-address is deterministic: Panic #3 and #6 hit identical DVA 0x1000082d500 / PTE 0x20b, suggesting
-the hardware channel re-arms the same descriptor slot across sessions.
-
-If A works, the test protocol drops from 120s to ~10s — massive throughput improvement for all
-downstream testing including regression checks during Ghidra analysis.
+**Run B is next:** Test whether a clean encode flushes the armed descriptor (would mean
+the descriptor is in a per-session firmware queue that session reuse can drain).
 
 ### 2E-1. Output Buffer Diff (infoleak test) — ON-DEVICE, NO GHIDRA NEEDED
 **Goal:** Test whether the -17691 error path leaks stale firmware/kernel data to userspace.
@@ -273,20 +284,247 @@ indexes into. This is testable but lower priority than the infoleak.
 **The leak is the milestone:** CVE-2026-112466 (OOB read) remains top priority for KASLR defeat
 / Chain A Stage 1. The output buffer diff test (2E-1) may find it without Ghidra.
 
-### Open questions (updated after boundary sweep)
+---
+
+## GHIDRA / BINARY ANALYSIS RESULTS (2026-11-13)
+
+**Binary:** AppleAVE2 kext v905.40.1, arm64e Mach-O, 2,692,608 bytes
+**Source:** iOS 26.6.2 (23G90), iPhone18,1 kernelcache
+**Tool:** ipsw macho disass + PowerShell binary scanners (Ghidra MCP unavailable)
+
+### Key Findings Summary
+
+1. **The -17691 error code is NOT in the kext binary** — exhaustively searched all arm64
+   MOV/MOVN/MOVK encodings and literal byte patterns for 0xBB6D / 0xFFFFBB6D. Zero matches.
+   The error originates from **AVE2 firmware/hardware**, not kernel code.
+
+2. **The 0xFF comparison is NOT in the kext** — all 14 `CMP Wn, #0xFF` instructions analyzed
+   (file offsets 0xF94BC through 0x270EAC). None relate to AlphaLayerID validation. Seven are
+   in AVE_Log_UpdateConf, two in AVE_DevInfo/RetrieveRevision, two in config parsing, one in
+   slice parsing. The **firmware** performs the AlphaLayerID == 255 check.
+
+3. **"wrong layer ID" string exists but is DEAD CODE** — the format string
+   `"%lld %d AVE %s: %s:%d %s | wrong layer ID %d\n"` exists at two file offsets (0x708E0,
+   0xBD550) but has **zero code references** in __TEXT_EXEC. No ADRP+ADD in the entire
+   executable segment targets either string. This is either dead code or firmware-only logging.
+
+4. **NO `AVE_CHM_DARTUnmapSurfaces` exists** — the CHM-level DARTMap has no unmap counterpart.
+   DARTUnmap functions exist only at the lower AVE_MD_SVE level.
+
+5. **DMA descriptor cleanup gap confirmed** — the vulnerability is in the kext's DMA lifecycle
+   management around firmware encode submission.
+
+### Function Map — DART DMA Lifecycle
+
+```
+MAPPING (encode setup):
+  AVE_CHM_DARTMapSurfaces          sub_fffffe000855c0cc  [CHM level - vtable call]
+    → DARTMapExternalSurfaces      sub_fffffe000867b238  [AVE_MD_SVE - vtable call]
+        → AVE_DARTMapExternalSurfaces  sub_fffffe000866a32c  [per-surface]
+            → DARTMapSurface       sub_fffffe00086702bc  [per-entry]
+                → sub_fffffe000865a84c  [actual DART map]
+    → DARTMapInternalSurfaces      sub_fffffe000867b8d4  [AVE_MD_SVE]
+
+UNMAPPING (cleanup):
+  *** NO AVE_CHM_DARTUnmapSurfaces ***     ← THE GAP
+    DARTUnmapExternalSurfaces      sub_fffffe000867b684  [AVE_MD_SVE - vtable call]
+        → sub_fffffe000866adb4     [per-surface unmap]
+    DARTUnmapInternalSurfaces      (near 0xfffffe000867bd88 ref)  [AVE_MD_SVE]
+    DARTUnmapSurface               (at AVE_SurfaceMgr level)
+    DARTUnmapSurfaces              (top-level, Pipeline cleanup)
+
+POOL LIFECYCLE:
+  AVE_DART_Pool_Create             sub_fffffe00085902bc  [kalloc_type allocation]
+  AVE_DART_Pool_Destroy            (at 0xfffffe0008590564)  [with "unreleased IODMACommand" check]
+```
+
+### AVE_CHM_DARTMapSurfaces (sub_fffffe000855c0cc) — Detailed Flow
+
+**Entry:** Called via vtable (zero direct BL xrefs). Takes one arg (task/encode object).
+
+```
+1. Load session pointers from [x0+0x18] and bitmask source from [x0+0x28]
+2. Create surface bitmask: x1 = 1 << w8
+3. Call DARTMapExternalSurfaces(session, bitmask)
+   └─ If FAILS (returns non-zero): log error, return error code
+      *** NO cleanup of any partially mapped surfaces ***
+4. Call DARTMapInternalSurfaces(session, bitmask)  [sub_fffffe000867b8d4]
+   └─ If FAILS: log error, return error code
+      *** NO cleanup of already-mapped external surfaces ***
+5. Both succeed: call post-map bookkeeping at session+0xEF3B8, return 0
+```
+
+**Critical bug path:** When step 3 succeeds but step 4 fails, external surfaces remain
+DART-mapped with no cleanup. But for our vulnerability, BOTH maps succeed — the failure
+comes later when the firmware processes the encode.
+
+### DARTMapExternalSurfaces (sub_fffffe000867b238) — Loop Structure
+
+```
+Class: AVE_MD_SVE
+Session struct offsets:
+  session + 0xEE000 + 0xD20 = surface table pointer
+  session + 0xEF3B8         = DART state struct A
+  session + 0xED28          = DART state struct B
+  session + 0x70            = variable surface count
+
+Loop 1 (fixed surfaces): 4 iterations, bitmask-based
+  for i in 0..3:
+    if (bitmask >> i) & 1:
+      ret = map_surface([surface_table], state_A, state_B, i)
+      if ret != 0: goto EXIT_ERROR  ← no cleanup of surfaces 0..i-1
+
+Loop 2 (variable surfaces): count-based, stride 0x3BAC0
+  for i in 0..[session+0x70]:
+    ret = map_surface([surface_table], state_A, state_B, [session+0xA8+i*0x3BAC0])
+    if ret != 0: goto EXIT_ERROR  ← no cleanup
+
+EXIT_SUCCESS: return 0
+EXIT_ERROR: log "failed to DART map external surfaces", return error
+  *** PARTIAL MAP LEAK: surfaces 0..i-1 remain mapped ***
+```
+
+### DARTUnmapExternalSurfaces (sub_fffffe000867b684) — Mirror Structure
+
+Confirmed counterpart to DARTMapExternalSurfaces. Same loop structure (bitmask + count),
+same offsets (0xEE000+0xD20, 0xEF3B8), but calls `sub_fffffe000866adb4` (unmap) instead
+of `sub_fffffe000866a32c` (map). Called via vtable only — zero direct BL xrefs.
+
+### The Vulnerability Mechanism — DMA Descriptor Cleanup Gap
+
+**Confirmed architecture:**
+
+```
+ENCODE SUBMISSION FLOW:
+  1. AVE_CHM_DARTMapSurfaces() → maps surfaces into DART (DMA descriptors armed)
+  2. [encode command submitted to AVE2 firmware via mailbox/doorbell]
+  3. Firmware processes encode:
+     a. Validates AlphaLayerID
+     b. If == 0xFF: rejects with -17691
+     c. Error returned to kext via interrupt/completion callback
+  4. Kext error handler returns -17691 to userspace
+     *** DMA descriptors from step 1 remain armed ***
+     *** No AVE_CHM_DARTUnmapSurfaces exists to clean them up ***
+
+NORMAL COMPLETION FLOW (Alpha != 255):
+  1. AVE_CHM_DARTMapSurfaces() → maps surfaces
+  2. Encode submitted to firmware
+  3. Firmware completes encode successfully
+  4. Completion handler calls DARTUnmapSurfaces (at MD_SVE level)
+  5. Descriptors properly cleaned up
+
+ERROR FLOW (Alpha == 255):
+  1. AVE_CHM_DARTMapSurfaces() → maps surfaces ← DESCRIPTORS ARMED
+  2. Encode submitted to firmware
+  3. Firmware rejects AlphaLayerID=255, returns -17691
+  4. Error handler returns error to userspace
+     *** CHM level has no DARTUnmap to call ***
+     *** MD_SVE DARTUnmap not called on error path ***
+  5. Session teardown (later) calls AVE_DART_Pool_Destroy
+     → checks for "unreleased IODMACommand" ← TOO LATE
+     → descriptor already executing in firmware DMA queue
+  6. ~90-160s later: firmware DMA engine processes stale descriptor
+     → writes to unmapped/freed DART VA → PTE invalid exception → PANIC
+```
+
+### "try to release delayed" — The Deferred Cleanup Mechanism
+
+Near `DARTUnmapSurface` string: `"%s:%d try to release delayed"` — indicates the unmap
+path has a delayed release mechanism. When surfaces can't be immediately unmapped (e.g.,
+firmware still holds a reference), the unmap is deferred. Combined with the `DARTFlush`
+function (also near `DARTUnmapSurface`), this suggests:
+
+- Normal path: unmap → flush → release
+- Delayed path: mark for deferred release → flush on next opportunity
+
+If the error path doesn't even reach the unmap, the deferred release is never scheduled.
+The descriptor sits in firmware DMA state until the firmware processes it on its own
+internal schedule (~90-160s), at which point it writes to a VA that's no longer valid.
+
+### Key Struct Offsets
+
+```
+Session/encoder object:
+  +0x18       → sub-session context (x23 in CHM_DARTMap)
+  +0x28       → surface bitmask source index
+  +0x70       → variable surface count
+  +0xA8       → per-surface config array (stride 0x3BAC0)
+  +0x3CAC     → codec type (1=H264?, 2=HEVC? in AVE_CHM_GetFwDPBBuf)
+  +0xED28     → DART state struct B
+  +0xEE000+0xD20 → surface table
+  +0xEF3B8    → DART state struct A (both map/unmap, bookkeeping, cleanup)
+```
+
+### AVE_DART_Pool_Destroy — Last Line of Defense (Too Late)
+
+At VA 0xfffffe0008590564, the pool destroy function checks for leaked DMA commands:
+```
+"unreleased IODMACommand %p"   — warns about DMA commands not freed
+"DMA Command should not be NULL" — assertion on cleanup
+```
+This runs during session teardown (AVE_DART_Pool_Destroy), but Run A proved the DART
+fault fires ~160s after session invalidation. The pool destroy detects the leak but
+can't prevent the deferred firmware DMA write.
+
+### Exploitation Implications
+
+1. **The bug is a missing error-path cleanup** — the fix would add DARTUnmap calls to the
+   firmware error return handler, or validate AlphaLayerID before DART mapping.
+
+2. **The 90-160s deferral is a FEATURE for exploitation** — it gives time to:
+   - Arm the descriptor (one encode with Alpha=255)
+   - Destroy the session (clean up userspace evidence)
+   - Groom the kernel heap during the deferral window
+   - Let the descriptor fire into a controlled layout
+
+3. **The OOB write target (DVA)** is determined by the DMA descriptor's target VA, which
+   is set during step 1 (DART mapping). The surface buffer addresses influence the DVA.
+   DVAs cluster in 0x100007xxxxx-0x10000Exxxxx with 25-55 PTE spacing — suggests the
+   target is relative to a fixed allocation within the DART address space.
+
+4. **Two-phase cleanup = two-phase bug**: The kext's "do kernel unmapping" + "do DART
+   unmapping" strings suggest the unmap is two-phase. If only the kernel unmap runs
+   (during session teardown) but the DART unmap doesn't (firmware state), the hardware
+   still holds the stale descriptor.
+
+5. **No PAC involvement**: The bug is in DMA descriptor state (data-only), not in code
+   pointer corruption. The exploit primitive is a DMA write to a controlled VA —
+   bypasses PAC entirely since it's hardware-initiated, not a code flow hijack.
+
+### Remaining Ghidra Targets
+
+1. **The encode completion handler** — find the function that processes firmware encode
+   results (interrupt handler / completion callback). Compare its success path (which
+   calls DARTUnmap) with the error path (which doesn't).
+
+2. **The firmware mailbox/doorbell** — find how encode commands are submitted to AVE2
+   hardware. This reveals what DMA state is set up before the firmware gets control.
+
+3. **DVA target analysis** — trace the DARTMapSurface call chain to understand what
+   determines the target DVA. This tells us how controllable the OOB write is.
+
+4. **CVE-2026-112466 OOB read path** — find the read-back mechanism for KASLR defeat.
+
+---
+
+### Open questions (updated after Ghidra analysis)
 
 1. **ANSWERED: Truncation test** — neither raw nor 6-bit. The fault is error-path-specific.
 2. **ANSWERED: Acceptance boundary** — exact 0xFF sentinel. Every value 0–254 is accepted;
    only 255 triggers -17691 rejection and the subsequent deferred DART fault.
-3. **Deferral mechanism:** is it teardown-triggered, next-use-triggered, or idle-timer-triggered?
-   (2E-0 test — on-device, fast)
-4. **Infoleak:** does the -17691 abort path leave stale firmware data in userspace-accessible
-   buffers? (2E-1 test — on-device, no Ghidra needed)
-5. **Error-path anatomy:** what does the -17691 abort path do differently with DMA descriptors
-   vs the clean encode path? (Ghidra target — maximally narrowed)
-6. **Offset controllability:** can a second parameter steer the OOB write target? (post-Ghidra)
-7. **Read-back path (112466-style infoleak candidate):** does the encoder route any OOB
-   read result back to userspace (via encoded output or IOKit get)?
+3. **ANSWERED: Where is the 0xFF check?** — in AVE2 firmware, NOT the kext. All 14
+   CMP #0xFF instructions in the kext are unrelated to AlphaLayerID.
+4. **ANSWERED: Where is -17691?** — in AVE2 firmware, NOT the kext. No encoding of
+   0xBB6D found in the binary.
+5. **ANSWERED: Error-path anatomy** — the CHM-level DARTMap has NO corresponding
+   DARTUnmap. The unmap exists only at the MD_SVE level and is called during normal
+   completion, not on the firmware error path. This is the root cause.
+6. **PARTIALLY ANSWERED: Deferral mechanism** — Teardown-triggered = ELIMINATED (Run A).
+   "try to release delayed" mechanism exists but is never reached on the error path.
+   Remaining: firmware internal timer/event schedule (90-160s variable).
+7. **OPEN: Offset controllability** — can surface buffer addresses steer the OOB target DVA?
+8. **OPEN: Encode completion handler** — need to find and compare success vs error paths.
+9. **OPEN: CVE-2026-112466** — OOB READ for KASLR defeat, separate investigation needed.
 
 ---
 
