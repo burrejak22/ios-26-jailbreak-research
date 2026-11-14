@@ -873,9 +873,324 @@ Completely separate from the firmware's AlphaLayerID=255 → -17691 rejection.
 | 0xfffffe00085c3d54 | FUN_fffffe00085c3d54 | AVE_PipelineReconfigure |
 | 0xfffffe0008636d70 | FUN_fffffe0008636d70 | AVE_ValidateLayerParams |
 
-### Remaining Targets (unchanged)
+### Additional Functions Renamed (this session, continued)
 
-1. **Encode completion handler** — find the interrupt/callback that processes firmware results
-2. **Firmware mailbox/doorbell** — understand encode submission DMA setup
-3. **DVA target controllability** — trace DARTMapSurface to determine DVA steering
-4. **CVE-2026-112466** — OOB READ for KASLR defeat
+| Address | Old Name | New Name |
+|---------|----------|----------|
+| 0xfffffe000860587c | FUN_fffffe000860587c | AVE_ISR_ReceiveCommandDone |
+| 0xfffffe0008607474 | FUN_fffffe0008607474 | AVE_ISR_InterruptHandler |
+| 0xfffffe00086072e8 | FUN_fffffe00086072e8 | AVE_ISR_ChannelDispatch |
+| 0xfffffe0008565460 | FUN_fffffe0008565460 | AVE_FrameCompletionNotify |
+| 0xfffffe00086055f0 | FUN_fffffe00086055f0 | AVE_ProcessOutputData_Dispatch |
+| 0xfffffe000860398c | FUN_fffffe000860398c | AVE_ProcessCommandResult |
+| 0xfffffe000865a84c | FUN_fffffe000865a84c | AVE_DART_MapSurface_Impl |
+| 0xfffffe0008593a9c | FUN_fffffe0008593a9c | AVE_IODMACommand_MapSurface |
+| 0xfffffe0008603cd8 | FUN_fffffe0008603cd8 | AVE_ProcessEncodeOutput |
+
+---
+
+## GHIDRA DEEP ANALYSIS — DART LIFECYCLE & EXPLOIT CHAIN (2026-11-14)
+
+### DELIVERABLE 1: DART Map/Unmap Call Graph with Real Names
+
+All DART lifecycle functions with addresses, names, and callers:
+
+```
+DART LIFECYCLE FUNCTIONS — COMPLETE CALL GRAPH
+═══════════════════════════════════════════════
+
+MAP CHAIN (encode setup → DART map):
+────────────────────────────────────
+  IOUserClient external method (0x86a* range)
+    → FUN_fffffe00085cae90 / FUN_fffffe00085ce4f0 (encode pipeline setup)
+      → FUN_fffffe00085c6860 (encode path setup)
+        → FUN_fffffe000860f318 (encode dispatch)
+          → FUN_fffffe00085fc4d4 (pre-encode DART setup)
+            → FUN_fffffe00085fc3b4 (DART map orchestrator)
+              → FUN_fffffe00085fa6cc (CHM DART map caller)
+                → AVE_CHM_DARTMapSurfaces (0xfffffe000855c0cc)
+                    CALLERS: FUN_fffffe00085fa6cc (1 xref)
+                    CALLS:
+                    ├── DARTMapExternalSurfaces (0xfffffe000867b238)
+                    │     → AVE_DARTMapExternalSurfaces (0xfffffe000866a32c) [per surface]
+                    │       → DARTMapSurface (0xfffffe00086702bc)
+                    │         → AVE_DART_MapSurface_Impl (0xfffffe000865a84c)
+                    │           → AVE_IODMACommand_MapSurface (0xfffffe0008593a9c)
+                    │             → IODMACommand::genIOVMSegments() [vtable+0xb8]
+                    │               → DART hardware mapper allocates DVA
+                    └── DARTMapInternalSurfaces (0xfffffe000867b8d4) [bitmask-based]
+
+UNMAP CHAIN (cleanup — COMPLETELY SEPARATE hierarchy):
+──────────────────────────────────────────────────────
+  FUN_fffffe00085c5764
+    → AVE_PipelineReconfigure (0xfffffe00085c3d54)
+        CALLERS: FUN_fffffe00085c5764 (1 xref)
+        CONDITION: ONLY after unregister→updateEUMap→register ALL succeed
+        CALLS:
+        → DARTUnmapSurfaces_Wrapper (0xfffffe000868b400)
+            CALLERS: AVE_PipelineReconfigure ONLY (1 code xref)
+            → FUN_fffffe000868b2e8
+              → DARTUnmapExternalSurfaces (0xfffffe000867b684)
+                → AVE_DARTUnmapExternalSurfaces (0xfffffe000866adb4) [per surface]
+                  → DARTUnmapSurface (0xfffffe0008670484)
+                    → DARTUnmapSurface_TwoPhase (0xfffffe0008658064)
+                        Contains: "do kernel unmapping", "do DART unmapping"
+
+INTERRUPT/COMPLETION CHAIN (firmware response — NO UNMAP):
+──────────────────────────────────────────────────────────
+  AVE_ISR_InterruptHandler (0xfffffe0008607474)
+    Contains: "interrupt %p %d 0x%x"
+    Checks: state==3 (command complete)
+    → AVE_ISR_ChannelDispatch (0xfffffe00086072e8)
+      ├── Channel 1: FUN_fffffe0008603570 (HW interrupt)
+      └── Channel 2: AVE_ISR_ReceiveCommandDone (0xfffffe000860587c)
+            Contains: "receive command done", "firmware command error"
+            → AVE_ProcessCommandResult (0xfffffe000860398c)
+            │   Contains: "firmware command error", "frame drop"
+            │   On error: logs error, handles -0x3f6/-0x3fa with frame drop, NO UNMAP
+            │
+            ├── [SUCCESS path] → AVE_ProcessOutputData_Dispatch (0xfffffe00086055f0)
+            │     Dispatches by command type (2-6, default)
+            │     Type 2 (encode): → AVE_ProcessEncodeOutput (0xfffffe0008603cd8)
+            │       → AVE_FrameCompletionNotify (0xfffffe0008565460)
+            │         → FUN_fffffe00085f1b44 (client notification callback) ×2
+            │         NO DARTUNMAP ANYWHERE IN SUCCESS PATH
+            │
+            └── [ERROR path] → LAB_fffffe0008606770 (slot cleanup)
+                  Clears command buffer slot only
+                  NO DARTUNMAP, NO output processing, NO client notification
+
+SESSION TEARDOWN:
+─────────────────
+  AVE_DART_Pool_Destroy (0xfffffe00085904b0)
+    Contains: "unreleased IODMACommand"
+    Destroys IODMACommand pool objects
+    Called during session/client destruction
+
+  FUN_fffffe000866e284 (SurfaceMgr level)
+    Contains: "try to release delayed"
+    Surface manager cleanup
+```
+
+**FULL FUNCTION TABLE:**
+
+| Address | Name | Callers | Role |
+|---------|------|---------|------|
+| 0xfffffe000855c0cc | AVE_CHM_DARTMapSurfaces | FUN_0x85fa6cc (1) | Top-level CHM map |
+| 0xfffffe000867b238 | DARTMapExternalSurfaces | AVE_CHM_DARTMapSurfaces, FUN_0x868aeb4 (2) | External surface map loop |
+| 0xfffffe000867b684 | DARTUnmapExternalSurfaces | FUN_0x868b2e8 (1) | External surface unmap loop |
+| 0xfffffe000867b8d4 | DARTMapInternalSurfaces | AVE_CHM_DARTMapSurfaces (1) | Internal surface map loop |
+| 0xfffffe000866a32c | AVE_DARTMapExternalSurfaces | DARTMapExternalSurfaces (per-surface) | Per-surface map wrapper |
+| 0xfffffe000866adb4 | AVE_DARTUnmapExternalSurfaces | DARTUnmapExternalSurfaces (per-surface) | Per-surface unmap wrapper |
+| 0xfffffe00086702bc | DARTMapSurface | AVE_DARTMapExternalSurfaces + others | DART map with lock |
+| 0xfffffe0008670484 | DARTUnmapSurface | AVE_DARTUnmapExternalSurfaces + others | DART unmap with lock |
+| 0xfffffe000865a84c | AVE_DART_MapSurface_Impl | DARTMapSurface (1) | IOMapper + IODMACommand setup |
+| 0xfffffe0008593a9c | AVE_IODMACommand_MapSurface | AVE_DART_MapSurface_Impl (1) | IODMACommand::genIOVMSegments |
+| 0xfffffe000868b400 | DARTUnmapSurfaces_Wrapper | AVE_PipelineReconfigure ONLY (1) | Top-level unmap entry |
+| 0xfffffe00085c3d54 | AVE_PipelineReconfigure | FUN_0x85c5764 (1) | Pipeline reconfigure (conditional unmap) |
+| 0xfffffe0008658064 | DARTUnmapSurface_TwoPhase | DARTUnmapSurface chain | "do kernel unmapping"/"do DART unmapping" |
+| 0xfffffe00085904b0 | AVE_DART_Pool_Destroy | teardown path | "unreleased IODMACommand" |
+| 0xfffffe00085902bc | AVE_DART_Pool_Create | init path | IODMACommand pool allocator |
+| 0xfffffe0008607474 | AVE_ISR_InterruptHandler | hardware interrupt | Top-level ISR |
+| 0xfffffe00086072e8 | AVE_ISR_ChannelDispatch | AVE_ISR_InterruptHandler | Per-channel dispatch |
+| 0xfffffe000860587c | AVE_ISR_ReceiveCommandDone | AVE_ISR_ChannelDispatch (ch2) | Completion handler |
+| 0xfffffe000860398c | AVE_ProcessCommandResult | AVE_ISR_ReceiveCommandDone | Command result processor |
+| 0xfffffe00086055f0 | AVE_ProcessOutputData_Dispatch | AVE_ISR_ReceiveCommandDone | Output type dispatcher |
+| 0xfffffe0008603cd8 | AVE_ProcessEncodeOutput | AVE_ProcessOutputData_Dispatch (type 2) | Encode output handler |
+| 0xfffffe0008565460 | AVE_FrameCompletionNotify | AVE_ProcessEncodeOutput + others | Frame done notification |
+| 0xfffffe0008636d70 | AVE_ValidateLayerParams | encode setup path | "wrong layer ID" (kext-level) |
+
+### DELIVERABLE 2: Proof That Error Path Skips DARTUnmap
+
+**THE DEFINITIVE PROOF:**
+
+The firmware encode completion handler (`AVE_ISR_ReceiveCommandDone` at 0xfffffe000860587c)
+processes firmware results through `AVE_ProcessCommandResult` (0xfffffe000860398c). The
+critical branch:
+
+```c
+// Inside AVE_ISR_ReceiveCommandDone (0xfffffe000860587c):
+// After AVE_ProcessCommandResult returns...
+
+if ((int)uVar25 == 0) {
+    // === SUCCESS PATH ===
+    // Calls AVE_ProcessOutputData_Dispatch → AVE_ProcessEncodeOutput
+    // → AVE_FrameCompletionNotify → client callback
+    // STILL NO DARTUnmap — just output processing + notification
+    FUN_fffffe00086055f0(param_1, lVar12, param_3);  // process output data
+    // ...
+    FUN_fffffe0008565460(lVar12, lVar17, 1, 0);       // notify: status=1 (success)
+} else {
+    // === FIRMWARE ERROR PATH ("firmware command error") ===
+    // Logs error, goes DIRECTLY to slot cleanup
+    // NO AVE_ProcessOutputData_Dispatch
+    // NO AVE_FrameCompletionNotify
+    // NO DARTUnmap
+    goto LAB_fffffe0008606770;  // → clear command slot, return
+}
+
+// LAB_fffffe0008606770 (slot cleanup only):
+FUN_fffffe0008631064(*(param_1 + 0xe0), lVar21);  // clear slot
+*plVar2 = 0;                                       // zero command pointer
+*(param_1 + 0xf0) &= ~bitmask;                     // clear active flag
+*(param_1 + 0xf4 + slot*4) -= 1;                   // decrement counter
+// RETURN — no DARTUnmap, no surface cleanup
+```
+
+**Verification — DARTUnmap is NEVER called from any completion path:**
+
+1. `AVE_ISR_ReceiveCommandDone` (0x860587c): NO DARTUnmap calls
+2. `AVE_ProcessCommandResult` (0x860398c): NO DARTUnmap calls
+3. `AVE_ProcessOutputData_Dispatch` (0x86055f0): NO DARTUnmap calls (just dispatcher)
+4. `AVE_ProcessEncodeOutput` (0x8603cd8): NO DARTUnmap calls
+5. `AVE_FrameCompletionNotify` (0x8565460): NO DARTUnmap calls
+
+**DARTUnmapSurfaces_Wrapper (0x868b400) cross-references:**
+- 1 DATA ref (vtable pointer at 0x0b4e8ea7)
+- 1 CODE ref: `AVE_PipelineReconfigure` (0x85c3d54) — THE ONLY CALLER
+
+**AVE_PipelineReconfigure conditions for calling DARTUnmap:**
+```c
+// unregister → updateEUMap → register must ALL succeed
+result = unregister(...);
+if (result == 0) {
+    result = updateEUMap(...);
+    if (result == 0) {
+        result = register(...);
+        if (result == 0) {
+            DARTUnmapSurfaces_Wrapper(...);  // ONLY HERE
+        }
+    }
+}
+// ANY error → return WITHOUT calling DARTUnmap
+```
+
+**CONCLUSION:** DARTUnmap is NEVER called from the interrupt/completion handler chain.
+It is ONLY called from AVE_PipelineReconfigure, which is on a completely different call
+hierarchy (pipeline setup/teardown, not firmware response processing). When firmware
+rejects AlphaLayerID=255, the error path clears the command slot and returns — the
+DART-mapped surfaces from the encode setup are NEVER cleaned up.
+
+### DELIVERABLE 3: DVA Origin & Steerability Analysis
+
+**DARTMapSurface chain decompiled (0x86702bc → 0x865a84c → 0x8593a9c):**
+
+```
+DARTMapSurface (0x86702bc):
+  Validates: param_2 != 0, param_3 (surface_index) <= 3
+  Takes lock: FUN_0x853c6d8(param_1[0])
+  Checks bitmask: (param_1[1] >> index >> 16) & 1  [surface valid flag]
+  Checks: surface pointer at param_1[0x20 + index*8] != 0
+  CALLS: AVE_DART_MapSurface_Impl(param_2, index)
+  On success: accumulates size at param_1[0x98 + index*8]
+  Releases lock
+
+AVE_DART_MapSurface_Impl (0x865a84c):
+  Checks: *(param_1 + 0x68) != 0         [surface must be created]
+  Checks: *(param_1 + 0xf1) bit 2 set    [some state flag]
+  Checks: not already mapped via bitmask at *(param_1 + 0xf0)
+
+  MAPPING SEQUENCE:
+  1. uVar11 = *(param_1 + 0x78)           ← IOMapper (DART hardware instance)
+  2. uVar10 = func_0x9ecc544(*(param_1+0x68))  ← IOMemoryDescriptor from IOSurface
+  3. FUN_0x859593c(param_3, uVar11, uVar10)    ← IODMACommand::setMemoryDescriptor
+  4. result = FUN_0x8593a9c(param_3, *(param_1+0x78), &dva_out)
+                                           ← IODMACommand::genIOVMSegments [THE DART MAP]
+  5. DVA stored at: *(param_1 + 0xc0 + index*8) = dva_out
+
+  RANGE CHECK (DART type 3 only):
+  if (dva + *(param_1 + 0xe0) >= 0x70800001)
+    → "DART mapped address is out of range [0x%llx, 0x%llx)"
+    → returns 0xFFFFFC06
+
+  On mapping failure: "failed to do DART mapping"
+  On error: calls FUN_0x8594a78 (IODMACommand::clearMemoryDescriptor), zeros stored DVA
+
+AVE_IODMACommand_MapSurface (0x8593a9c):
+  Checks: *(param_1 + 0x63c) == 1        [pool must be initialized]
+  Gets DMA command from pool: FUN_0x8594228(param_1, &cmd)
+  
+  ACTUAL DART MAP via vtable calls:
+  1. (**(cmd+0x18) + 0x88)(mapper, 1)     ← IODMACommand::setMemoryDescriptor
+  2. (**(cmd+0x18) + 0xb8)(mapper, &addr, &segments, &count)
+                                           ← IODMACommand::genIOVMSegments [HARDWARE MAP]
+  3. On success: *(cmd + 0x20) = mapped_addr  ← DVA stored in command object
+  4. Increments: *(param_1 + 0x688) += 1      [total map count]
+  5. Accumulates: *(param_1 + 0x690) += (*param_2->vtable+0xb0)(param_2)  [total size]
+  
+  On failure: "failed to get mapped DART address", returns 0xFFFFFC18
+```
+
+**DVA STEERABILITY ASSESSMENT:**
+
+| Property | Value | Implication |
+|----------|-------|-------------|
+| DVA source | IODMACommand::genIOVMSegments() via IOMapper (DART HW) | Hardware-allocated IOVA |
+| DVA controllable? | NO — allocated from DART aperture by kernel IOMapper | Attacker cannot choose DVA value |
+| DVA predictable? | PARTIALLY — sequential allocation from DART pool | Can be influenced by allocation pattern |
+| DART aperture max | 0x70800000 (~1.88 GB, type 3 check) | Fixed hardware limit |
+| Physical backing | IOSurface provided by userspace (via IOMemoryDescriptor) | Attacker controls physical pages |
+| Surface count | Max 4 per encode (param_3 <= 3) | Up to 4 leaked DART mappings per trigger |
+
+**EXPLOIT STEERABILITY MODEL:**
+
+The DVA itself is NOT directly steerable — it's allocated by the DART hardware mapper
+from its IOVA aperture. However, the exploit does NOT need DVA steerability because:
+
+1. **The physical backing is userspace-controlled**: The IOSurface memory descriptor comes
+   from userspace via func_0x9ecc544, so the attacker controls WHICH physical pages get
+   DART-mapped.
+
+2. **The leak is about stale DART mappings, not stale DVAs**: After the firmware error,
+   the DART mapping (DVA → physical address) persists. When the deferred DMA fires 90-160s
+   later, it writes through the stale DART entry to whatever physical address it maps.
+
+3. **Physical page recycling is the attack vector**: 
+   - Map IOSurface A → DART maps its physical pages, gets DVA X
+   - Trigger AlphaLayerID=255 → firmware error → DART mapping DVA X → phys(A) persists
+   - Free IOSurface A → physical pages returned to kernel allocator
+   - Spray kernel objects → physical pages of A get reallocated for kernel heap objects
+   - Deferred DMA fires → writes through DVA X → DART translates to phys(A) → corrupts
+     kernel heap objects now occupying those physical pages
+
+4. **PAC bypass is inherent**: DMA writes bypass PAC because they go through the DART
+   hardware, not through CPU pointer authentication. The write target is physical memory,
+   not a CPU-visible virtual address.
+
+### DELIVERABLE 4: Encode Submission Path & CVE-2026-112466 (Partial)
+
+**Encode Submission Path (traced via xrefs):**
+
+```
+AppleAVE2UserClient external method
+  → FUN_0x85cae90 / FUN_0x85ce4f0 (encode pipeline entry)
+    → FUN_0x85c6860 (encode path setup)
+      → FUN_0x860f318 (encode dispatch)
+        → FUN_0x860f118 (alternate encode path)
+        → FUN_0x85fc4d4 (pre-encode DART setup)
+          → FUN_0x85fc3b4 (DART map orchestrator)
+            → FUN_0x85fa6cc
+              → AVE_CHM_DARTMapSurfaces (0x855c0cc)
+                [DART map chain continues as in Deliverable 1]
+```
+
+**EncodesAlpha reference:**
+- String "EncodesAlpha" at 0xfffffe00072be45a
+- Referenced from FUN_fffffe0008645bf0 (massive encode setup function, 192K+ chars decompiled)
+- This function handles all encode parameter setup including alpha layer configuration
+
+**CVE-2026-112466 (OOB READ for KASLR defeat) — Not Yet Located:**
+- The read-side (data copy back to userspace on completion) would be in the success path
+  of the completion handler
+- AVE_ProcessEncodeOutput (0x8603cd8) calls FUN_fffffe000869f0f8 which processes output
+  data — this is likely where the output surface data is copied/exposed
+- The OOB read would involve reading past the mapped region bounds during output processing
+- REQUIRES FURTHER ANALYSIS of FUN_fffffe000869f0f8 and the output surface handling
+
+### Remaining Targets
+
+1. **CVE-2026-112466 read-side** — trace FUN_fffffe000869f0f8 (output data processing) for
+   OOB read during encode output surface handling
+2. **Full IOUserClient selector map** — identify which externalMethod selector triggers encode
+3. **Session teardown DART cleanup** — verify whether AVE_DART_Pool_Destroy (0x85904b0) properly
+   unmaps DART on session destruction (affects exploit timing window)
