@@ -2042,3 +2042,62 @@ the error handler.
   coded output sizes, allocation patterns, DPB structure
 - Ping-2o/panicIDK: Armed sessions produce zero output bitstream ("readback conflict")
   — confirms encoder write surface is reachable even when normal output stops
+
+---
+
+### EXPERIMENT 3.0: Mode A — DART Re-claim Design (2024-11-14)
+
+**Coded-output buffer size formula** (from aquarat docs/18-coded-data-sizing.md):
+```
+AVE_CalcBufSizeOfCodedData:
+  base = align_up(W, mb) * H * 3/2   (mb=16 for AVC, 32 for HEVC)
+  size = align_up(base, 4096)
+  surface_alloc = align_up(size, 16384)
+
+At 320x240 (HEVC, mb=32):
+  align_up(320, 32) = 320
+  320 * 240 * 1.5 = 115,200
+  align_up(115200, 4096) = 118,784  (29 pages)
+  align_up(118784, 16384) = 131,072  (8 PTEs)
+
+Header: constant 0xC000 = 49,152 B → 3 PTEs
+Total per coded buffer: 11 PTEs
+Pool: up to 30 buffers → 330 PTEs theoretical max
+```
+
+**Mode A Implementation (in deploy_to_iphone.sh, Exp 3.0 button):**
+
+Phase 1 — ARM:
+- Create HEVC 320x240 session
+- Set AlphaLayerID=255 (sole DART panic trigger)
+- Encode frame → firmware arms DMA descriptor targeting coded-output DVA
+- Callback returns -17691
+
+Phase 2 — FREE:
+- VTCompressionSessionInvalidate → session teardown
+- DARTUnmapExternalSurfaces → DARTUnmapSurface_TwoPhase
+- DART PTEs freed, but firmware DMA descriptor stays armed with stale DVA
+
+Phase 3 — SPRAY:
+- Allocate 128 IOSurfaces at 131,072 bytes each (coded-output size class)
+- Also spray 32 IOSurfaces at 49,152 bytes (header size class)
+- Fill all with 0xDEADBEEF canary pattern
+- Goal: DART allocator reuses freed PTE slots for our IOSurfaces
+- Cross-boot PTE determinism (PTEs 0x1c4-0x20b) means targeted re-claim works
+
+Phase 4 — POLL (200s):
+- Monitor all sprayed surfaces every 1s for canary corruption
+- Firmware idle timer fires stale descriptor at ~90-160s post-arm
+- If we re-claimed the right PTE, write lands in our canary
+
+Phase 5 — READ:
+- Canary corrupted = Mode A confirmed = controlled write primitive
+- Analyze write pattern: offset, size, content (fixed-format encoder output)
+- Chain to CVE-2026-86916 (UAF→R/W) for kernel control
+
+**Key insight from aquarat docs/18:**
+The coded-output size formula is a CLOSED FORM — it does NOT depend on
+bitrate, framerate, level, profile or entropy mode. Only W, H, chroma format,
+bit depth, and the lossless/RC/HEIF flags. Under normal parameters it
+degenerates to "one uncompressed frame, page-rounded." This means we can
+predict the exact allocation size for any resolution.

