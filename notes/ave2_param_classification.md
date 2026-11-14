@@ -248,26 +248,31 @@ delayed-release walk deterministically and early. If Run B panics fast (~seconds
 encode rather than ~minutes after the failed one), the timing is now attacker-controlled — a major
 exploitability upgrade.
 
-**Run B — FINAL protocol (one reboot, specific prediction from Ghidra 2026-11-14):**
+**Run B v2 protocol (one reboot, frame-by-frame logging, specific prediction from Ghidra 2026-11-14):**
 
 1. Fresh reboot → app → canary OK.
 2. Arm: Alpha=255 → encode → -17691 observed, note wall-clock.
-3. Same session, no invalidation, immediately (within ~5s): set Alpha=0 (or 254) → encode
-   one clean frame.
-4. Watch and timestamp continuously for 5 minutes.
+3. Same session, no invalidation, set Alpha=0 → encode clean frames **one at a time**,
+   logging each frame number + timestamp as you go. Give each ~10s before the next.
+   Continue for up to 10 frames / 5 minutes total.
+4. Watch and timestamp continuously for panic.
 
-Record: encode→clean-encode delta, clean-encode→panic delta if it fires, DVA + PTE + AXI_ID
+Record per frame: frame#, wall-clock submitted, wall-clock callback, result code.
+Record overall: arm→first-clean delta, last-clean→panic delta if it fires, DVA + PTE + AXI_ID
 from the .ips.
 
-**Interpretation:**
-- Panic within ~30s of the clean encode → **prediction confirmed**: cleanup-phase walks the
-  delayed release inside the encode cycle, fire timing is now attacker-controlled. This is the
-  exploitability milestone — you choose the heap state at fire time.
-- Panic at normal 90–160s regardless → the walk happens at a different pipeline point than we
-  think; the clean encode still helps narrow it.
-- No panic in 5 min → the delayed-release queue didn't hold your surface (queue entry condition
-  `(flags & 0xf0000) == 0` is the gate). That itself is a finding: then ask what puts the
-  surface on the delayed queue, in Ghidra.
+**Interpretation (v2, frame-count disambiguates +0xf8 gate):**
+- Panic ≤ ~10s after clean frame #1 → **v4 model confirmed**: +0xf8 was already 1 from the
+  arming encode, first submission's TriggerCleanup walks the delayed release immediately.
+  Fire timing is attacker-controlled. This is the exploitability milestone.
+- Panic after frame #2 (not #1) → gate was cleared by error, re-armed by success — the
+  0→1 transition in AVE_SetEncodeActiveState triggers the immediate cleanup. Still attacker-
+  controlled but requires one "priming" frame.
+- Panic at normal 90–160s regardless of frame count → the walk happens at a different pipeline
+  point than we think; the clean encode still helps narrow it.
+- No panic in 5 min / 10 frames → the delayed-release queue didn't hold your surface (queue
+  entry condition `(flags & 0xf0000) == 0` is the gate). That itself is a finding: then ask
+  what puts the surface on the delayed queue, in Ghidra.
 
 **Run B prediction (CORRECTED Ghidra model 2026-11-14):** The clean encode's submission
 directly calls AVE_EncodeSubmit_TriggerCleanup (0x85ccd48) which, if *(session+0xf8)==1,
@@ -616,6 +621,18 @@ can't prevent the deferred firmware DMA write.
    (c) **Session teardown:** AVE_ClientClose → count==0 → AVE_SessionDestroy → SurfaceMgr_Cleanup
    → ReleaseDelayed → DARTUnmapSurface_TwoPhase.
    NOT firmware-internal timing.
+6a. **ANSWERED (2026-11-14): +0xf8 gate — who writes it?** The field `*(session+0xf8)` is the
+   **encode-active state flag**, controlled by `AVE_SetEncodeActiveState` (0x85ca838). Writers:
+   - `AVE_UC_EncodeStartStop` (0x86b41f0) — IOUserClient method. param_2=1 → sets +0xf8=1
+     (start encoding, also starts timers). param_2=0 → sets +0xf8=0 (stop, also stops timers).
+   - `AVE_UC_PowerEvent` (0x86b45d4) — power management handler. On sleep/power events
+     (codes 0xE0000310, 0xE0000250), dispatches +0xf8=0 (force stop).
+   - **No other writers exist** — firmware errors do NOT clear +0xf8.
+   **Critical implication for Run B:** After a failed Alpha=255 encode, +0xf8 stays 1 because
+   only explicit userspace stop or power events clear it. The gate is open for the clean encode's
+   submission to reach AVE_EncodeCycle_Cleanup → ReleaseAllDelayed. **Run B is confirmed viable.**
+   The Run B frame-count test disambiguates whether +0xf8 *transitions* matter (set by 0→1 at
+   encode start triggers an immediate cleanup on transition).
 7. **OPEN: Offset controllability** — can surface buffer addresses steer the OOB target DVA?
 8. **OPEN: Encode completion handler** — need to find and compare success vs error paths.
 9. **OPEN: CVE-2026-112466** — OOB READ for KASLR defeat, separate investigation needed.
@@ -1034,6 +1051,14 @@ Completely separate from the firmware's AlphaLayerID=255 → -17691 rejection.
 | 0xfffffe00085ce220 | FUN_fffffe00085ce220 | AVE_EncodeSubmit_WithCleanup |
 | 0xfffffe000860f318 | FUN_fffffe000860f318 | AVE_EncodeChannel_Service |
 | 0xfffffe000860a3c0 | FUN_fffffe000860a3c0 | AVE_ChannelService_DARTUnmap |
+
+### Functions Renamed (2026-11-14, +0xf8 gate analysis)
+
+| Address | Old Name | New Name |
+|---------|----------|----------|
+| 0xfffffe00085ca838 | FUN_fffffe00085ca838 | AVE_SetEncodeActiveState |
+| 0xfffffe00086b41f0 | FUN_fffffe00086b41f0 | AVE_UC_EncodeStartStop |
+| 0xfffffe00086b45d4 | FUN_fffffe00086b45d4 | AVE_UC_PowerEvent |
 
 ---
 
@@ -1457,7 +1482,45 @@ mapping, surface diff catches the written bytes.
    fire-control variant (loses the userspace process). Run B (encode-driven) is strictly
    better: fires the walk without teardown, keeping the process alive to observe/collect.
 
-2. **Command struct at error time — PARTIAL (2026-11-14)**
+2. **+0xf8 encode-active state gate — RESOLVED (2026-11-14)**
+
+   `AVE_SetEncodeActiveState` (0x85ca838) is the sole writer of `*(session+0xf8)`. Decompiled:
+   ```c
+   void AVE_SetEncodeActiveState(long session, int new_state) {
+       if (new_state == *(int *)(session + 0xf8)) return;  // no-op if unchanged
+       // Log: "Start %p %d <- %d" (new ← old)
+       if (new_state == 0) {
+           FUN_0x85cae90(session, -1);  // shutdown/stop path
+       } else if (new_state == 1 && completion_queue_empty(session + 0xa8)) {
+           AVE_EncodeCycle_Cleanup(session, -1);  // immediate cleanup on 0→1 transition
+       }
+       *(int *)(session + 0xf8) = new_state;
+       // Log: "End %p %d <- %d %d"
+   }
+   ```
+
+   **Callers (2 total, both IOUserClient level):**
+   - `AVE_UC_EncodeStartStop` (0x86b41f0): IOUserClient external method.
+     - param_2=1 (start): sets FUN_0x86b4544(1), FUN_0x86b458c(1) [timer start], then
+       dispatches AVE_SetEncodeActiveState(session, 1) through command gate.
+     - param_2=0 (stop): dispatches AVE_SetEncodeActiveState(session, 0) through command gate,
+       then sets FUN_0x86b4544(0), FUN_0x86b458c(0) [timer stop].
+   - `AVE_UC_PowerEvent` (0x86b45d4): IOUserClient power event handler.
+     - On specific power codes (0xE0000310, 0xE0000250): dispatches
+       AVE_SetEncodeActiveState(session, 0) through command gate (force stop on sleep).
+
+   **Key insight:** Firmware error codes (-17691) do NOT clear +0xf8. The flag persists as 1
+   after a failed Alpha=255 encode because only explicit userspace start/stop calls or power
+   events control it. The Run B prediction is confirmed viable: the gate is open for the clean
+   encode's TriggerCleanup to reach ReleaseAllDelayed.
+
+   **Transition behavior note:** When +0xf8 transitions from 0→1 and the completion queue is
+   empty, AVE_SetEncodeActiveState calls AVE_EncodeCycle_Cleanup immediately. This means if
+   +0xf8 were somehow 0 at the time of the clean encode (it shouldn't be, but the Run B v2
+   frame-count test disambiguates), the start→encode sequence would still trigger cleanup on
+   the 0→1 transition.
+
+3. **Command struct at error time — PARTIAL (2026-11-14)**
    - IPC command buffer is itself a DART-mapped surface (at IPC_pool + 0x28).
    - AVE_IPC_FreeCommandSlot converts command DVA to pool-relative offset:
      `pool_offset = FUN_0x865b494(surface, type, 0) + (command_DVA - base_DVA)`
