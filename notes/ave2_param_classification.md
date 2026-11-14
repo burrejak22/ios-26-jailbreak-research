@@ -1,4 +1,4 @@
-# AVE2 Parameter Classification — Device Test Results (rev. 2026-11-13)
+# AVE2 Parameter Classification — Device Test Results (rev. 2026-11-14)
 
 **Device:** iPhone 17 Pro (iPhone18,1), iOS 26.6.2
 **Test:** `VTSessionCopySupportedPropertyDictionary` on hardware HEVC encoder
@@ -91,17 +91,20 @@ DMA write**, not synchronous with the encode error.
 - DVAs shift with kernel slide and heap state per boot, but descriptor slot may be fixed
   relative to session allocation
 
-**Fire-context variance explained (model v3):** DVA differences across panics 1-6 are now
-explained by the two confirmed delayed-release walk paths (Ghidra-traced):
-- **Encode-cycle-start path:** AVE_SurfaceMgr_ReleaseAllDelayed (0x86708a4) runs at the start
-  of the next encode cycle — walks delayed queue, unmaps surfaces via DARTUnmapSurface_TwoPhase.
-  Different surfaces in the delayed queue at walk time → different DVAs.
-- **Session-teardown-at-zero path:** AVE_SurfaceMgr_Cleanup (0x866dc50) drains both delayed and
-  regular queues when the driver session count drops to zero.
-The 2A idle panics are explained by whatever timer/pressure eventually runs one of these two
-walks (or power/idle state reclaims pages outright). Run A's 160s deferral (longer than the
-90-130s idle baseline) is explained by VTCompressionSessionInvalidate triggering a different
-teardown path than the natural idle lifecycle, changing when the delayed release walk runs.
+**Fire-context variance explained (model v3.1, corrected 2026-11-14):** DVA differences across
+panics 1-6 are now explained by the three confirmed DART unmap paths (Ghidra-traced):
+- **Timer/channel-service path (idle panics):** Process timer → AVE_Heartbeat_ServicePipeline →
+  AVE_ServiceEncodeChannels → AVE_EncodeChannel_Service → ... → AVE_ChannelService_DARTUnmap →
+  FUN_0x866e870 → DARTUnmapSurface_TwoPhase. Direct per-surface unmap during channel servicing.
+  Different channel service states at fire time → different DVAs.
+- **Encode-submission path (Run B target):** Userspace encode → AVE_EncodeSubmit_TriggerCleanup
+  (gated on +0xf8==1) → AVE_EncodeCycle_Cleanup → ReleaseAllDelayed → DARTUnmapSurface_TwoPhase.
+  Synchronous, walks delayed-release queue — deterministic.
+- **Session-teardown-at-zero path:** AVE_ClientClose → count==0 → AVE_SessionDestroy →
+  AVE_SurfaceMgr_Cleanup → ReleaseDelayed → DARTUnmapSurface_TwoPhase.
+The 2A idle panics are the timer/channel-service path. Run A's 160s deferral is
+VTCompressionSessionInvalidate changing the session state (possibly clearing +0xf8 or altering
+channel service conditions), shifting when the channel service reaches the stale surface.
 
 **Deferral timing is variable** (90s, 130s, 160s post-encode) — confirms async trigger, not fixed timer.
 **Run A result: Session invalidation does NOT accelerate the fault.** The descriptor survives both
@@ -245,20 +248,41 @@ delayed-release walk deterministically and early. If Run B panics fast (~seconds
 encode rather than ~minutes after the failed one), the timing is now attacker-controlled — a major
 exploitability upgrade.
 
-**Run B protocol (one reboot):**
-1. Canary OK → arm with Alpha=255 → -17691 observed.
-2. WITHOUT invalidating anything, encode one clean frame (Alpha=254 or 0) on the SAME session
-   immediately — within seconds.
-3. Watch. If the panic lands within ~30s of the clean encode → CONFIRMED: encode-cycle-start
-   drives ReleaseAllDelayed → that's the fire trigger, timing now attacker-controlled.
-4. If no panic within 5 min → the walk didn't run or the target was re-mapped by then.
-   Note the result and move to 3.0 proper.
+**Run B — FINAL protocol (one reboot, specific prediction from Ghidra 2026-11-14):**
 
-**Run B prediction (from Ghidra):** The clean encode's setup path calls FUN_0x85cabf4, which
-iterates 4 surface slots and calls AVE_SurfaceMgr_ReleaseAllDelayed on each. This walks the
-delayed-release queue, calling DARTUnmapSurface_TwoPhase on queued surfaces. If the Alpha=255
-abort queued a surface for delayed release, the clean encode's setup should trigger the PTE
-invalidation — converting the "random 90-160s" deferral into a precise attacker-controlled fire.
+1. Fresh reboot → app → canary OK.
+2. Arm: Alpha=255 → encode → -17691 observed, note wall-clock.
+3. Same session, no invalidation, immediately (within ~5s): set Alpha=0 (or 254) → encode
+   one clean frame.
+4. Watch and timestamp continuously for 5 minutes.
+
+Record: encode→clean-encode delta, clean-encode→panic delta if it fires, DVA + PTE + AXI_ID
+from the .ips.
+
+**Interpretation:**
+- Panic within ~30s of the clean encode → **prediction confirmed**: cleanup-phase walks the
+  delayed release inside the encode cycle, fire timing is now attacker-controlled. This is the
+  exploitability milestone — you choose the heap state at fire time.
+- Panic at normal 90–160s regardless → the walk happens at a different pipeline point than we
+  think; the clean encode still helps narrow it.
+- No panic in 5 min → the delayed-release queue didn't hold your surface (queue entry condition
+  `(flags & 0xf0000) == 0` is the gate). That itself is a finding: then ask what puts the
+  surface on the delayed queue, in Ghidra.
+
+**Run B prediction (CORRECTED Ghidra model 2026-11-14):** The clean encode's submission
+directly calls AVE_EncodeSubmit_TriggerCleanup (0x85ccd48) which, if *(session+0xf8)==1,
+calls AVE_EncodeCycle_Cleanup → AVE_SurfaceMgr_ReleaseAllDelayed. This walks the delayed-
+release queue, calling DARTUnmapSurface_TwoPhase on queued surfaces. This is a SYNCHRONOUS
+path — no timer dependency. If the Alpha=255 abort queued a surface for delayed release,
+the clean encode's submission should trigger the PTE invalidation immediately, converting
+the "random 90-160s" deferral into precise attacker-controlled fire timing.
+
+**If Run B confirms, go straight to 3.0 (re-claim) on the next boot:** arm → clean-encode
+to control fire timing → spray ~dozens of 320x240 IOSurfaces/sessions with checksummed
+contents → clean-encode to trigger the walk → watch which surface's bytes change and which
+bytes. Any diff = the write primitive observed firsthand, value/offset/data all captured.
+Don't need the output-surface index first — match all four shapes and the diff tells you
+empirically which one got written.
 
 ### 2E-1. Output Buffer Diff (infoleak test) — ON-DEVICE, NO GHIDRA NEEDED
 **Goal:** Test whether the -17691 error path leaks stale firmware/kernel data to userspace.
@@ -580,11 +604,18 @@ can't prevent the deferred firmware DMA write.
 5. **ANSWERED: Error-path anatomy** — the CHM-level DARTMap has NO corresponding
    DARTUnmap. The unmap exists only at the MD_SVE level and is called during normal
    completion, not on the firmware error path. This is the root cause.
-6. **ANSWERED: Deferral mechanism** — Process timers (internal/external/Sw) fire periodically,
-   driving the encode pipeline (FUN_0x85ce4f0). The pipeline's cleanup phase
-   (AVE_EncodeCycle_Cleanup at 0x85cabf4) calls AVE_SurfaceMgr_ReleaseAllDelayed, which walks
-   the delayed-release queue → DARTUnmapSurface_TwoPhase. This is the idle-panic timer.
-   Client close also triggers teardown when count reaches 0. NOT firmware-internal timing.
+6. **ANSWERED (CORRECTED 2026-11-14): Deferral mechanism** — Two paths reach DARTUnmapSurface_TwoPhase:
+   (a) **Timer/idle path:** Process timers fire periodically, calling AVE_Heartbeat_ServicePipeline
+   (0x85ce4f0) which is a heartbeat/service function (NOT a cleanup trigger). Its encode channel
+   service sub-call (AVE_EncodeChannel_Service at 0x860f318) reaches DARTUnmapSurface_TwoPhase
+   through FUN_0x866e870 (direct per-surface unmap during channel servicing). 90-160s variability
+   is timer interval + channel service conditions.
+   (b) **Encode submission path (Run B target):** Userspace encode submission directly calls
+   AVE_EncodeSubmit_TriggerCleanup (0x85ccd48) which, gated on *(session+0xf8)==1, calls
+   AVE_EncodeCycle_Cleanup → ReleaseAllDelayed → DARTUnmapSurface_TwoPhase. Synchronous path.
+   (c) **Session teardown:** AVE_ClientClose → count==0 → AVE_SessionDestroy → SurfaceMgr_Cleanup
+   → ReleaseDelayed → DARTUnmapSurface_TwoPhase.
+   NOT firmware-internal timing.
 7. **OPEN: Offset controllability** — can surface buffer addresses steer the OOB target DVA?
 8. **OPEN: Encode completion handler** — need to find and compare success vs error paths.
 9. **OPEN: CVE-2026-112466** — OOB READ for KASLR defeat, separate investigation needed.
@@ -990,6 +1021,20 @@ Completely separate from the firmware's AlphaLayerID=255 → -17691 rejection.
 | 0xfffffe00085cabf4 | FUN_fffffe00085cabf4 | AVE_EncodeCycle_Cleanup |
 | 0xfffffe000866de18 | FUN_fffffe000866de18 | AVE_SurfaceMgr_Cleanup_Wrapper |
 
+### Functions Renamed (2026-11-14, param_2 analysis & pipeline correction)
+
+| Address | Old Name | New Name |
+|---------|----------|----------|
+| 0xfffffe00085ce4f0 | FUN_fffffe00085ce4f0 | AVE_Heartbeat_ServicePipeline |
+| 0xfffffe00085c6684 | FUN_fffffe00085c6684 | AVE_ProcessCompletionQueue |
+| 0xfffffe00085c6860 | FUN_fffffe00085c6860 | AVE_ServiceEncodeChannels |
+| 0xfffffe00085c68c4 | FUN_fffffe00085c68c4 | AVE_ServiceSwCChannels |
+| 0xfffffe00085cea98 | FUN_fffffe00085cea98 | AVE_ComputeTimerInterval |
+| 0xfffffe00085ccd48 | FUN_fffffe00085ccd48 | AVE_EncodeSubmit_TriggerCleanup |
+| 0xfffffe00085ce220 | FUN_fffffe00085ce220 | AVE_EncodeSubmit_WithCleanup |
+| 0xfffffe000860f318 | FUN_fffffe000860f318 | AVE_EncodeChannel_Service |
+| 0xfffffe000860a3c0 | FUN_fffffe000860a3c0 | AVE_ChannelService_DARTUnmap |
+
 ---
 
 ## GHIDRA DEEP ANALYSIS — DART LIFECYCLE & EXPLOIT CHAIN (2026-11-14)
@@ -1063,20 +1108,38 @@ INTERRUPT/COMPLETION CHAIN (firmware response — NO UNMAP):
                   Clears command buffer slot only
                   NO DARTUNMAP, NO output processing, NO client notification
 
-PROCESS TIMER → ENCODE PIPELINE → DELAYED RELEASE (IDLE-PANIC PATH):
-─────────────────────────────────────────────────────────────────────
-  AVE_InternalProcessTimer_Callback (0xfffffe00085c843c) [IOTimerEventSource]
-    → FUN_fffffe00085ce4f0(session, 0xFF) [encode pipeline entry]
-  AVE_ExternalProcessTimer_Callback (0xfffffe00085c860c) [IOTimerEventSource]
-    → FUN_fffffe00085ce4f0(session, 0xFF) [encode pipeline entry]
-  AVE_SwTimer_Callback (0xfffffe00085c87dc) [IOTimerEventSource]
-    → FUN_fffffe00085ce4f0(session, 0) [conditional, when +0xf8 == 1]
+PROCESS TIMER → HEARTBEAT → CHANNEL SERVICE → DART UNMAP (IDLE-PANIC PATH):
+─────────────────────────────────────────────────────────────────────────────
+  AVE_InternalProcessTimer_Callback (0x85c843c) [IOTimerEventSource]
+    → AVE_Heartbeat_ServicePipeline(session, 0xFF) [completions-first order]
+  AVE_ExternalProcessTimer_Callback (0x85c860c) [IOTimerEventSource]
+    → AVE_Heartbeat_ServicePipeline(session, 0xFF) [completions-first order]
+  AVE_SwTimer_Callback (0x85c87dc) [IOTimerEventSource]
+    → AVE_Heartbeat_ServicePipeline(session, 0) [channels-first, when +0xf8==1]
 
-  FUN_fffffe00085ce4f0 (encode pipeline)
-    → ... → AVE_EncodeCycle_Cleanup (0xfffffe00085cabf4)
-              → AVE_SurfaceMgr_ReleaseAllDelayed (0xfffffe00086708a4)
-                → AVE_SurfaceMgr_ReleaseDelayed (0xfffffe000866e284)
-                  → DARTUnmapSurface_TwoPhase  ← INVALIDATES STALE PTE
+  AVE_Heartbeat_ServicePipeline (0x85ce4f0):
+    param_2=0xFF: AVE_ProcessCompletionQueue → AVE_ServiceEncodeChannels → AVE_ServiceSwCChannels
+    param_2=0:    AVE_ServiceEncodeChannels → AVE_ServiceSwCChannels → AVE_ProcessCompletionQueue
+    Then: AVE_ComputeTimerInterval → reschedule timer
+
+  PATH TO DART UNMAP (via encode channel service, NOT delayed-release walk):
+    → AVE_ServiceEncodeChannels (0x85c6860) [iterates +0xfc channels at +0x120]
+      → AVE_EncodeChannel_Service (0x860f318) [per-channel]
+        → FUN_0x8601d4c → FUN_0x8601938 → FUN_0x85fc904
+          → FUN_0x860a998 → FUN_0x860af60
+            → AVE_ChannelService_DARTUnmap (0x860a3c0)
+              → FUN_0x866e870 → DARTUnmapSurface_TwoPhase  ← INVALIDATES STALE PTE
+
+ENCODE SUBMISSION → CLEANUP → DELAYED RELEASE (RUN B PATH — DIRECT):
+─────────────────────────────────────────────────────────────────────
+  IOUserClient external method (encode submission)
+    → AVE_EncodeSubmit_WithCleanup (0x85ce220)
+      → AVE_EncodeSubmit_TriggerCleanup (0x85ccd48)
+        GATE: *(session+0xf8) == 1 [encode-active flag]
+        → AVE_EncodeCycle_Cleanup (0x85cabf4)
+          → AVE_SurfaceMgr_ReleaseAllDelayed (0x86708a4)
+            → AVE_SurfaceMgr_ReleaseDelayed (0x866e284)
+              → DARTUnmapSurface_TwoPhase  ← INVALIDATES ALL DELAYED SURFACES
 
 CLIENT CLOSE → SESSION TEARDOWN:
 ─────────────────────────────────
@@ -1293,13 +1356,14 @@ from its IOVA aperture. However, the exploit does NOT need DVA steerability beca
 
 ### DELIVERABLE 4: Encode Submission Path & CVE-2026-112466 (Partial)
 
-**Encode Submission Path (traced via xrefs):**
+**Encode Submission Path (traced via xrefs, CORRECTED 2026-11-14):**
 
 ```
 AppleAVE2UserClient external method
-  → FUN_0x85cae90 / FUN_0x85ce4f0 (encode pipeline entry)
-    → FUN_0x85c6860 (encode path setup)
-      → FUN_0x860f318 (encode dispatch)
+  → AVE_EncodeSubmit_WithCleanup (0x85ce220) [calls cleanup with +0xf8 gate]
+  → AVE_Heartbeat_ServicePipeline (0x85ce4f0) [heartbeat/service, NOT cleanup]
+    → AVE_ServiceEncodeChannels (0x85c6860) [per-channel iteration]
+      → AVE_EncodeChannel_Service (0x860f318) [per-channel dispatch]
         → FUN_0x860f118 (alternate encode path)
         → FUN_0x85fc4d4 (pre-encode DART setup)
           → FUN_0x85fc3b4 (DART map orchestrator)
@@ -1347,24 +1411,51 @@ mapping, surface diff catches the written bytes.
    - Session context at driver_obj + 0x98; count at driver_obj + 0xb8.
    - AVE_SessionInit (0x85c70d8) increments session count at session_context + 0x160 on success.
 
-   **IDLE-PANIC TIMER MECHANISM (KEY FINDING):**
+   **IDLE-PANIC TIMER MECHANISM (CORRECTED 2026-11-14, param_2 analysis):**
    Three timers created during AVE_SessionInit:
    - **Internal process timer** (session + 0x70): callback AVE_InternalProcessTimer_Callback
-     (0x85c843c) → calls FUN_0x85ce4f0(session, 0xFF) = encode pipeline entry
+     (0x85c843c) → calls AVE_Heartbeat_ServicePipeline(session, 0xFF)
    - **External process timer** (session + 0x88): callback AVE_ExternalProcessTimer_Callback
-     (0x85c860c) → calls FUN_0x85ce4f0(session, 0xFF) = encode pipeline entry
+     (0x85c860c) → calls AVE_Heartbeat_ServicePipeline(session, 0xFF)
    - **Sw timer** (session + 0x98): callback AVE_SwTimer_Callback (0x85c87dc) → conditionally
-     calls FUN_0x85ce4f0(session, 0) when session + 0xf8 == 1
-   All three can trigger the encode pipeline. The encode pipeline's cleanup phase
-   (AVE_EncodeCycle_Cleanup at 0x85cabf4) calls AVE_SurfaceMgr_ReleaseAllDelayed, which walks
-   the delayed-release queue and calls DARTUnmapSurface_TwoPhase. **This is the idle-panic
-   mechanism:** process timer fires → encode pipeline runs → delayed-release walk →
-   PTE unmapped → stale firmware DMA descriptor fires into unmapped DVA → DART fault.
-   The 90-160s variability is the timer firing interval + pipeline processing delay.
+     calls AVE_Heartbeat_ServicePipeline(session, 0) when session + 0xf8 == 1
 
-   **Run B prediction strengthened:** A clean encode on the same session will drive
-   AVE_EncodeCycle_Cleanup → ReleaseAllDelayed BEFORE the timer would naturally fire,
-   triggering the PTE unmap and panic sooner (seconds, not minutes).
+   **param_2 (0xFF vs 0) controls call ordering, NOT a sentinel:**
+   AVE_Heartbeat_ServicePipeline (0x85ce4f0) is a heartbeat/service function that processes
+   three sub-systems in order. param_2 controls the priority:
+   - param_2 != 0 (0xFF, process timers): **completions first** — AVE_ProcessCompletionQueue,
+     then AVE_ServiceEncodeChannels, then AVE_ServiceSwCChannels
+   - param_2 == 0 (Sw timer): **channels first** — AVE_ServiceEncodeChannels,
+     AVE_ServiceSwCChannels, then AVE_ProcessCompletionQueue
+   The 0xFF value is NOT the AlphaLayerID sentinel — it's a boolean-like priority flag meaning
+   "drain completions before servicing channels." After the three sub-calls, the function
+   computes the next timer interval via AVE_ComputeTimerInterval (0x85cea98) and reschedules.
+
+   **CORRECTED UNMAP PATH (2026-11-14):** The timer path does NOT directly reach
+   AVE_EncodeCycle_Cleanup → ReleaseAllDelayed as previously claimed. The actual path is:
+   - Timer → AVE_Heartbeat_ServicePipeline → AVE_ServiceEncodeChannels (0x85c6860)
+     → AVE_EncodeChannel_Service (0x860f318) → FUN_0x8601d4c → ... →
+     AVE_ChannelService_DARTUnmap (0x860a3c0) → FUN_0x866e870 → DARTUnmapSurface_TwoPhase
+   This is a **direct per-surface DART unmap** during encode channel servicing, not through
+   the delayed-release walk. The 90-160s variability is how often the timer fires and whether
+   the channel service function finds the stale surface to unmap.
+
+   AVE_EncodeCycle_Cleanup is gated on `*(session+0xf8) == 1` inside
+   AVE_EncodeSubmit_TriggerCleanup (0x85ccd48) and is only called from IOUserClient
+   external methods (encode submissions), NOT from the timer path.
+
+   **Run B prediction (STRENGTHENED by correction):** A clean encode submission from userspace
+   directly calls the encode external method → AVE_EncodeSubmit_TriggerCleanup (gated on
+   +0xf8==1, which is 1 during an active encode session) → AVE_EncodeCycle_Cleanup →
+   AVE_SurfaceMgr_ReleaseAllDelayed → DARTUnmapSurface_TwoPhase. This is a **synchronous,
+   direct path** to the delayed-release walk — no timer dependency, no channel service
+   intermediary. Run B should panic within seconds.
+
+   **Run C corollary:** Killing the app process entirely (not just VTCompressionSession-
+   Invalidate) triggers AVE_ClientClose → client count to 0 → AVE_SessionDestroy →
+   AVE_SurfaceMgr_Cleanup → full delayed-release walk → fast panic. This is a destructive
+   fire-control variant (loses the userspace process). Run B (encode-driven) is strictly
+   better: fires the walk without teardown, keeping the process alive to observe/collect.
 
 2. **Command struct at error time — PARTIAL (2026-11-14)**
    - IPC command buffer is itself a DART-mapped surface (at IPC_pool + 0x28).
