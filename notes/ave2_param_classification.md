@@ -1895,3 +1895,150 @@ Assuming kernel R/W from Phase 3:
 
 4. **Kext diff 26.6.2 → 26.7.2** — If Apple patched the idle-timer path, understanding
    the fix reveals the exact code path and may suggest refinements.
+---
+
+## GATING QUESTION RESOLVED: AXI 0xc0 Write Target (2026-11-14)
+
+### The Answer
+
+**The AXI_ID 0xc0 write targets an INTERNAL driver-owned coded-output buffer — NOT a user-supplied external IOSurface.**
+
+This means:
+- **D-prep (readback from your input IOSurface):** Cannot directly catch the write — it lands in driver memory
+- **Mode A (clone-session deterministic re-claim):** Is the PRIMARY weaponization path
+- **The write is fixed-format header/coded-output data:** A corruption primitive, not data exfiltration
+- **PAC bypass:** Still inherent — DMA writes through DART hardware, no CPU PAC
+
+### Evidence Chain
+
+**1. Wire Format (Anchor 0) — RESOLVED from eddinos2/CVE-2026-64747**
+
+Full selector table for AppleAVE2UserClient kext 905.40.1 (our exact build):
+
+| sel | func | structIn | structOut | role |
+|-----|------|----------|-----------|------|
+| 1 | FUN_642e7c | 0x920 | 0x28 | session CREATE ("IO_Open") |
+| 2 | FUN_643978 | 0x28 | 0x20 | session DESTROY |
+| 3 | FUN_64417c | 0x38 | 0x20 | UNKNOWN (verb) |
+| 4 | FUN_644a38 | 0x1a0a0 | 0x20 | CONFIGURE ("IO_Prepare") ★ |
+| 5 | FUN_64150c | 0x1a0b0 | 0x150 | UNKNOWN (process?) |
+| 6-10 | various | 0x30 | 0x20 | verb family (Start/Stop/Process...) |
+
+Configure struct starts at inbuf + 0x338. Width at abs offset 0xd90, height at 0xd94.
+Session create requires version string "905.40.1" at +0x28 and encType >= 1 at +0x918.
+
+**2. Encode Output Surface — RESOLVED from Ghidra**
+
+`AVE_ProcessEncodeOutput` (0x8603cd8) accesses the output surface via:
+```
+surface_index = *(int *)(frame_info + 0xc6c)
+surface_ptr = *(long *)(session + 0xef6e0 + surface_index * 8)
+surface_dva = *(long *)(surface_ptr + 0x98)  // via FUN_0x865b474
+```
+
+The `session + 0xef6e0` table is the INTERNAL surface table — the same table
+used by `DARTMapInternalSurfaces` (which maps from `session + 0xef3b8`).
+
+The ISR's data copy in `AVE_ISR_ReceiveCommandDone`:
+```
+memcpy(frame_info + 0x87e0, surface_dva + 0x1270, 0x9400)  // 37,888 bytes
+```
+Copies encoded output from the DART-mapped internal surface into frame info.
+
+From aquarat's driver: coded buffers (`coded` and `coded_hdr`) are driver-allocated,
+passed at Start_AVC/Start_HEVC time. Per-frame Process command specifies:
+- `coded_index`: index into the session's coded buffer table
+- `coded_addr`: IOVA of the coded buffer
+- `coded_hdr_addr`: IOVA of the coded header buffer
+- `coded_size`: buffer size
+
+**3. Internal vs External DVA Analysis (Anchor 2) — RESOLVED**
+
+`DARTMapInternalSurfaces` (0x867b8d4) maps surfaces with:
+- Full mode (param_2==0): loops `*(session+0x70)` times, stride 0x3bac0
+- Bitmask mode: iterates 4 positions
+
+`DARTMapExternalSurfaces` is called FIRST in `AVE_CHM_DARTMapSurfaces` (0x855c0cc),
+then internals map AFTER. In the DART bump allocator, internal DVAs land AFTER externals.
+
+Panic PTE band 0x1c4–0x20b = ~64 PTEs ≈ ~1 MB at 16 KB granularity.
+- At 320x240, input NV12 surface ≈ 115 KB (8 PTEs) — too small
+- Coded output at 320x240 ≈ 200-300 KB minimum — closer
+- But the band spans ~1 MB — consistent with coded output + neighboring internal surfaces
+- Higher PTE numbers = later in DART address space = internal (mapped after external)
+
+The internal DART mapper `FUN_0x866bd68` maps a massive surface set with
+surface type categories 5, 6, 0xb, 0xd, 0xe, 0xf, 0x10, 0x11, 0x12, 0x15-0x1a,
+0x20-0x23. Including reconstruction surfaces (17 per DPB slot × 2 planes),
+coded output buffers, entropy buffers, source neighbor tables, colocated MV buffers,
+low-res motion estimation surfaces, and transcoded data buffers.
+
+From aquarat: 35-slot InfoSet with 19 internal + 7 "out" allocations.
+Coded output at 1920x1080 = 3,112,960 B with 49,152 B header.
+All kext-allocated surfaces: linear blobs, align_up(size, 16 KB), no geometry keys.
+
+**4. Abort Path (Anchor 3) — RESOLVED from Ghidra**
+
+`AVE_ISR_ReceiveCommandDone` error branch at LAB_0x8606770:
+```c
+AVE_IPC_FreeCommandSlot(*(param_1 + 0xe0), lVar21);  // free IPC slot
+*plVar2 = 0;                                          // clear cmd buffer ptr
+*(lVar12 + 0xf0) &= ~(1 << cmd_type);                // clear active bitmask
+*(lVar12 + 0xf4 + category*4) -= 1;                   // decrement counter
+```
+
+**The kext abort path writes NOTHING to any surface.** It only:
+1. Frees the IPC command slot
+2. Clears bookkeeping (command pointer, active bitmask, category count)
+3. Returns immediately
+
+The write that causes the DART panic comes from the **FIRMWARE HARDWARE** itself.
+The firmware's DMA descriptor remains armed regardless of the error status code (-17691).
+The kext's error handling is purely software bookkeeping — it cannot disarm the hardware
+DMA descriptor. This is why the panic fires 90-160s later on the idle timer, not during
+the error handler.
+
+### Weaponization Impact
+
+**Mode A (Clone-Session Deterministic Re-claim) is now the confirmed primary path:**
+
+1. **Arm phase:** Create encode session, set AlphaLayerID=255, encode → firmware arms
+   DMA descriptor targeting coded-output buffer, returns -17691
+
+2. **Free phase:** Session teardown unmaps the coded-output surface's DART PTEs
+   (via `DARTUnmapExternalSurfaces` → `DARTUnmapSurface_TwoPhase`), but the firmware
+   DMA descriptor remains armed with the now-stale DVA
+
+3. **Re-claim phase:** Rapidly allocate IOSurfaces matching the coded-output buffer's
+   size class (align_up(coded_output_size, 16KB)). The DART allocator reuses freed DVA
+   slots in a deterministic pattern (confirmed by cross-boot PTE determinism in panic
+   logs: DVAs cluster at PTEs 0x1c4-0x20b across 8 separate panics)
+
+4. **Write phase:** 90-160s later, firmware idle timer fires the stale DMA descriptor.
+   The write lands in attacker-controlled IOSurface at the re-claimed DVA slot.
+   The write content is fixed-format encoded bitstream header/data — a corruption
+   primitive of known shape
+
+5. **Read phase:** Read back the attacker's IOSurface to observe the firmware's write.
+   The written data reveals: (a) whether re-claim succeeded, (b) the exact write
+   offset within the buffer, (c) the firmware's write pattern
+
+**Size matching for re-claim recipe:**
+- Coded output size formula (from aquarat): closed-form, resolution-dependent
+- At 320x240: small enough that the re-claim IOSurface pool can be tightly sized
+- 16 KB alignment means the DART PTE granularity matches exactly
+- PTE determinism means the re-claim doesn't need spraying — targeted allocation works
+
+**What this is NOT:**
+- Not a data exfiltration read primitive (the written content is encoder output, not kernel memory)
+- Not useful for KASLR defeat alone (that's CVE-2026-112466 OOB READ)
+- It IS a controlled corruption write into a surface you own → starting point for
+  kernel R/W via further exploitation of the corrupted data
+
+### External Sources Used
+
+- eddinos2/CVE-2026-64747: Full wire format for kext 905.40.1 (ave2_wire.h, WIRE_FORMAT.md)
+- aquarat/apple-m-series-ave-driver: Surface InfoSet (35 slots, 19 internal + 7 out),
+  coded output sizes, allocation patterns, DPB structure
+- Ping-2o/panicIDK: Armed sessions produce zero output bitstream ("readback conflict")
+  — confirms encoder write surface is reachable even when normal output stops
