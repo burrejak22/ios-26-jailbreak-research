@@ -83,16 +83,20 @@ DMA write**, not synchronous with the encode error.
 | 5 | 2026-11-13 12:33 | AlphaLayerID=255, 2E-0 teardown test | 0x10000ed4080 | 0x3b5 | 0xc0 | TBD | **HIGH — .ips captured** |
 | 6 | 2026-11-13 ~20:08 | AlphaLayerID=255, 2E-0 **Run A** (immediate invalidate) | 0x1000082d500 | 0x20b | 0xc0 | ~160s | **HIGH — Run A result** |
 | 7 | 2026-11-14 12:50 | AlphaLayerID=255, **Run B v2** (arm + 10 clean encodes) | 0x1000082d4c0 | 0x20b | 0xc0 | ~78s post-app-idle | **HIGH — Run B result** |
+| 8 | 2026-11-14 16:51 | AlphaLayerID=255, **Run C1** (client-death: exit(0), no invalidate) | 0x100007ec500 | 0x1fb | 0xc0 | ~158s post-exit | **HIGH — C1 result: idle timer fires after client death** |
 
-**DVA analysis (6 panics):**
+**DVA analysis (8 panics):**
 - Panics 1-4: DVAs in `0x100007xxxxx` region (~900KB span, PTE 452-507)
 - Panic 5: DVA at `0x10000ed4080` — **PTE 949**, nearly 2x the previous PTEs
 - **Panic 6: DVA at `0x1000082d500` — PTE 0x20b (523)** — back in the mid-range
 - **Panic 7: DVA at `0x1000082d4c0` — PTE 0x20b (523)** — SAME PTE as panic 6, DVA differs by only 0x40
+- **Panic 8: DVA at `0x100007ec500` — PTE 0x1fb (507)** — back in the 0x100007xxxxx region,
+  16 PTEs below panics 6/7 (0x20b). Close to panics 1-4's PTE range (452-507).
 - **DVA REPEAT: Panics 6+7 share PTE 0x20b and nearly identical DVAs (0x1000082d500 vs 0x1000082d4c0)**
   — strongly suggests deterministic descriptor slot; the 0x40 offset may be a different sub-surface
   or alignment within the same DART mapping region
-- AXI_ID 0xc0 in 5 of 6 runs (one 0xc1) — primary encoder write channel
+- **PTE clustering: 0x1c4-0x1fb-0x20b** — panics 1-4, 8, 6/7 form a tight band in the DART page table
+- AXI_ID 0xc0 in 6 of 7 measured runs (one 0xc1) — primary encoder write channel
 - All faults are **PTE invalid exception on write** from `dart-ave` at `AppleT8110DART.cpp:2369`
 - DVAs shift with kernel slide and heap state per boot, but descriptor slot may be fixed
   relative to session allocation
@@ -237,7 +241,7 @@ DVA 0x1000082d500 PTE 0x20b AXI_ID 0xc0 — **identical to Panic #3**.
 |-----|--------|---------|
 | **A** | **Panic at 160s** | **CONFIRMED: Stale DMA descriptor fires after delayed surface release unmaps PTE** |
 | **B** | **Panic at ~78s idle, during videocodecd teardown** | **Clean encodes don't trigger via EncodeSubmit path — stale descriptor is firmware-only state, PTE invalidated via daemon teardown** |
-| **C1** | TBD | Client-death: app exit(0) with session NOT invalidated — XPC drop is sole trigger |
+| **C1** | **Panic at ~158s post-exit** | **CONFIRMED: Delayed panic after app exit(0) — idle timer unmap, NOT session-teardown** |
 | **C2** | TBD | Daemon-death: app holds session open, videocodecd killed externally from Mac |
 
 **Corrected mechanism (from Ghidra):** The deferral is the session lifecycle delay — how long
@@ -373,10 +377,21 @@ Protocol:
 4. exit(0) — process death drops XPC connection, sole trigger
 5. Monitor: `idevicesyslog | grep JBPoC` on Mac, wall-clock panic timing from syslog
 
-Prediction: Panic within ≤10s of exit(0). The XPC drop cascades:
-videocodecd → AVE_ClientClose → client count==0 → AVE_SessionDestroy →
-AVE_SurfaceMgr_Cleanup → ReleaseDelayed → DARTUnmapSurface_TwoPhase → stale descriptor
-fires into unmapped DVA. Fast because there's no idle timeout in the path.
+**RESULT — Panic #8 (2026-11-14):**
+- ARM: 16:46:39, -17691 callback: 16:48:39 (2 min encode timeout), EXIT: 16:48:42
+- Phone stayed up after exit — NO immediate panic from session teardown
+- **Panic at 16:51:20 — ~158 seconds after exit(0)**
+- `dart-ave: SID 0 PTE invalid exception on write of DVA 0x100007ec500 (CTE 0x10 SEG 0 PTE 0x1fb)`
+- `ERROR_SID_SUMMARY 0x00003100`, `AppleT8110DART.cpp:2369`
+- Kext: `com.apple.driver.AppleT8110DART(1.0)[0B0D8EBA]`
+- PTE 0x1fb (cf. panics #6/#7 at PTE 0x20b — 16 PTEs apart, same DART region)
+
+**Analysis:** Original prediction WRONG — panic is NOT fast (≤10s). Session teardown from
+XPC disconnect does NOT immediately unmap the PTEs. Instead the daemon survives client death
+and holds session resources. The ~158s delay = idle timer / channel-service cleanup path.
+The daemon's idle timeout fires ~2.5 min after client disconnect, triggering the bulk
+PTE unmap that hits the stale firmware DMA descriptor. This matches Run A's 160s timing
+almost exactly — the idle timeout is the consistent trigger across both paths.
 
 **Run C2 — Daemon-death (needs Mac-side kill):**
 Goal: Test whether daemon death (not client death) unmaps the surface.
@@ -392,9 +407,13 @@ Prediction: Panic within ≤10s of daemon kill. launchd-driven daemon death trig
 session teardown regardless of client state. Run B's 77s was slow because app sat idle
 holding XPC connection — daemon stayed alive until launchd's idle timeout fired.
 
-**C1 fires fast + C2 fires fast** = both paths lead to the same unmap. Best case.
-**C1 fires fast + C2 no panic** = only client-death path unmaps (app controls fire).
-**C1 no panic + C2 fires fast** = only daemon-death path unmaps (need external kill).
+**Outcome matrix (updated with C1 result):**
+~~C1 fires fast + C2 fires fast~~ — C1 fires SLOW (~158s), not fast
+**C1 fires delayed (~158s)** = idle-timer path confirmed. Session teardown does NOT unmap;
+the daemon's idle timeout is the trigger. The ~158s matches Run A's 160s almost exactly.
+**C2 prediction (revised):** If daemon-kill panics FAST (≤10s), that confirms daemon-death
+does a bulk unmap that bypasses the idle timer. If C2 also takes ~160s or doesn't panic,
+the idle timer is the ONLY trigger and daemon death alone doesn't fire it.
 **Neither fires** = model needs revision; the 77-160s window is intrinsic, not idle-based.
 
 The re-claim experiment (3.0) proceeds with whichever path fires fastest: arm → trigger
