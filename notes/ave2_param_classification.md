@@ -91,6 +91,18 @@ DMA write**, not synchronous with the encode error.
 - DVAs shift with kernel slide and heap state per boot, but descriptor slot may be fixed
   relative to session allocation
 
+**Fire-context variance explained (model v3):** DVA differences across panics 1-6 are now
+explained by the two confirmed delayed-release walk paths (Ghidra-traced):
+- **Encode-cycle-start path:** AVE_SurfaceMgr_ReleaseAllDelayed (0x86708a4) runs at the start
+  of the next encode cycle — walks delayed queue, unmaps surfaces via DARTUnmapSurface_TwoPhase.
+  Different surfaces in the delayed queue at walk time → different DVAs.
+- **Session-teardown-at-zero path:** AVE_SurfaceMgr_Cleanup (0x866dc50) drains both delayed and
+  regular queues when the driver session count drops to zero.
+The 2A idle panics are explained by whatever timer/pressure eventually runs one of these two
+walks (or power/idle state reclaims pages outright). Run A's 160s deferral (longer than the
+90-130s idle baseline) is explained by VTCompressionSessionInvalidate triggering a different
+teardown path than the natural idle lifecycle, changing when the delayed release walk runs.
+
 **Deferral timing is variable** (90s, 130s, 160s post-encode) — confirms async trigger, not fixed timer.
 **Run A result: Session invalidation does NOT accelerate the fault.** The descriptor survives both
 session destruction AND the 60s post-invalidation idle window. The deferral is firmware/hardware
@@ -227,8 +239,26 @@ through the now-invalid DVA → DART fault. This means:
    converts the panic into a controlled write primitive
 3. The "time bomb" model still holds — the descriptor fires regardless of session state
 
-**Run B is next:** Test whether a clean encode flushes the armed descriptor (would mean
-the descriptor is in a per-session firmware queue that session reuse can drain).
+**Run B is next** — tests a specific prediction from Ghidra: since AVE_SurfaceMgr_ReleaseAllDelayed
+runs at the start of the next encode cycle, a clean encode on the live session should trigger the
+delayed-release walk deterministically and early. If Run B panics fast (~seconds after the clean
+encode rather than ~minutes after the failed one), the timing is now attacker-controlled — a major
+exploitability upgrade.
+
+**Run B protocol (one reboot):**
+1. Canary OK → arm with Alpha=255 → -17691 observed.
+2. WITHOUT invalidating anything, encode one clean frame (Alpha=254 or 0) on the SAME session
+   immediately — within seconds.
+3. Watch. If the panic lands within ~30s of the clean encode → CONFIRMED: encode-cycle-start
+   drives ReleaseAllDelayed → that's the fire trigger, timing now attacker-controlled.
+4. If no panic within 5 min → the walk didn't run or the target was re-mapped by then.
+   Note the result and move to 3.0 proper.
+
+**Run B prediction (from Ghidra):** The clean encode's setup path calls FUN_0x85cabf4, which
+iterates 4 surface slots and calls AVE_SurfaceMgr_ReleaseAllDelayed on each. This walks the
+delayed-release queue, calling DARTUnmapSurface_TwoPhase on queued surfaces. If the Alpha=255
+abort queued a surface for delayed release, the clean encode's setup should trigger the PTE
+invalidation — converting the "random 90-160s" deferral into a precise attacker-controlled fire.
 
 ### 2E-1. Output Buffer Diff (infoleak test) — ON-DEVICE, NO GHIDRA NEEDED
 **Goal:** Test whether the -17691 error path leaks stale firmware/kernel data to userspace.
@@ -550,9 +580,11 @@ can't prevent the deferred firmware DMA write.
 5. **ANSWERED: Error-path anatomy** — the CHM-level DARTMap has NO corresponding
    DARTUnmap. The unmap exists only at the MD_SVE level and is called during normal
    completion, not on the firmware error path. This is the root cause.
-6. **PARTIALLY ANSWERED: Deferral mechanism** — Teardown-triggered = ELIMINATED (Run A).
-   "try to release delayed" mechanism exists but is never reached on the error path.
-   Remaining: firmware internal timer/event schedule (90-160s variable).
+6. **ANSWERED: Deferral mechanism** — Process timers (internal/external/Sw) fire periodically,
+   driving the encode pipeline (FUN_0x85ce4f0). The pipeline's cleanup phase
+   (AVE_EncodeCycle_Cleanup at 0x85cabf4) calls AVE_SurfaceMgr_ReleaseAllDelayed, which walks
+   the delayed-release queue → DARTUnmapSurface_TwoPhase. This is the idle-panic timer.
+   Client close also triggers teardown when count reaches 0. NOT firmware-internal timing.
 7. **OPEN: Offset controllability** — can surface buffer addresses steer the OOB target DVA?
 8. **OPEN: Encode completion handler** — need to find and compare success vs error paths.
 9. **OPEN: CVE-2026-112466** — OOB READ for KASLR defeat, separate investigation needed.
@@ -944,6 +976,20 @@ Completely separate from the firmware's AlphaLayerID=255 → -17691 rejection.
 | 0xfffffe00086708a4 | FUN_fffffe00086708a4 | AVE_SurfaceMgr_ReleaseAllDelayed |
 | 0xfffffe0008631064 | FUN_fffffe0008631064 | AVE_IPC_FreeCommandSlot |
 
+### Functions Renamed (2026-11-14, session count & timer analysis)
+
+| Address | Old Name | New Name |
+|---------|----------|----------|
+| 0xfffffe00086b2e0c | FUN_fffffe00086b2e0c | AVE_ClientClose |
+| 0xfffffe00085c9820 | FUN_fffffe00085c9820 | AVE_PerClientCleanup_DARTUnmap |
+| 0xfffffe00085c70d8 | FUN_fffffe00085c70d8 | AVE_SessionInit |
+| 0xfffffe00085c8960 | FUN_fffffe00085c8960 | AVE_SessionDestroy |
+| 0xfffffe00085c843c | FUN_fffffe00085c843c | AVE_InternalProcessTimer_Callback |
+| 0xfffffe00085c860c | FUN_fffffe00085c860c | AVE_ExternalProcessTimer_Callback |
+| 0xfffffe00085c87dc | FUN_fffffe00085c87dc | AVE_SwTimer_Callback |
+| 0xfffffe00085cabf4 | FUN_fffffe00085cabf4 | AVE_EncodeCycle_Cleanup |
+| 0xfffffe000866de18 | FUN_fffffe000866de18 | AVE_SurfaceMgr_Cleanup_Wrapper |
+
 ---
 
 ## GHIDRA DEEP ANALYSIS — DART LIFECYCLE & EXPLOIT CHAIN (2026-11-14)
@@ -1017,16 +1063,41 @@ INTERRUPT/COMPLETION CHAIN (firmware response — NO UNMAP):
                   Clears command buffer slot only
                   NO DARTUNMAP, NO output processing, NO client notification
 
-SESSION TEARDOWN:
-─────────────────
+PROCESS TIMER → ENCODE PIPELINE → DELAYED RELEASE (IDLE-PANIC PATH):
+─────────────────────────────────────────────────────────────────────
+  AVE_InternalProcessTimer_Callback (0xfffffe00085c843c) [IOTimerEventSource]
+    → FUN_fffffe00085ce4f0(session, 0xFF) [encode pipeline entry]
+  AVE_ExternalProcessTimer_Callback (0xfffffe00085c860c) [IOTimerEventSource]
+    → FUN_fffffe00085ce4f0(session, 0xFF) [encode pipeline entry]
+  AVE_SwTimer_Callback (0xfffffe00085c87dc) [IOTimerEventSource]
+    → FUN_fffffe00085ce4f0(session, 0) [conditional, when +0xf8 == 1]
+
+  FUN_fffffe00085ce4f0 (encode pipeline)
+    → ... → AVE_EncodeCycle_Cleanup (0xfffffe00085cabf4)
+              → AVE_SurfaceMgr_ReleaseAllDelayed (0xfffffe00086708a4)
+                → AVE_SurfaceMgr_ReleaseDelayed (0xfffffe000866e284)
+                  → DARTUnmapSurface_TwoPhase  ← INVALIDATES STALE PTE
+
+CLIENT CLOSE → SESSION TEARDOWN:
+─────────────────────────────────
+  AVE_ClientClose (0xfffffe00086b2e0c) [vtable, IOUserClient::clientClose]
+    → AVE_PerClientCleanup_DARTUnmap (0xfffffe00085c9820)
+    │   → DARTUnmapSurface(surface_mgr, surface, client_index)  [per-client surface]
+    │   → Decrements per-session counter at +0xfc
+    │
+    └── if (driver_client_count == 0):
+          → AVE_SessionDestroy (0xfffffe00085c8960)
+            → AVE_SurfaceMgr_Cleanup_Wrapper (0xfffffe000866de18)
+              → AVE_SurfaceMgr_Cleanup (0xfffffe000866dc50)
+                → AVE_SurfaceMgr_ReleaseDelayed (0xfffffe000866e284)
+                  → DARTUnmapSurface_TwoPhase  ← INVALIDATES ALL DELAYED SURFACES
+
+SESSION POOL TEARDOWN:
+──────────────────────
   AVE_DART_Pool_Destroy (0xfffffe00085904b0)
     Contains: "unreleased IODMACommand"
     Destroys IODMACommand pool objects
     Called during session/client destruction
-
-  FUN_fffffe000866e284 (SurfaceMgr level)
-    Contains: "try to release delayed"
-    Surface manager cleanup
 ```
 
 **FULL FUNCTION TABLE:**
@@ -1251,19 +1322,70 @@ AppleAVE2UserClient external method
 - REQUIRES: experiment 3.0 (DART re-claim race) and analysis of what firmware writes into
   output surfaces during aborted encodes.
 
-### Remaining Targets (priority order, 2026-11-14)
+### Remaining Targets (priority order, updated 2026-11-14 model v3)
 
-1. **Experiment 3.0: DART re-claim race** — highest-value single reboot. Arm with Alpha=255,
-   immediately allocate new encode sessions/IOSurfaces to re-fill the freed DVA region, wait
-   300s. Outcome A (no panic) = write primitive confirmed. Outcome B (panic) = tune allocation
-   sizing to match 16KB page granularity.
-2. **`AVE_SurfaceMgr_ReleaseDelayed` timing** — what exactly triggers the ~90-160s delayed
-   release? Is it a timer, the next encode cycle, or session garbage collection?
-3. **Aborted encode output descriptor** — what DVA does the command struct point to for the
-   output surface? Which surface index does the deferred write hit? (Determines what to
-   re-populate in experiment 3.0.)
-4. **CVE-2026-112466 read-side** — if the re-claim experiment captures firmware-written data
-   in the reclaim surface, that IS the infoleak. Otherwise trace the encode output path for
-   a length-from-firmware OOB copy.
-5. **IOUserClient external-method table** — selector numbers for encode-start, so a later PoC
-   can skip VideoToolbox and drive the kext directly.
+**HIGHEST-VALUE NEXT: ON-DEVICE Run B** — one reboot, tests whether a clean encode on the live
+session triggers the delayed-release walk (prediction from Ghidra: it should). See Run B protocol
+above. If Run B confirms attacker-controlled timing, proceed directly to 3.0 proper (DART re-claim).
+
+**Experiment 3.0 (DART re-claim race)** — same as designed, with task 3 refinement: since the
+stale descriptor is an output descriptor targeting the mapped IOSurface backing, the reclaim should
+re-populate DVAs via fresh IOSurface allocations (same small sizes as encode surfaces, 320x240-class
+buffers — match the shapes the map path creates). If the descriptor fires through a re-claimed valid
+mapping, surface diff catches the written bytes.
+
+**Remaining Ghidra (narrow, priority order):**
+
+1. **Driver-teardown session-count path — COMPLETE (2026-11-14)**
+   - AVE_ClientClose (0x86b2e0c) = vtable entry (IOUserClient::clientClose). Zero code callers.
+   - Takes lock, decrements client count at driver_obj + 0xb8 (byte offset).
+   - Calls AVE_PerClientCleanup_DARTUnmap (0x85c9820) which calls DARTUnmapSurface for the
+     client's specific surface (param_2 < 4 = surface index).
+   - If client count == 0: AVE_SessionDestroy (0x85c8960) → AVE_SurfaceMgr_Cleanup_Wrapper
+     (0x866de18) → AVE_SurfaceMgr_Cleanup (0x866dc50) → AVE_SurfaceMgr_ReleaseDelayed →
+     DARTUnmapSurface_TwoPhase for ALL delayed-queue surfaces.
+   - Session context at driver_obj + 0x98; count at driver_obj + 0xb8.
+   - AVE_SessionInit (0x85c70d8) increments session count at session_context + 0x160 on success.
+
+   **IDLE-PANIC TIMER MECHANISM (KEY FINDING):**
+   Three timers created during AVE_SessionInit:
+   - **Internal process timer** (session + 0x70): callback AVE_InternalProcessTimer_Callback
+     (0x85c843c) → calls FUN_0x85ce4f0(session, 0xFF) = encode pipeline entry
+   - **External process timer** (session + 0x88): callback AVE_ExternalProcessTimer_Callback
+     (0x85c860c) → calls FUN_0x85ce4f0(session, 0xFF) = encode pipeline entry
+   - **Sw timer** (session + 0x98): callback AVE_SwTimer_Callback (0x85c87dc) → conditionally
+     calls FUN_0x85ce4f0(session, 0) when session + 0xf8 == 1
+   All three can trigger the encode pipeline. The encode pipeline's cleanup phase
+   (AVE_EncodeCycle_Cleanup at 0x85cabf4) calls AVE_SurfaceMgr_ReleaseAllDelayed, which walks
+   the delayed-release queue and calls DARTUnmapSurface_TwoPhase. **This is the idle-panic
+   mechanism:** process timer fires → encode pipeline runs → delayed-release walk →
+   PTE unmapped → stale firmware DMA descriptor fires into unmapped DVA → DART fault.
+   The 90-160s variability is the timer firing interval + pipeline processing delay.
+
+   **Run B prediction strengthened:** A clean encode on the same session will drive
+   AVE_EncodeCycle_Cleanup → ReleaseAllDelayed BEFORE the timer would naturally fire,
+   triggering the PTE unmap and panic sooner (seconds, not minutes).
+
+2. **Command struct at error time — PARTIAL (2026-11-14)**
+   - IPC command buffer is itself a DART-mapped surface (at IPC_pool + 0x28).
+   - AVE_IPC_FreeCommandSlot converts command DVA to pool-relative offset:
+     `pool_offset = FUN_0x865b494(surface, type, 0) + (command_DVA - base_DVA)`
+   - Surface DVAs stored at surface_desc + 0xc0 + index*8 (indices 0-3).
+   - Surface index per encode task at task_obj + 0x28 (bitmask `1 << (val & 0x3f)`).
+   - Which of 4 indices is "output" vs "input" not yet determined from Ghidra alone.
+     AXI_ID 0xc0 (encoder write channel) in all panics = firmware writes to output surface.
+   - FUN_0x865b474 = DVA accessor: returns `*(surface + 0x98) + offset` (base DVA + byte offset).
+
+3. **IOUserClient external-method selector map — DEFERRED**
+   Vtable entries are arm64e PAC-encoded; raw memory reads don't directly decode the dispatch
+   table. Requires specialized arm64e vtable analysis. Lower priority — the PoC can use
+   VideoToolbox initially and switch to direct IOKit calls later.
+
+**NOTE (task 3 negative / deprioritization):** FUN_0x869f0f8 (previously suspected as 112466
+read-side) is just frame-number matching — checks `*(param_2+0x28) == *(param_3+0xa8)`, copies
+one 4-byte value on match. The 112466 OOB read is NOT in the output-processing chain. Data
+transfer is via shared IOSurface DMA (firmware writes directly into mapped IOSurface, no
+kernel-side memcpy to exploit). The read primitive, if it exists on this trigger, is more likely
+in the stale-descriptor write landing in a re-claimed readable surface = read-back via 3.0
+Outcome A, or is an entirely separate code path. **Deprioritize further Ghidra work on the
+output processing chain accordingly.**
