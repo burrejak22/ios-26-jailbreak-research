@@ -2144,3 +2144,74 @@ Both observed fires (#7, #8) landed during teardown — synchronized with
 the unmap. If F≈U, S1's teardown panics before the clone maps, and the
 ARM→FREE→CLONE sequence can never succeed. The D-prep-2/C2 pair decides
 this cheaply (one boot each) before spending boot cycles on Mode A.
+
+## Pre-Committed Interpretation Tree (D-prep-2 × C2 Matrix)
+
+Results are committed here BEFORE running so they can't be over-read.
+Each row is a (D-prep-2 result, C2 result) pair → what it means → next step.
+
+### D-prep-2 outcomes
+
+- **HIT (anomalous bytes in bitstream):** Model (b) — stale DMA fires while
+  session PTEs are still valid. The write succeeds into the still-mapped coded
+  buffer. Primitive = arm + keep-alive + read output. Mode A is unnecessary.
+- **NULL (no anomalies, 180s):** Write did not land while session was alive.
+  Ambiguous — need C2 to disambiguate.
+
+### C2 outcomes
+
+- **fire lags kill by seconds:** Model (a) — the deferred descriptor fires
+  after a delay, not synchronized with teardown. There IS a re-claim window.
+- **fire ≈ instantaneous with kill:** F≈U — fire is synchronized with the
+  unmap event. ARM→FREE→CLONE has no window to sequence through.
+- **no fire on kill:** Fire needs session state (encode-active flag, completion
+  queue) that teardown destroys. The descriptor is disarmed by cleanup.
+
+### Decision matrix
+
+```
+D-prep-2 HIT + C2 (any)
+  → Model (b) confirmed. Primitive is arm + keep-alive + continuous read.
+  → Mode A unnecessary. Skip directly to controlled write shaping.
+  → The C2 result is informational but doesn't change the path.
+
+D-prep-2 NULL + C2 fire lags kill
+  → Model (a). Stale write deferred to idle timer, not synchronized with unmap.
+  → Mode A as designed works: ARM → FREE → CLONE within the window.
+  → Clone re-claim window = (C2 fire latency - teardown time).
+
+D-prep-2 NULL + C2 fire ≈ kill
+  → F≈U. Fire is the unmap. No ARM→FREE→CLONE window exists.
+  → Pivot to keep-alive variant: don't teardown the armed session.
+  → Instead: arm → set Alpha=0 on SAME session → encode through it
+  → The stale descriptor fires into the still-mapped PTEs.
+  → Detection same as D-prep-2 (bitstream diff).
+  → This is D-prep-2 promoted to the attack, not a separate experiment.
+
+D-prep-2 NULL + C2 no fire
+  → Fire needs session state that teardown destroys.
+  → The descriptor is disarmed by cleanup (ReleaseAllDelayed).
+  → Revisit: need to find what keeps the descriptor armed.
+  → Check AVE_SetEncodeActiveState (session+0xf8) and completion queue.
+  → Possible: the descriptor fires only during active encode cycles.
+```
+
+### Panic .ips DVA interpretation (for Mode A runs)
+
+```
+DVA in PTE range 0x1c4-0x20b (coded buffer, 8 panics consistent):
+  → Stale write targeted the expected coded-output region.
+  → If clone was running: reclaim may have succeeded, check bitstream.
+  → If clone was NOT yet created: F≈U, fire came during FREE phase.
+
+DVA outside PTE range 0x1c4-0x20b:
+  → Either: fire targeted a different surface (control/status/reference)
+  → Or: Alpha=255 vs Alpha=0 changed InfoSet → different DART layout
+  → Or: bump allocator state diverged → clone's coded buffer at new DVA
+  → Fix: match Alpha exactly in clone, or use raw-IOKit CONFIGURE (sel 4)
+
+No panic at all after extended wait (>300s):
+  → Descriptor was disarmed by some cleanup path.
+  → Or: descriptor fired successfully into a valid PTE (no fault).
+  → D-prep-2 with keep-alive would have caught this (model b).
+```
