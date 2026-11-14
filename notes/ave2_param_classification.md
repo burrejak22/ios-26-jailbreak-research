@@ -237,7 +237,8 @@ DVA 0x1000082d500 PTE 0x20b AXI_ID 0xc0 — **identical to Panic #3**.
 |-----|--------|---------|
 | **A** | **Panic at 160s** | **CONFIRMED: Stale DMA descriptor fires after delayed surface release unmaps PTE** |
 | **B** | **Panic at ~78s idle, during videocodecd teardown** | **Clean encodes don't trigger via EncodeSubmit path — stale descriptor is firmware-only state, PTE invalidated via daemon teardown** |
-| C | TBD | Does explicit session close / daemon termination produce fast deterministic panic? |
+| **C1** | TBD | Client-death: app exit(0) with session NOT invalidated — XPC drop is sole trigger |
+| **C2** | TBD | Daemon-death: app holds session open, videocodecd killed externally from Mac |
 
 **Corrected mechanism (from Ghidra):** The deferral is the session lifecycle delay — how long
 until the surface manager runs its delayed release. AVE_SurfaceMgr_ReleaseDelayed calls
@@ -359,19 +360,46 @@ DART mappings are bulk-invalidated.
 - This means **the fastest attacker-controlled timing is explicit videocodecd termination**,
   not clean-encode-triggered delayed release
 
-**Next experiment: Run C — Explicit daemon termination**
-Goal: Test whether explicitly closing all AVE2 sessions (to trigger AVE_ClientClose → count==0
-→ session destroy → bulk DART unmap) produces a fast, deterministic panic.
-Protocol:
-1. Fresh reboot → canary → arm Alpha=255 → -17691
-2. Close VTCompressionSession, release all IOSurfaces
-3. Wait for videocodecd to exit (or try to kill it — may need entitlement)
-4. Measure time from session close to panic
+**Next experiments: Run C1 / C2 — Fire-control split**
 
-If Run C panics within seconds of session close, the timing IS attacker-controlled — just
-through the teardown path rather than the encode-submission path. The re-claim experiment
-(3.0) proceeds with this timing mechanism: arm → close session → spray physical pages →
-daemon teardown fires stale DMA into sprayed pages.
+Two separate tests to isolate which teardown path fires the stale descriptor:
+
+**Run C1 — Client-death (app-side only, deployable now):**
+Goal: Test the AVE_ClientClose path. App dies → XPC drop → client count zero → teardown.
+Protocol:
+1. Fresh reboot → canary → arm Alpha=255 → confirm -17691
+2. Session deliberately NOT invalidated — armed session stays alive
+3. os_log markers with token `JBPoC-RUN-C1-EXIT`, state file to ~/Documents/runc1_state.txt
+4. exit(0) — process death drops XPC connection, sole trigger
+5. Monitor: `idevicesyslog | grep JBPoC` on Mac, wall-clock panic timing from syslog
+
+Prediction: Panic within ≤10s of exit(0). The XPC drop cascades:
+videocodecd → AVE_ClientClose → client count==0 → AVE_SessionDestroy →
+AVE_SurfaceMgr_Cleanup → ReleaseDelayed → DARTUnmapSurface_TwoPhase → stale descriptor
+fires into unmapped DVA. Fast because there's no idle timeout in the path.
+
+**Run C2 — Daemon-death (needs Mac-side kill):**
+Goal: Test whether daemon death (not client death) unmaps the surface.
+Protocol:
+1. Fresh reboot → canary → arm Alpha=255 → confirm -17691
+2. Session NOT invalidated, app stays alive holding XPC connection
+3. os_log markers with token `JBPoC-RUN-C2-ARMED`, continuous timing loop
+4. From Mac: kill videocodecd via lldb (`process attach --name videocodecd; kill`)
+   or Xcode (Debug → Attach to Process → videocodecd → kill)
+5. Monitor: last os_log timestamp before panic = fire delay
+
+Prediction: Panic within ≤10s of daemon kill. launchd-driven daemon death triggers bulk
+session teardown regardless of client state. Run B's 77s was slow because app sat idle
+holding XPC connection — daemon stayed alive until launchd's idle timeout fired.
+
+**C1 fires fast + C2 fires fast** = both paths lead to the same unmap. Best case.
+**C1 fires fast + C2 no panic** = only client-death path unmaps (app controls fire).
+**C1 no panic + C2 fires fast** = only daemon-death path unmaps (need external kill).
+**Neither fires** = model needs revision; the 77-160s window is intrinsic, not idle-based.
+
+The re-claim experiment (3.0) proceeds with whichever path fires fastest: arm → trigger
+fire-control → spray checksummed IOSurfaces matching encode surface shapes → stale DMA
+writes into sprayed pages → diff all surfaces to find the write primitive.
 
 ### 2E-1. Output Buffer Diff (infoleak test) — ON-DEVICE, NO GHIDRA NEEDED
 **Goal:** Test whether the -17691 error path leaks stale firmware/kernel data to userspace.

