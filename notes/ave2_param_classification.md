@@ -712,7 +712,32 @@ can't prevent the deferred firmware DMA write.
    pointer corruption. The exploit primitive is a DMA write to a controlled VA —
    bypasses PAC entirely since it's hardware-initiated, not a code flow hijack.
 
-### Remaining Ghidra Targets
+### Remaining Ghidra Targets (priority-reranked 2026-11-14)
+
+**GATING QUESTION (do first — decides D-proper Mode A design):**
+
+0. **Which surface index does AXI_ID 0xc0 write to — external or internal?**
+   The panic DVAs cluster at PTEs 0x1c4-0x20b. External surfaces map first in
+   `AVE_CHM_DARTMapSurfaces` (indices 0-3), internal surfaces map after via
+   `DARTMapInternalSurfaces` (0x867b8d4). If the target is internal:
+   - D-prep null result is explained by construction (daemon namespace, invisible)
+   - The primitive becomes "write into driver-allocated memory" — not user-readable
+     but potentially corruption of kernel-side codec state
+   - Mode A re-claim still works but the landing zone is the clone session's internal
+     surface, and observable is behavioral not byte-diff
+
+   **Three anchors to resolve this:**
+   a. **Encode command construction** — near AVE_EncodeSubmit_WithCleanup (0x85ce220)
+      or callers of DVA accessor FUN_0x865b474 (computes `*(surface+0x98) + offset`).
+      The command embeds DVAs for input and output — which surface index feeds the
+      output/bitstream field? That's the write target.
+   b. **DARTMapInternalSurfaces contents** — decompile 0x867b8d4. What does it map,
+      what sizes? External maps first → internal DVAs land after external in the bump
+      allocator. Do panic DVAs (low in the 0x100007xxxxx range) look external or internal?
+   c. **ABORT path descriptor** — in AVE_ISR_ReceiveCommandDone (0x860587c) error branch
+      LAB_0x8606770: what DVA does the firmware write the result to for a failed command?
+      Is it the output surface or a status/control slot? A status write = small, fixed
+      format, constant-ish → corruption primitive, not data-steering.
 
 1. **The encode completion handler** — find the function that processes firmware encode
    results (interrupt handler / completion callback). Compare its success path (which
@@ -725,6 +750,36 @@ can't prevent the deferred firmware DMA write.
    determines the target DVA. This tells us how controllable the OOB write is.
 
 4. **CVE-2026-112466 OOB read path** — find the read-back mechanism for KASLR defeat.
+
+### D-proper design correction (2026-11-14)
+
+**Mode B structural issue:** App-sprayed IOSurfaces don't occupy freed dart-ave DVA slots
+unless the AVE kext maps them through a session. Bare `IOSurfaceCreate()` surfaces never
+touch the freed PTE slots — they only get dart-ave DVAs when submitted as input to a real
+encode via `AVE_CHM_DARTMapSurfaces`. Therefore:
+- Mode B must be implemented as many small encode sessions (or frames submitted into
+  sessions) with matching geometry — the spray surface has to be the input surface of a
+  real encode submission to get mapped into the same DART allocator region.
+- **Mode A (clone-session re-claim) is the primary mechanism:** on the unmap, the freed
+  slot returns to the same bump allocator. A fresh session with identical allocation
+  sequence remaps surfaces into the recycled DVA region. Evidence: panics #6/#7 show
+  same PTE 0x20b across different boots with DVAs 0x40 apart — allocator determinism is
+  strong enough to build on.
+- **Mode A design question:** which of the clone session's surfaces (input vs internal
+  output vs control) lands on the original write-target DVA? If the target is always an
+  internal surface, Mode A alone doesn't give a user-readable landing zone. This is
+  exactly Ghidra target #0 above.
+
+### Diagnostic combo: D-prep + C2 together
+
+If D-prep is null AND C2 shows fire landing within seconds of daemon kill (not tens of
+seconds), this supports an even stronger model: the unmap path itself triggers the firmware
+write (release-delayed signals firmware, firmware ACKs with a status write through the
+now-unmapped PTE). The unmap-to-write gap would be effectively zero:
+- Bad for any Mode B spray race
+- Perfectly compatible with Mode A clone-claim (fresh mapping already valid when write fires)
+- Would mean the descriptor isn't "stale from the arm" — it's "armed at teardown by the
+  teardown" — and the 160s window is pure timer latency, not race budget
 
 ---
 

