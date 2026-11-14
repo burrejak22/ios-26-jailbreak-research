@@ -380,3 +380,42 @@ ELIMINATED: log2_max_minus4 (VT rejects 12+), NumberOfSlices (VT rejects 64+),
 ChromaQPIndexOffsetMultiPPS (not settable), UserParameterSetsIds (clamped), MaxFrameDelayCount
 (ReadOnly), NumberOfTemporalLayers (clamped).
 
+## Escalation Test Plan ("Escalate" button) — COMPLETED
+
+1. **AlphaLayerID sweep** (0, 32, 62, 63, 64, 100, 200, 255): DONE — mod-64 wrapping confirmed
+2. **Dedicated MVHEVCVideoLayerIDs oracle**: DONE — no encode output (needs isolation)
+3. **RepFormatIndex + AlphaLayerID combined**: DONE — RepFormatIndex ignored in single-layer
+4. **FaceTime mode retry**: DONE — UserDPB/UserRPS rejected
+
+**Result:** Escalation sweep triggered DART panic (kernel crash). See KERNEL PANIC CONFIRMED section.
+
+## Narrow Isolation Test ("Narrow Panic" button) — REBUILT (2026-11-13)
+
+**Problem:** First Narrow test (8 presses, all AlphaLayerID-only) produced NO data — AVE2 was wedged after the Escalation sweep's DART fault. All encodes failed with -12912.
+
+**Fix applied:** Rebuilt with three critical improvements:
+
+1. **Canary encode:** Before each suspect value, encodes with AlphaLayerID=0. If canary fails → "AVE2 is wedged, reboot phone." No false data from broken encoder.
+2. **Serialization:** `g_narrowRunning` flag prevents overlapping tests from rapid button presses.
+3. **Expanded suspect list** (ordered by likelihood):
+   - AlphaLayerID=255 (largest OOB if kernel uses raw value)
+   - Alpha64+RepFmt10 combined (multi-layer mode may activate RepFormatIndex consumer)
+   - MVHEVCVideoLayerIDs=[0,100] (dedicated encode, value 100 > 63 limit)
+   - AlphaLayerID=63/200/128/64/32 (individual isolation)
+
+**Protocol:** Reboot phone → deploy → press Narrow once → wait for "CANARY OK" + suspect result → press again for next. If phone reboots, the last-printed suspect label is the trigger. Compare DVA addresses across crashes for determinism.
+
+### Narrow Test Results (2026-11-13)
+
+| # | Suspect | Result | Notes |
+|---|---------|--------|-------|
+| 1 | AlphaLayerID=255 | **ELIMINATED** — error -17691 | Hardware rejects at encode callback time (kVTParameterErr). NOT a panic trigger. |
+| 2 | Alpha64+RepFmt10 combined | ⏳ PENDING | User needs to press Narrow button |
+| 3 | MVHEVCLayerIDs=[0,100] | ⏳ PENDING | |
+| 4 | AlphaLayerID=63 | ⏳ PENDING | |
+| 5 | AlphaLayerID=200 | ⏳ PENDING | |
+| 6 | AlphaLayerID=128 | ⏳ PENDING | |
+| 7 | AlphaLayerID=64 | ⏳ PENDING | |
+| 8 | AlphaLayerID=32 | ⏳ PENDING | |
+
+**AlphaLayerID=255 analysis:** The -17691 error means the hardware encoder performs its own validation at encode time (not just at property-set time). This is AFTER VideoToolbox accepted the value (SET returned noErr) and AFTER readback confirmed it was stored. The hardware itself rejects 255 before attempting DMA. This suggests the kernel-side array access uses a DIFFERENT value than the raw property — possibly the mod-64 wrapped value from the VPS bitstream. This strengthens the hypothesis that the kernel consumer reads the VPS bitstream rather than the IOKit config struct directly.
