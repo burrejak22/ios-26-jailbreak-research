@@ -75,10 +75,15 @@ DMA write**, not synchronous with the encode error.
 | 2 | 2026-11-13 ~00:42 | AlphaLayerID=255, deferred fault | 0x100007ec500 | — | 0xc0 | unknown | **HIGH — isolated** |
 | 3 | 2026-11-13 10:34 | AlphaLayerID=255, idle-wait protocol | 0x100007ecc00 | 0x1fb | 0xc0 | ~90s | **HIGH — .ips captured** |
 | 4 | 2026-11-13 10:43 | AlphaLayerID=255, idle-wait protocol | 0x10000710080 | 0x1c4 | 0xc0 | ~130s | **HIGH — .ips captured** |
+| 5 | 2026-11-13 12:33 | AlphaLayerID=255, 2E-0 teardown test | 0x10000ed4080 | 0x3b5 | 0xc0 | TBD | **HIGH — .ips captured** |
 
-**All 4 DVAs in 0x100007xxxxx region** (~900KB span). PTE delta crashes 3 vs 4: 55 PTEs (55 pages).
-AXI_ID 0xc0 in 3 of 4 runs — likely the parameter-set/bitstream DMA channel.
-All faults are **PTE invalid exception on write** from `dart-ave` at `AppleT8110DART.cpp:2369`.
+**DVA analysis (5 panics):**
+- Panics 1-4: DVAs in `0x100007xxxxx` region (~900KB span, PTE 452-507)
+- Panic 5: DVA at `0x10000ed4080` — **PTE 949**, nearly 2x the previous PTEs
+- PTE jump (452→949) = ~500 extra pages (~8MB) — likely different DART mapping layout on fresh boot
+- AXI_ID 0xc0 in 4 of 5 runs (one 0xc1) — primary encoder write channel
+- All faults are **PTE invalid exception on write** from `dart-ave` at `AppleT8110DART.cpp:2369`
+- **DVAs are NOT deterministic** — they shift with kernel slide and heap state per boot
 
 **Deferral timing is variable** (90s and 130s post-encode) — confirms race/async trigger, not fixed timer.
 The DMA descriptor fires on some internal kernel event (flush/teardown/idle GC).
