@@ -25,6 +25,35 @@ All AXI_ID = 0xc0 (firmware DMA write channel).
 Crash site: DART hardware trap — "PTE invalid exception on write".
 Backtrace: entirely in AppleT8110DART, not AppleAVE2 driver code.
 
+| A3 (spray) | 0x1000082d1c0 | 0x20b | 0xc0 | Mode A3 spray — spray FAILED to absorb | AppleT8110DART |
+
+PTE clusters:
+- **0x20b band** (panics 3, 6, 7, 10, A3): standard arm — **5 hits**, dominant target
+- **0x1fb band** (panics 1, 8): idle-context
+- **0x3cc/0x3bc band** (A1, A2): Alpha=255 sessions — different DART mapping path
+- **0x1c4** (panic 2): outlier
+
+DVA sub-page analysis for PTE 0x20b panics:
+- 0x1000082d500 (panics 3, 6, 10): offset 0x1500 within page
+- 0x1000082d4c0 (panic 7): offset 0x14c0 within page
+- 0x1000082d1c0 (A3): offset 0x11c0 within page
+All within same 16K page (index 0x400020b). Firmware write offset varies by codec state.
+
+## Mode A3 Spray Result (2026-11-15)
+
+**SPRAY FAILED.** 20 thin (320x240 Alpha=255) + 30 fat (1920x1080 no-Alpha) sessions
+did NOT re-map PTE 0x20b. Panic still occurred at the stale page.
+
+Strong evidence for **forward-only (bump) DART allocator**: if freed pages were recycled
+via free-list, 50 spray sessions should have covered PTE 0x20b. They didn't.
+
+Implication: spray-after-free cannot cover the target. Need either:
+1. Ghidra confirmation of allocator type (DARTMapInternalSurfaces)
+2. Reverse approach: pre-allocate sessions, free specific ones to position the arm
+   session's allocation at a controlled PTE, then spray THOSE pages
+3. Alternative: exploit the deterministic PTE (0x20b) by finding what maps there
+   BEFORE the arm and racing to remap it
+
 ## C2-EK Discriminator Result (2026-11-15)
 
 **VERDICT: Fire is KEXT TIMER, not daemon-coupled. Mode A IS VIABLE.**
