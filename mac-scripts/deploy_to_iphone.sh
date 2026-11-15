@@ -151,7 +151,20 @@ cat > "$WORK/main.m" << 'OBJC'
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <AVFoundation/AVFoundation.h>
-#import <IOSurface/IOSurface.h>
+// IOSurface header unavailable in iOS SDK 27.2 — declare what we use.
+// The framework .tbd is present so -framework IOSurface links fine.
+typedef struct __IOSurface *IOSurfaceRef;
+extern uint32_t IOSurfaceGetID(IOSurfaceRef surface);
+extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
+extern size_t IOSurfaceGetPlaneCount(IOSurfaceRef surface);
+extern size_t IOSurfaceGetWidth(IOSurfaceRef surface);
+extern size_t IOSurfaceGetHeight(IOSurfaceRef surface);
+extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
+extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+extern IOSurfaceRef IOSurfaceLookup(uint32_t csid);
+extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+#define kIOSurfaceLockReadOnly 0x00000001
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <unistd.h>
