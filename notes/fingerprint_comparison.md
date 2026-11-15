@@ -99,6 +99,115 @@ This means:
 3. The bounty may still be live for this specific trigger/mechanism
 4. BUT: it could still be in the 26.7.2 "improved bounds checking" batch if Apple fixed the Alpha validation path alongside the NTL path
 
+## Ghidra Reverse Engineering: DART Allocator (2026-11-15)
+
+Binary: com.apple.driver.AppleAVE2, kext 905.40.1 (iOS 26.6.2)
+Image base: fffffe000724a7b0, 2819 functions, AARCH64 AppleSilicon
+
+### Pool Architecture (AVE_DART_Pool)
+
+Each pool is a struct with **three linked lists** and a flat buffer of 0x28-byte entries:
+
+| Offset | List | Purpose |
+|--------|------|---------|
+| +0x28 | Free | Virgin slots from pool creation (no IODMACommand yet) |
+| +0x48 | Returned | Used-and-freed slots (IODMACommand retained for reuse) |
+| +0x68 | Active | Currently mapped slots (IODMACommand in use, DMA live) |
+
+Pool entries cycle: Free → Active → Returned → Active → Returned → ...
+
+### Allocation Path (`FUN_fffffe000859084c`)
+
+**The allocator IS a free-list with recycling, NOT bump-only.**
+
+Priority order:
+1. **Returned list first** (+0x48) — reuses entry AND its IODMACommand object
+2. **Free list second** (+0x28) — creates new IODMACommand via `IODMACommand::withSpecification`
+3. **If both empty** — returns failure; caller (`FUN_fffffe0008594228`) creates a new pool
+
+Returned entries are preferred over virgin entries. The IODMACommand is retained across reuse.
+
+### Deallocation Path (`FUN_fffffe0008594630`)
+
+1. Finds which pool owns the entry (range check: `pool->buffer <= entry < pool->buffer + count * 0x28`)
+2. Unlinks entry from Active list (+0x68)
+3. Adds entry to Returned list (+0x48)
+4. **Pool pruning**: if total_count >= initial_count × 2, destroy the LAST pool whose Active list is empty
+
+### Two-Phase Unmap (`DARTUnmapSurface_TwoPhase`)
+
+1. `FUN_fffffe00086585b4` — **kernel DART PTE invalidation** (phase 1)
+2. `FUN_fffffe000865874c` × 4 — per-surface-type metadata cleanup, bitmap clear
+3. `FUN_fffffe0008658c30` — DMA completion wait
+4. `FUN_fffffe0008658eb4` — fence release
+5. Surface object release at +0x68
+
+**THE BUG MECHANISM**: Phase 1 invalidates the DART PTE, but the AVE2 firmware's DMA engine
+still holds the old DVA in its coded-output descriptor. The firmware's deferred write (~156s timer)
+fires AFTER the PTE is invalid → DART hardware trap.
+
+### Why A3 Spray Failed (Revised Understanding)
+
+The AVE2 pool-level allocator DOES recycle entries. But the spray failed because:
+- When a returned entry is reused, `IODMACommand::prepare()` asks the **kernel IOMMU** for a NEW DVA
+- The kernel DART allocator assigns DVAs sequentially (forward/bump at the IOMMU level)
+- Freed DVAs are NOT recycled by the kernel DART — they go into the TLB invalidation queue
+- So spray sessions get NEW DVAs (higher PTE indices), not the freed PTE 0x20b
+
+The two allocation layers:
+1. **AVE2 pool** (user-space facing): free-list with recycling ← confirmed by Ghidra
+2. **Kernel DART/IOMMU** (hardware facing): sequential DVA allocation ← this is what spray can't cover
+
+### Surface Classes Mapped by DARTMapInternalSurfaces
+
+`FUN_fffffe000866bd68` maps ~15+ surface categories with type IDs from `FUN_fffffe000869673c`:
+- Types 5, 6: base surfaces (2 each, with 0x110-stride multi-plane arrays of 0x11 entries)
+- Type 0xb: 30 surfaces at offset 0x508
+- Types 0xd, 0xe: 2×2 surfaces at offsets 0x6e8, 0x708
+- Types 0xf, 0x10: multi-plane (2×2×0x11 and 2×7) at offsets 0x728, 0x948
+- Type 0x11: multi-plane (2×2×0x11) at offset 0x9b8
+- Type 0x12: single surface at offset 0xbd8
+- Types 0x15-0x18: 4 surfaces each at offsets 0x1fe0-0x2060
+- Type 0x19: 2 surfaces at offset 0x2060
+- Type 0x1a: 4×16 surfaces at offset 0x2070
+- Types 0x20-0x23: 4 + 1 + 4 + 2×8 surfaces at offsets 0x2270-0x22b8
+
+Total: ~100+ surfaces per session, each getting its own DART mapping.
+This is why PTE 0x20b is deterministic — the coded-output buffer lands at a consistent index
+in the DVA allocation sequence.
+
+### Implication for Co-Tenancy (Mode A4)
+
+The co-tenancy hypothesis is STILL valid but at the IOMMU level:
+- If buddy sessions are created BEFORE the arm, their DVAs are allocated first
+- The arm's coded-output surface gets the NEXT sequential DVA
+- If a buddy's surface and the arm's surface land in the SAME 16K DART page (same PTE),
+  freeing only the arm's mapping doesn't invalidate the PTE (buddy keeps it valid)
+- Stale firmware DMA writes hit the buddy's chunk → silent corruption instead of panic
+
+The sub-page offset evidence supports this: all PTE 0x20b panics show different byte offsets
+within the same page (0x11c0, 0x14c0, 0x1500), suggesting the firmware writes to a specific
+offset within a page-aligned allocation.
+
+### Key Function Addresses
+
+| Function | Address | Role |
+|----------|---------|------|
+| DARTMapInternalSurfaces | fffffe000867b8d4 | Top-level: map all internal surfaces |
+| FUN_fffffe000866bd68 | fffffe000866bd68 | Iterator: map each surface class |
+| DARTMapSurface | fffffe00086702bc | Per-surface: lock, check, delegate |
+| AVE_DART_MapSurface_Impl | fffffe000865a84c | Per-surface: IODMACommand map |
+| AVE_IODMACommand_MapSurface | fffffe0008593a9c | IODMACommand: prepare + get DVA |
+| DARTUnmapSurface | fffffe0008670484 | Per-surface: unmap |
+| DARTUnmapSurface_TwoPhase | fffffe0008658064 | Full teardown: PTE invalidate + cleanup |
+| FUN_fffffe000865874c | fffffe000865874c | Per-surface unmap impl |
+| AVE_DART_Pool_Create | fffffe00085902bc | Pool: allocate struct + entries |
+| AVE_DART_Pool_Destroy | fffffe00085904b0 | Pool: release IODMACommands + free |
+| FUN_fffffe0008594228 | fffffe0008594228 | Pool: get entry (allocate from pool) |
+| FUN_fffffe0008594630 | fffffe0008594630 | Pool: return entry (dealloc to pool) |
+| FUN_fffffe000859084c | fffffe000859084c | Pool: try-get from single pool |
+| FUN_fffffe0008594a78 | fffffe0008594a78 | Full unmap: IODMACommand release + pool return |
+
 ## What to verify
 - Check if any of the 26.7.2 CVEs specifically mention DMA or DART (none do in the advisory text — all say "bounds checking" or "improved validation")
 - The Hcamael quartet (CVE-2026-112470/112469/112468 OOB writes + 112466 OOB read) — their "corrupt kernel memory" language could cover DART-based writes
