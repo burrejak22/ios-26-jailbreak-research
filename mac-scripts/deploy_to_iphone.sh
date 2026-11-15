@@ -4530,7 +4530,7 @@ static void runExp3_ModeA(void) {
         VTCompressionSessionEncodeFrame(baseSession, basePB, pts,
             kCMTimeInvalid, NULL, NULL, NULL);
     }
-    VTCompressionSessionCompleteEncoding(baseSession);
+    VTCompressionSessionCompleteFrames(baseSession, kCMTimeInvalid);
     [NSThread sleepForTimeInterval:1.0];
 
     int baselineCount = g_exp3SampleCount;
@@ -4596,7 +4596,7 @@ static void runExp3_ModeA(void) {
         armPTS, kCMTimeInvalid, NULL, NULL, NULL);
     INFO(@"Armed EncodeFrame submitted: %d", (int)encStatus);
 
-    VTCompressionSessionCompleteEncoding(armSession);
+    VTCompressionSessionCompleteFrames(armSession, kCMTimeInvalid);
     [NSThread sleepForTimeInterval:2.0];
 
     if (!g_exp3Armed) {
@@ -4678,11 +4678,11 @@ static void runExp3_ModeA(void) {
 
         // Flush periodically so we get outputs during the wait window
         if ((i + 1) % 5 == 0) {
-            VTCompressionSessionCompleteEncoding(cloneSession);
+            VTCompressionSessionCompleteFrames(cloneSession, kCMTimeInvalid);
             [NSThread sleepForTimeInterval:0.1];
         }
     }
-    VTCompressionSessionCompleteEncoding(cloneSession);
+    VTCompressionSessionCompleteFrames(cloneSession);
     [NSThread sleepForTimeInterval:1.0];
 
     int cloneCount = g_exp3SampleCount;
@@ -4711,7 +4711,7 @@ static void runExp3_ModeA(void) {
             VTCompressionSessionEncodeFrame(cloneSession, clonePB, pts,
                 kCMTimeInvalid, NULL, NULL, NULL);
         }
-        VTCompressionSessionCompleteEncoding(cloneSession);
+        VTCompressionSessionCompleteFrames(cloneSession);
         [NSThread sleepForTimeInterval:0.5];
 
         int newCount = g_exp3SampleCount;
