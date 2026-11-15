@@ -4682,7 +4682,7 @@ static void runExp3_ModeA(void) {
             [NSThread sleepForTimeInterval:0.1];
         }
     }
-    VTCompressionSessionCompleteFrames(cloneSession);
+    VTCompressionSessionCompleteFrames(cloneSession, kCMTimeInvalid);
     [NSThread sleepForTimeInterval:1.0];
 
     int cloneCount = g_exp3SampleCount;
@@ -4711,7 +4711,7 @@ static void runExp3_ModeA(void) {
             VTCompressionSessionEncodeFrame(cloneSession, clonePB, pts,
                 kCMTimeInvalid, NULL, NULL, NULL);
         }
-        VTCompressionSessionCompleteFrames(cloneSession);
+        VTCompressionSessionCompleteFrames(cloneSession, kCMTimeInvalid);
         [NSThread sleepForTimeInterval:0.5];
 
         int newCount = g_exp3SampleCount;
