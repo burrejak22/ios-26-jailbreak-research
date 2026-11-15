@@ -3949,6 +3949,11 @@ static void runDPrep2(void) {
         armPTS, kCMTimeInvalid, NULL, NULL, NULL);
     INFO(@"Armed encode submitted (frame 1): %d", (int)status);
 
+    // Flush the frame to hardware — without this, VT buffers it internally
+    // and the frame never reaches AVE2 firmware. Every successful arm in
+    // phase2Encode calls CompleteFrames; D-prep-2 was missing it.
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+
     // Wait for -17691
     LOG(@"Waiting for -17691 (up to 130s)...");
     for (int w = 0; w < 130; w++) {
