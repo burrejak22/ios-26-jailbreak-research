@@ -11,10 +11,34 @@
 | 7 (runB) | 0x1000082d4c0 | 0x20b | 0xc0 | teardown | AppleT8110DART |
 | 8 (runC1) | 0x100007ec500 | 0x1fb | 0xc0 | idle timer | AppleT8110DART |
 
-PTE range: {0x1c4, 0x1fb, 0x20b} — deterministic cross-boot, within coded-output buffer region.
+| A1 | ? | 0x3cc | 0xc0 | Alpha=0 clone | AppleT8110DART |
+| A2 | 0x10000ef0c00 | 0x3bc | 0xc0 | Alpha=255 clone | AppleT8110DART |
+| 10 (C2-EK) | 0x1000082d500 | 0x20b | 0xc0 | daemon killed, fire at T+155 | AppleT8110DART |
+
+PTE clusters:
+- **0x20b band** (panics 3, 6, 7, 10): standard arm — 4 hits, most common target
+- **0x1fb band** (panics 1, 8): idle-context
+- **0x3cc/0x3bc band** (A1, A2): Alpha=255 sessions — different DART mapping path
+- **0x1c4** (panic 2): outlier
+
 All AXI_ID = 0xc0 (firmware DMA write channel).
 Crash site: DART hardware trap — "PTE invalid exception on write".
 Backtrace: entirely in AppleT8110DART, not AppleAVE2 driver code.
+
+## C2-EK Discriminator Result (2026-11-15)
+
+**VERDICT: Fire is KEXT TIMER, not daemon-coupled. Mode A IS VIABLE.**
+
+Timeline:
+- ARM: 03:36:17, FREE: 03:38:19 (T+0), KILL WINDOW: T+25
+- Daemon killed between T+121 and T+155 (videocodecd: terminatedSnapshot, 16KB resident)
+- **PANIC at ~T+155** — matches ~156s fire model exactly
+
+Interpretation:
+- The ~156s fire timer is independent of videocodecd's lifecycle
+- It is a kext/firmware-level timer in the DART subsystem
+- Daemon can be dead and the fire still occurs on schedule
+- Mode A3 spray approach is viable — only PTE coverage matters
 
 ## panicIDK Panics (NumberOfTemporalLayers, iOS 27.0, kext 913.43)
 
