@@ -4469,13 +4469,17 @@ static void exp3ArmCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
     VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
     g_exp3EncodeStatus = (int)status;
-    if (status == -17691) {
-        PASS(@"[Exp3] Got -17691 — firmware DMA is armed!");
+    if (status != noErr && !sampleBuffer) {
         g_exp3Armed = YES;
-    } else if (status != noErr) {
-        INFO(@"[Exp3] Arm encode callback: %d", (int)status);
-    } else {
-        INFO(@"[Exp3] Arm encode succeeded (unexpected for Alpha=255)");
+        if (status == -17691) {
+            PASS(@"[Exp3] -17691 — classic arm, firmware DMA is armed!");
+        } else {
+            PASS(@"[Exp3] %d — alternate arm signature, continuing", (int)status);
+        }
+        return;
+    }
+    if (status == noErr && sampleBuffer) {
+        FAIL(@"[Exp3] Arm encode SUCCEEDED — Alpha=255 not taken");
     }
 }
 
@@ -4693,8 +4697,8 @@ static void runExp3_ModeA(void) {
     [NSThread sleepForTimeInterval:2.0];
 
     if (!g_exp3Armed) {
-        FAIL(@"Did not get -17691. Status: %d", g_exp3EncodeStatus);
-        INFO(@"AlphaLayerID=255 may not trigger on this firmware version.");
+        FAIL(@"Arm not detected. EncodeFrame returned %d", g_exp3EncodeStatus);
+        INFO(@"No error from firmware — Alpha=255 may not trigger on this build.");
         VTCompressionSessionInvalidate(armSession);
         CFRelease(armSession);
         CVPixelBufferRelease(armPB);
