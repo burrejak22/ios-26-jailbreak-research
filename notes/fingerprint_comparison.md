@@ -224,14 +224,61 @@ Mode A5 will confirm this with a clean, controlled test. If panic → fire escap
 pages, and adjacency-based grooming becomes the primary attack vector. If survive →
 early panics were from daemon/PM interference, not the core fire.
 
+### IODARTFamily DVA Allocator: IORangeAllocator (CONFIRMED)
+
+**Source**: Ghidra headless decompilation of IODARTFamily kext from kernelcache 23G90.
+
+The IODARTVMAllocatorGeneric class (instance vtable at 0xfffffe00081448d0) wraps an
+`IORangeAllocator` (created via `func_0xfffffe000ae0a3b0`, stored at object offset +0x48).
+
+**Allocation path** (vtable+0x80 → FUN_fffffe0009b8a90c):
+1. Calls `IORangeAllocator::allocate` (vtable+0xb0) with requested page count
+2. Returns start page index of allocated range
+3. Creates an IODARTVMSpace object to track the mapping
+4. On failure: "VM exhausted" — DVAs on a finite range, first-fit
+
+**Free path** (vtable+0x98 → FUN_fffffe0009b8aedc):
+1. Reads start page (VMSpace+0x50) and count (VMSpace+0x54) from the freed mapping
+2. Destroys the VMSpace tracking object
+3. Calls `IORangeAllocator::deallocate` (vtable+0xc0) with (startPage, pageCount)
+4. Pages return to the free pool for reuse
+
+**IORangeAllocator properties** (well-known IOKit class):
+- Sorted free-list of (start, length) ranges
+- First-fit allocation: walks the list, takes the first range >= requested size
+- Coalescing on free: merges adjacent free ranges
+- **DVAs ARE recyclable** — freed pages go back to the pool
+
+**A3 spray failure root cause CONFIRMED: Phase-2 timing hole**
+
+The spray sessions' `IORangeAllocator::allocate` calls ran BEFORE the armed session's
+Phase 2 (`IODMACommand::clearMapping` → `IODARTVMAllocatorGeneric::releaseVMSpace` →
+`IORangeAllocator::deallocate`) freed the DVA pages. The freed DVAs were still allocated
+in the range allocator when the spray ran, so the spray got fresh DVAs from the end of
+the range instead.
+
+**Fix for A3**: Force Phase-2 completion (confirmed teardown + sleep), then spray
+same-class sessions. IORangeAllocator first-fit will recycle the exact freed range.
+
+**Key function addresses (IODARTFamily)**:
+| Function | Address | Role |
+|----------|---------|------|
+| IODARTVMAllocatorGeneric::allocate | fffffe0009b8a90c | vtable+0x80: allocate via IORangeAllocator |
+| IODARTVMAllocatorGeneric::allocFromReserved | fffffe0009b8abcc | vtable+0x88: allocate from reserved range |
+| IODARTVMAllocatorGeneric::releaseVMSpace | fffffe0009b8aedc | vtable+0x98: free DVAs back to IORangeAllocator |
+| IODARTVMAllocatorGeneric::findVMSpace | fffffe0009b8e19c | vtable+0xa8: lookup VMSpace by DVA |
+| Instance vtable | fffffe00081448d0 | 32 entries, PAC-signed IA |
+| IORangeAllocator (create) | fffffe000ae0a3b0 | Kernel IOKit range allocator factory |
+
 ### Implication for Co-Tenancy (Mode A4)
 
-The co-tenancy hypothesis is STILL valid but at the IOMMU level:
-- If buddy sessions are created BEFORE the arm, their DVAs are allocated first
-- The arm's coded-output surface gets the NEXT sequential DVA
-- If a buddy's surface and the arm's surface land in the SAME 16K DART page (same PTE),
-  freeing only the arm's mapping doesn't invalidate the PTE (buddy keeps it valid)
-- Stale firmware DMA writes hit the buddy's chunk → silent corruption instead of panic
+The co-tenancy hypothesis is STILL valid but now PROVEN at the IOMMU level:
+- IORangeAllocator first-fit means freed DVAs are recycled in order
+- A victim session created AFTER teardown gets the exact freed DVA range
+- If the victim's coded-output surface reuses the armed session's DVA pages,
+  stale firmware DMA writes corrupt the victim's buffer → controlled write
+- The timing fix: ensure Phase-2 completes (IODMACommand::clearMapping finishes)
+  BEFORE creating the victim session
 
 The sub-page offset evidence supports this: all PTE 0x20b panics show different byte offsets
 within the same page (0x11c0, 0x14c0, 0x1500), suggesting the firmware writes to a specific
