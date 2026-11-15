@@ -134,17 +134,38 @@ Returned entries are preferred over virgin entries. The IODMACommand is retained
 3. Adds entry to Returned list (+0x48)
 4. **Pool pruning**: if total_count >= initial_count × 2, destroy the LAST pool whose Active list is empty
 
-### Two-Phase Unmap (`DARTUnmapSurface_TwoPhase`)
+### Two-Phase Unmap (`DARTUnmapSurface_TwoPhase`) — CORRECTED
 
-1. `FUN_fffffe00086585b4` — **kernel DART PTE invalidation** (phase 1)
-2. `FUN_fffffe000865874c` × 4 — per-surface-type metadata cleanup, bitmap clear
-3. `FUN_fffffe0008658c30` — DMA completion wait
-4. `FUN_fffffe0008658eb4` — fence release
-5. Surface object release at +0x68
+1. `FUN_fffffe00086585b4` — **kernel-shared surface release** (bit 11 of bitmap at +0xf0).
+   This is NOT the PTE invalidation — only releases a kernel mapping object at +0x80.
+2. `FUN_fffffe000865874c` × 4 — **per-surface IODMACommand::clearMapping** + pool return.
+   THIS is where DVAs are freed — calls `IODMACommand::clearMapping()` which tells the
+   kernel IOMMU to release the DVA. Then returns the pool entry to the Returned list.
+3. `FUN_fffffe0008658c30` — **DMA completion**. Checks bitmap 0xf0800 is clear (all unmapped).
+   If surfaces still mapped: logs "Surface is busy", returns -0x3f8 (INCOMPLETE).
+   If clear: calls `IODMACommand::complete()` + release on object at +0x78, clears bit 10.
+4. `FUN_fffffe0008658eb4` — **fence release**
+5. Surface object release at +0x68, clear size/state fields.
 
-**THE BUG MECHANISM**: Phase 1 invalidates the DART PTE, but the AVE2 firmware's DMA engine
-still holds the old DVA in its coded-output descriptor. The firmware's deferred write (~156s timer)
-fires AFTER the PTE is invalid → DART hardware trap.
+**CRITICAL TIMING HOLE**: Phase 2 (IODMACommand::clearMapping) is where the DVA is freed.
+If `VTCompressionSessionInvalidate` is asynchronous, or if the IOKit user-client teardown
+is deferred (e.g., JBPoC process holds the connection open), phase 2 may not have completed
+during A3's spray window. The "Surface is busy" check in phase 3 confirms that the unmap
+can fail partway through if surfaces are still in flight.
+
+**IMPLICATION FOR A3 FAILURE**: The A3 spray may have run BEFORE phase 2 freed the DVAs.
+If so, the IOMMU allocator never had PTE 0x20b's DVA in its free pool during the spray.
+This is a timing artifact, not proof of non-recycling.
+
+**THE BUG MECHANISM**: The firmware's DMA engine holds a stale DVA in its coded-output
+descriptor. The descriptor references a DVA that was valid when the encode was submitted.
+After session teardown (whenever phase 2 completes), the IOMMU frees the DVA and invalidates
+the PTE. The firmware's deferred write (~156s) fires to the now-invalid PTE → DART trap.
+
+**OPEN QUESTION**: The DVA allocator lives in IODARTFamily (separate kext in kernelcache,
+not in AppleAVE2). Historic Apple IOVM allocators DO recycle — "sequential" is unproven
+until IODARTFamily is decompiled. Needs extraction from kernelcache (72MB, at
+`firmware/23G90__iPhone18,1/kernelcache.release.iPhone18,1`).
 
 ### Why A3 Spray Failed (Revised Understanding)
 
@@ -175,6 +196,33 @@ The two allocation layers:
 Total: ~100+ surfaces per session, each getting its own DART mapping.
 This is why PTE 0x20b is deterministic — the coded-output buffer lands at a consistent index
 in the DVA allocation sequence.
+
+### Pivotal Fork: Corpus Evidence for Fire-With-Session-Alive
+
+Panics 1, 2, 8 all occurred with the session ALIVE (Run C: "Session NOT invalidated"):
+
+| Panic | PTE | Session State | Experiment |
+|-------|-----|---------------|------------|
+| 1 | 0x1fb | ALIVE | idle after arm |
+| 2 | 0x1c4 | ALIVE | idle after arm |
+| 8 | 0x1fb | ALIVE (Run C) | idle timer |
+| 3 | 0x20b | FREED | control run |
+| 6 | 0x20b | FREED | teardown |
+| 7 | 0x20b | FREED | teardown |
+| 10 | 0x20b | FREED | C2-EK |
+| A3 | 0x20b | FREED | spray |
+
+**Pattern**: session alive → PTE 0x1fb/0x1c4 (lower indices); session freed → PTE 0x20b.
+
+This suggests the fire DOES happen with the session alive, but targets DIFFERENT pages.
+Possible explanations:
+- videocodecd daemon teardown partially unmaps some surfaces while session is alive
+- Power management / screen lock causes partial DART unmap
+- The firmware writes to multiple pages; the one that's unmapped depends on session state
+
+Mode A5 will confirm this with a clean, controlled test. If panic → fire escapes session
+pages, and adjacency-based grooming becomes the primary attack vector. If survive →
+early panics were from daemon/PM interference, not the core fire.
 
 ### Implication for Co-Tenancy (Mode A4)
 
