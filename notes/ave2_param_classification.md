@@ -2215,3 +2215,188 @@ No panic at all after extended wait (>300s):
   → Or: descriptor fired successfully into a valid PTE (no fault).
   → D-prep-2 with keep-alive would have caught this (model b).
 ```
+
+---
+
+## GHIDRA Q3-Q5 ANALYSIS — MODE A VALIDATION (2026-11-14)
+
+Five targeted questions ranked by de-risk priority for Mode A. Q1-Q2 resolved in prior session,
+Q3-Q5 resolved in this session. All zero-boot-cycle (Ghidra-only) tasks.
+
+### Q1: Do internal surfaces enter the delayed-release queue? — RESOLVED (prior session)
+
+**Answer: NO.** Internal surfaces are allocated once at CONFIGURE and freed only at session
+teardown via `AVE_SurfaceMgr_Cleanup` (0xfffffe000866dc50). They never enter the delayed
+queue at `surface_mgr+0xc`. The delayed queue (`+0xc`) is for external/per-frame surfaces
+only. Internal surfaces live on the non-delayed list (`+0x8`), processed only during full
+cleanup.
+
+**Impact on Mode A:** The coded-output buffer (type 0x0b, internal) is bulk-unmapped at
+session/daemon teardown, not during encode cycle cleanup. This confirms the 90-160s
+deferral is the daemon idle-lifetime, not a per-encode timer.
+
+### Q2: Does DARTUnmapSurface_TwoPhase notify firmware? — RESOLVED (prior session)
+
+**Answer: NO.** `DARTUnmapSurface_TwoPhase` (0xfffffe0008658064) is pure kernel-side
+bookkeeping:
+- Phase 1 ("do kernel unmapping"): Releases kernel mapping via `vtable+0x28`, clears bit 11
+  of `surface+0xf0` flags
+- Phase 2 ("do DART unmapping"): Per-segment `IOMapper::iovmUnMapMemory`, clears
+  `0x10000 << segment` flag in `surface+0xf0`
+
+No MMIO writes, no doorbell, no mailbox, no firmware notification of any kind. The firmware
+has no idea its DMA target just vanished — this is the core of the exploit: the stale
+descriptor fires blind into an unmapped (or re-claimed) DVA.
+
+**Impact on Mode A:** PAC bypass is inherent — DMA writes go through DART hardware, not CPU
+pointer authentication. The firmware continues to DMA into whatever physical page backs the
+DVA slot, even after re-claim.
+
+### Q3: Does AlphaLayerID change the internal surface set? — RESOLVED
+
+**Answer: NO.** AlphaLayerID does NOT change the internal surface set. Mode A clone identity
+is SAFE.
+
+**Proof chain (Ghidra-traced):**
+
+Surface allocation happens during CONFIGURE (sel 4), NOT during per-frame encode submission.
+The CONFIGURE path:
+
+```
+IO_Prepare (0xfffffe00086a41f8) — validates input ≥ 0x1a0a0
+  → FUN_0x86a4804 — validates uc+0xd8/0x160
+    → FUN_0x8583700 — main CONFIGURE function
+      → FUN_0x8689f8c — per-session surface info calc
+        → FUN_0x867a1a8 — dispatch by encType: 1=H264, 2=HEVC, 3-6=other
+          → FUN_0x8697468 (H.264) — populates config descriptor with counts/sizes
+      → FUN_0x868a4ec — multi-session create dispatch
+        → FUN_0x867ad00 → AVE_CreateInternalSurfaces (0xfffffe00086672d4)
+      → FUN_0x857e89c — config surface pool (final step)
+```
+
+The surface count at `session+0x70` is set by the type-specific surface-info calculator
+(FUN_0x8697468 for H.264), which reads ONLY from the CONFIGURE command struct:
+- Resolution (width/height from cmd+0xa58)
+- Encode type (encType from cmd+0x3204)
+- Reference frame config (DPB parameters)
+
+AlphaLayerID is a **per-frame encode parameter** (set in the encode submission, sel 5),
+not a CONFIGURE parameter. It goes into the encode command buffer, not the surface
+allocation path.
+
+**Conclusion:** Same resolution + same encType → same `session+0x70` → same DART layout.
+A clone session with identical CONFIGURE parameters will have byte-identical internal
+surface allocation, regardless of what AlphaLayerID value the arming session used.
+
+### Q4: Where does the firmware output DMA target? — RESOLVED
+
+**Answer:** The firmware's output DMA targets the **CODED-OUTPUT buffer (type 0x0b)**, NOT
+the coded_hdr or any external surface.
+
+**DVA source:** `surface+0x98` (base DVA, offset 0). This is the DVA accessor at
+FUN_0x865b474: returns `*(surface+0x98) + offset` when bit 11 of `surface+0xf0` is set
+(DART-mapped).
+
+**Firmware metadata layout in coded-output buffer:**
+- `kva+0xa8`: frame number (u32) — firmware writes this, ISR reads it for verification
+- `kva+0xac`: coded_size (u32) — firmware writes actual encoded bitstream size
+- Bitstream data starts at approximately `+0x1270`
+- Header region: constant 0xC000 (49,152 bytes) for ALL resolutions
+
+**ISR readback chain:**
+```
+AVE_ProcessEncodeOutput (0xfffffe0008603cd8)
+  → reads surface index from frame_info+0xc6c
+  → looks up surface from session+0xef6e0 table
+  → FUN_0x869f0f8: verifies frame# at kva+0xa8, reads coded_size from kva+0xac
+  → memcpy(frame_info+0x998, kva+0x1270, 0x9400) — copies bitstream to kernel buffer
+```
+
+**Impact on Mode A:** The stale DMA write targets the coded-output buffer at its DVA base.
+The ISR's memcpy region (`dva+0x1270`, 0x9400 bytes) is the expected corruption signature
+in the re-claim surface. The re-claim IOSurface should be sized to match
+`align_up(coded_output_size, 16384)`.
+
+### Q5: 320x240 PTE Band Arithmetic — PARTIALLY RESOLVED
+
+**Answer:** The H.264 surface info calculator (FUN_0x8697468) populates the config descriptor
+with counts and sizes for all internal surface categories. The key fields:
+
+| config offset | Surface category | Count source | Size source |
+|--------------|-----------------|--------------|-------------|
+| +0xd8 | Type 0x05 (state/control) | FUN_0x854bf10 | FUN_0x854bf28 |
+| +0xdc | Type 0x05 size | — | — |
+| +0x100 | Type 0x06 (DPB/recon) count | FUN_0x854d644 | — |
+| +0x104 | Type 0x06 planes | FUN_0x854d188 | — |
+| +0x108 | Type 0x06 refs/plane | FUN_0x854d660 | — |
+| +0x10c | Type 0x06 size | — | FUN_0x854d6d8 |
+| +0x1f8 | Type 0x0b (coded output) count | FUN_0x854cc08 | — |
+| +0x1fc | Type 0x0b size | — | FUN_0x854cc48 |
+
+The DART allocation order follows the type sequence in `FUN_0x866bd68`
+(DARTMapInternalSurfaces):
+```
+0x05 → 0x06 → 0x0b → 0x0d → 0x0e → 0x0f → 0x10 → 0x11 → 0x12 →
+0x15 → 0x16 → 0x17 → 0x18 → 0x19 → 0x1a → 0x20 → 0x21 → 0x22 → 0x23
+```
+
+**Coded-output size at 320x240 (from closed-form formula):**
+```
+size = align_up(align_up(320, 32) * 240 * 3/2, 4096)
+     = align_up(320 * 240 * 3/2, 4096)
+     = align_up(115200, 4096)
+     = 118784 B
+surface_alloc = align_up(118784, 16384) = 131072 B = 8 PTEs per buffer
+```
+
+**Header:** constant 0xC000 = 49,152 B = 3 PTEs per header
+
+**Panic PTE band 0x1c4-0x20b = 72 PTEs ≈ 1,179,648 bytes.** This is consistent with
+multiple coded-output pool entries (count from `FUN_0x854cc08`, likely ≥ 2) plus neighboring
+internal surfaces (entropy, colocated MV, source neighbor tables).
+
+**Remaining:** Exact per-type counts at 320x240 require tracing ~20 helper functions. The
+practical path is D-prep-2 confirmation on device, which directly observes the DART layout
+empirically. The closed-form coded-output size (131,072 B = 8 PTEs) is the critical value
+for re-claim IOSurface sizing.
+
+### New Function Map — CONFIGURE Path (Q3-Q5 discoveries)
+
+| Address | Name/Role | Key Finding |
+|---------|-----------|-------------|
+| 0xfffffe00086a41f8 | IO_Prepare (CONFIGURE handler) | External method sel 4, validates input ≥ 0x1a0a0 |
+| 0xfffffe00086a4804 | CONFIGURE dispatch | Validates uc+0xd8/0x160, calls FUN_0x8583700 |
+| 0xfffffe0008583700 | Main CONFIGURE function | Full chain: client→pipeline→DLB→FPS→surfaces→pool |
+| 0xfffffe0008689f8c | Calculate surface info dispatch | Per-session, calls FUN_0x867a1a8 |
+| 0xfffffe000867a1a8 | Surface info type dispatch | By encType: 1=H264, 2=HEVC, 3-6=other |
+| 0xfffffe0008697468 | H.264 surface info calculator | Populates config descriptor counts/sizes |
+| 0xfffffe000868a4ec | Multi-session create dispatch | Iterates param+0x1c sessions |
+| 0xfffffe000867ad00 | CreateInternalSurfaces wrapper | Passes session+0xeed20/0xeed10/0xeed28/0xef3b8 |
+| 0xfffffe00086672d4 | AVE_CreateInternalSurfaces | Allocates all internal surface categories |
+| 0xfffffe000868a78c | Create surfaces call | Called from CONFIGURE with session+0x2d0 |
+| 0xfffffe000857e89c | Config surface pool | Last step of CONFIGURE |
+
+### Encode Preparation — Output DVA (Q4 discoveries)
+
+| Address | Name/Role | Key Finding |
+|---------|-----------|-------------|
+| 0xfffffe00085cd990 | Encode prep (HwCMap) | Iterates session+0x70 surface sets, stride 0x3bac0 |
+| 0xfffffe00086109f0 | Encode channel dispatch | Delegates to FUN_0x86105e4 |
+| 0xfffffe00086105e4 | Surface dispatch detail | Reads index from cmd+0x4afc / cmd+0x8de4 |
+| 0xfffffe0008603cd8 | AVE_ProcessEncodeOutput | Surface index at frame_info+0xc6c, table at session+0xef6e0 |
+| 0xfffffe000869f0f8 | Frame verify + size write | frame# at kva+0xa8, coded_size at kva+0xac |
+| 0xfffffe000865b474 | DVA accessor | Returns *(surface+0x98) + offset, checks bit 11 |
+| 0xfffffe000869673c | Type config table lookup | UNK_0x7e2b3b8 + type_id * 16, max type_id 0x28 |
+
+### H.264 Surface Info Helpers (Q5 discoveries)
+
+| Address | Role | Config descriptor field |
+|---------|------|----------------------|
+| 0xfffffe000854bf10 | Type 0x05 count | config+0xd8 |
+| 0xfffffe000854bf28 | Type 0x05 size | config+0xdc |
+| 0xfffffe000854d644 | Type 0x06 DPB count | config+0x100 |
+| 0xfffffe000854d188 | Type 0x06 planes/DPB | config+0x104 |
+| 0xfffffe000854d660 | Type 0x06 refs/plane | config+0x108 |
+| 0xfffffe000854d6d8 | Type 0x06 size | config+0x10c |
+| 0xfffffe000854cc08 | Type 0x0b coded count | config+0x1f8 |
+| 0xfffffe000854cc48 | Type 0x0b coded size | config+0x1fc |
