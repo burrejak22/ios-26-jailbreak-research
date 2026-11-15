@@ -3237,6 +3237,8 @@ static void runRunC2(void) {
 // If panic at ~T+156 → fire is independent kext timer → Mode A viable
 // ============================================================
 
+static void exp3Mark(NSString *phase);
+
 static void runC2EarlyKill(void) {
     if (g_phase2Running) {
         INFO(@"Phase 2 test already running");
