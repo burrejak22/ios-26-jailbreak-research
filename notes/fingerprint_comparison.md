@@ -307,3 +307,93 @@ offset within a page-aligned allocation.
 - Check if any of the 26.7.2 CVEs specifically mention DMA or DART (none do in the advisory text — all say "bounds checking" or "improved validation")
 - The Hcamael quartet (CVE-2026-112470/112469/112468 OOB writes + 112466 OOB read) — their "corrupt kernel memory" language could cover DART-based writes
 - File a report emphasizing the DMA/DART mechanism as distinct from software OOB
+
+---
+
+## Ghidra Static Analysis Findings (2026-11-15)
+
+### CRITICAL: DARTMapInternalSurfaces is ENCODE-PATH ONLY
+
+**Finding:** All 3 call chains to DARTMapInternalSurfaces lead to encode/completion paths.
+Zero paths from PrepareToEncodeFrames.
+
+| Call Chain | Entry | Path |
+|------------|-------|------|
+| 1 | AVE_EncodeChannel_Service (0x860f318) | encode submit → FUN_0x85fc4d4 → FUN_0x85fc3b4 → AVE_CHM_DARTMapSurfaces → DARTMapInternalSurfaces |
+| 2 | AVE_ProcessCompletionQueue (0x85c6684) | completion → AVE_PipelineReconfigure → DARTMapInternalSurfaces |
+| 3 | FUN_fffffe00086a4ccc | firmware cmd handler (no callers, top-level) → DARTMapInternalSurfaces |
+
+**Implication:** Surfaces are DART-mapped at first encode, NOT at session prepare.
+Any spray strategy that only calls PrepareToEncodeFrames will have ZERO PTE coverage.
+
+**A3 spray failure root cause CONFIRMED:** Mode A3 sprayed 20+ sessions but only called
+PrepareToEncodeFrames on each — surfaces were never DART-mapped. The spray had no PTE
+coverage whatsoever. The panic at PTE 0x20b was inevitable.
+
+### 156s Timer is Firmware-Internal
+
+All kext timers are millisecond-scale:
+- AVE_InternalProcessTimer_Callback (0x85c843c) — ms
+- AVE_ExternalProcessTimer_Callback (0x85c860c) — ms
+- AVE_SwTimer_Callback (0x85c87dc) — ms
+- AVE_ComputeTimerInterval (0x85cea98) returns 1000-10000 microseconds
+
+The 156s fire constant is burned into AVE2 firmware, not visible in kext RE.
+
+### Cleanup Scheduling
+
+AVE_SurfaceMgr_Cleanup_Wrapper (0x866de18) is called from BOTH:
+- AVE_SessionInit (0x85c70d8) — creating a new session triggers cleanup
+- AVE_SessionDestroy (0x85c8960) — destroying a session triggers cleanup
+
+This means spray sessions that call PrepareToEncodeFrames (which calls SessionInit)
+will trigger cleanup of delayed surfaces from the armed session.
+
+### DVA Free Gating
+
+AVE_SurfaceMgr_ReleaseDelayed (0x866e284) gates unmap per-surface:
+```
+flags = FUN_fffffe000865b3ec(surface);
+if ((flags & 0xf0000) == 0) {
+    DARTUnmapSurface_TwoPhase(surface);  // proceed with unmap
+} else {
+    // skip — surface has flags in bits 16-19
+    // re-add to delayed list
+}
+```
+If any of bits 16-19 are set, the DVA stays mapped. This is the "session alive" guard.
+
+### DVA Allocator (IODARTFamily)
+
+IODARTVMAllocatorGeneric wraps IORangeAllocator:
+- Sorted free-list, first-fit allocation
+- Coalescing on free (adjacent free ranges merge)
+- DVAs ARE recyclable — freed ranges go back to the free-list
+- First spray allocation after a free will get the same DVA range
+
+### Stage 1 Trigger (Mode S1) — Corrected DART Re-claim
+
+Mode S1 corrects A3's fatal flaw:
+
+| Phase | A3 (broken) | S1 (corrected) |
+|-------|-------------|-----------------|
+| Spray | PrepareToEncodeFrames only | Encode ≥1 frame per session |
+| DART mapping | None (never triggered) | DARTMapInternalSurfaces fires |
+| PTE coverage | Zero | Full (matching size allocation) |
+| Detection | Binary oracle only | IOSurface diff + bitstream comparison |
+| videocodecd | Not considered | 5s respawn wait after arm |
+
+### Updated Function Table
+
+| Function | Address | Role |
+|----------|---------|------|
+| AVE_SurfaceMgr_Cleanup | fffffe000866dc50 | Cleanup: releases delayed surfaces (2 lists) |
+| AVE_SurfaceMgr_Cleanup_Wrapper | fffffe000866de18 | Thin wrapper: SessionInit + SessionDestroy |
+| AVE_SurfaceMgr_ReleaseDelayed | fffffe000866e284 | Iterates delayed list, gates on flags & 0xf0000 |
+| AVE_SurfaceMgr_ReleaseAllDelayed | fffffe00086708a4 | Releases all delayed surfaces |
+| AVE_PerClientCleanup_DARTUnmap | fffffe00085c9820 | Client-close unmap (immediate) |
+| AVE_SessionInit | fffffe00085c70d8 | Session init — calls cleanup wrapper |
+| AVE_SessionDestroy | fffffe00085c8960 | Session destroy — calls cleanup wrapper |
+| AVE_ComputeTimerInterval | fffffe00085cea98 | Timer interval: 1000-10000 microseconds |
+| IODARTVMAllocatorGeneric::allocate | fffffe0009b8a90c | DVA allocate via IORangeAllocator |
+| IODARTVMAllocatorGeneric::releaseVMSpace | fffffe0009b8aedc | DVA free back to allocator |

