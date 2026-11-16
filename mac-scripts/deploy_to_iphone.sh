@@ -1598,12 +1598,14 @@ static void runTier1OOB(void) {
         return;
     }
 
+    void *y = NULL;
+    void *uv = NULL;
     if (jbLockPB(pb, 0)) {
-        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
         if (y) memset(y, 0x80,
             CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
             CVPixelBufferGetHeightOfPlane(pb, 0));
-        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
         if (uv) memset(uv, 0x80,
             CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
             CVPixelBufferGetHeightOfPlane(pb, 1));
@@ -4163,6 +4165,7 @@ static void runDPrep(void) {
              sid, w2, h2, allocSz, planeCount);
 
         // Lock and snapshot this surface
+        BOOL kept = NO;
         if (jbLockSurf(surf, kIOSurfaceLockReadOnly)) {
             void *base = IOSurfaceGetBaseAddress(surf);
             if (base && allocSz > 0 && allocSz < 4*1024*1024) {
@@ -4174,12 +4177,13 @@ static void runDPrep(void) {
                     extraSnapshots[extraCount] = snap;
                     extraSizes[extraCount] = allocSz;
                     extraCount++;
+                    kept = YES;
                 }
             }
             IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
         }
 
-        if (base == NULL || allocSz == 0) {
+        if (!kept) {
             CFRelease(surf);
         }
     }
@@ -6813,12 +6817,14 @@ static void runTier1bOOB(void) {
         return;
     }
 
+    void *y = NULL;
+    void *uv = NULL;
     if (jbLockPB(pb, 0)) {
-        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
         if (y) memset(y, 0x80,
             CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
             CVPixelBufferGetHeightOfPlane(pb, 0));
-        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
         if (uv) memset(uv, 0x80,
             CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
             CVPixelBufferGetHeightOfPlane(pb, 1));
