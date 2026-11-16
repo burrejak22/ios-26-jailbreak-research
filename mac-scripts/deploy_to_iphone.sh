@@ -315,21 +315,32 @@ static void jbRunLog(NSString *line) {
         withIntermediateDirectories:YES attributes:nil error:nil];
     FILE *f = fopen([docs stringByAppendingPathComponent:@"runlog.txt"].fileSystemRepresentation, "a");
     if (!f) { NSLog(@"jbRunLog: fopen failed"); return; }
-    fprintf(f, "%s\n", line.UTF8String);
-    fflush(f);
-    fsync(fileno(f)); // survive panic/reboot: runlog rows are evidence
-    fclose(f);
+    if (fprintf(f, "%s\n", line.UTF8String) < 0) NSLog(@"jbRunLog: fprintf failed");
+    if (fflush(f) != 0) NSLog(@"jbRunLog: fflush failed");
+    if (fsync(fileno(f)) != 0) NSLog(@"jbRunLog: fsync failed");
+    if (fclose(f) != 0) NSLog(@"jbRunLog: fclose failed");
 }
 
 static void jbSyncFile(NSString *path) {
     int fd = open(path.fileSystemRepresentation, O_RDONLY);
-    if (fd >= 0) { fsync(fd); close(fd); }
+    if (fd < 0) { NSLog(@"jbSyncFile: open failed for %@", path); return; }
+    if (fsync(fd) != 0) NSLog(@"jbSyncFile: fsync failed for %@", path);
+    close(fd);
 }
 
 static BOOL jbLockPB(CVPixelBufferRef pb, CVOptionFlags flags) {
     CVReturn r = CVPixelBufferLockBaseAddress(pb, flags);
     if (r != kCVReturnSuccess) {
         NSLog(@"CVPixelBufferLockBaseAddress failed: %d", (int)r);
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL jbLockSurf(IOSurfaceRef surf, uint32_t opts) {
+    kern_return_t kr = IOSurfaceLock(surf, opts, NULL);
+    if (kr != kIOReturnSuccess) {
+        NSLog(@"IOSurfaceLock failed: 0x%x", kr);
         return NO;
     }
     return YES;
@@ -346,8 +357,7 @@ static void armPanicJournal(NSString *label) {
     NSDictionary *stale = [NSDictionary dictionaryWithContentsOfFile:jbJournalPath()];
     // Finished journal from a prior run: if the boot changed since it ENDED,
     // the reboot may still belong to that run's deferred fault (F8).
-    NSString *priorRun = nil;
-    NSDate *priorGrace = nil;
+    NSMutableArray *priorRuns = [NSMutableArray array];
     if (stale && [stale[@"finished"] boolValue]) {
         NSString *endedBoot = stale[@"boot_at_end"] ?: stale[@"boot_id"];
         if (![endedBoot isEqualToString:jbBootID()]) {
@@ -359,11 +369,22 @@ static void armPanicJournal(NSString *label) {
         } else {
             NSDate *grace = stale[@"grace_until"] ?: [NSDate distantPast];
             if ([[NSDate date] compare:grace] == NSOrderedAscending) {
-                // F7: don't clobber attribution — the prior run's deferred-fault
-                // window is still open. Carry it inside the new journal.
-                priorRun = stale[@"label"];
-                priorGrace = grace;
-                INFO(@"Prior run '%@' grace window open until %@ — attribution carried.", priorRun, grace);
+                [priorRuns addObject:@{@"label": stale[@"label"], @"grace_until": grace}];
+                INFO(@"Prior run '%@' grace window open until %@ — attribution carried.", stale[@"label"], grace);
+            }
+            // Also carry forward any still-open prior_runs from the stale journal
+            NSArray *inherited = stale[@"prior_runs"];
+            if (!inherited) {
+                // Migrate single prior_run from older journal format
+                if (stale[@"prior_run"] && stale[@"prior_grace_until"]) {
+                    inherited = @[@{@"label": stale[@"prior_run"], @"grace_until": stale[@"prior_grace_until"]}];
+                }
+            }
+            for (NSDictionary *pr in inherited) {
+                NSDate *prGrace = pr[@"grace_until"] ?: [NSDate distantPast];
+                if ([[NSDate date] compare:prGrace] == NSOrderedAscending) {
+                    [priorRuns addObject:pr];
+                }
             }
         }
         [[NSFileManager defaultManager] removeItemAtPath:jbJournalPath() error:nil];
@@ -389,9 +410,8 @@ static void armPanicJournal(NSString *label) {
         @"started_at": [NSDate date],
         @"finished": @NO
     } mutableCopy];
-    if (priorRun) {
-        j[@"prior_run"] = priorRun;
-        j[@"prior_grace_until"] = priorGrace;
+    if ([priorRuns count] > 0) {
+        j[@"prior_runs"] = priorRuns;
     }
     if (![j writeToFile:jbJournalPath() atomically:YES])
         NSLog(@"armPanicJournal: journal write failed (path: %@)", jbJournalPath());
@@ -445,8 +465,12 @@ static void resolvePanicJournal(void) {
         PASS(@"*** REBOOT DETECTED for run '%@' — cause unconfirmed ***", j[@"label"]);
         PASS(@"    A reboot after an unfinished run proves only that the run didn't");
         PASS(@"    complete. Kernel panic is confirmed ONLY by a matching panic .ips.");
-        if (j[@"prior_run"]) {
-            PASS(@"    NOTE: completed run '%@' still had an OPEN deferred-fault grace", j[@"prior_run"]);
+        NSArray *prs = j[@"prior_runs"];
+        if (!prs && j[@"prior_run"]) {
+            prs = @[@{@"label": j[@"prior_run"]}];
+        }
+        for (NSDictionary *pr in prs) {
+            PASS(@"    NOTE: completed run '%@' still had an OPEN deferred-fault grace", pr[@"label"]);
             PASS(@"    window when this run started — either run could explain the reboot.");
         }
         PASS(@"    armed boot=%@  now=%@  build=%@",
@@ -484,35 +508,47 @@ static void jbPersistLog(void) {
         f.dateFormat = @"yyyyMMdd_HHmmss";
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         int millis = (int)((now - floor(now)) * 1000);
-        NSString *fn = [NSString stringWithFormat:@"%@/console_%@_%03d.txt",
-                        docs, [f stringFromDate:[NSDate date]], millis];
         NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *base = [NSString stringWithFormat:@"console_%@_%03d",
+                          [f stringFromDate:[NSDate date]], millis];
+        NSString *fn = [NSString stringWithFormat:@"%@/%@.txt", docs, base];
+        for (int seq = 1; [fm fileExistsAtPath:fn] && seq < 100; seq++) {
+            fn = [NSString stringWithFormat:@"%@/%@_%d.txt", docs, base, seq];
+        }
         NSString *live = [docs stringByAppendingPathComponent:@"console_live.txt"];
-        BOOL saved = NO;
+        BOOL fullCopy = NO;
         if ([fm fileExistsAtPath:live]) {
             jbSyncFile(live);
             NSError *cerr = nil;
-            saved = [fm copyItemAtPath:live toPath:fn error:&cerr];
-            if (!saved) NSLog(@"jbPersistLog: live-history copy failed: %@", cerr.localizedDescription);
+            fullCopy = [fm copyItemAtPath:live toPath:fn error:&cerr];
+            if (!fullCopy) NSLog(@"jbPersistLog: live-history copy failed: %@", cerr.localizedDescription);
         }
-        if (!saved) {
+        if (!fullCopy) {
             if ([g_logBuffer length] == 0) return;
             NSError *werr = nil;
-            saved = [g_logBuffer writeToFile:fn atomically:YES
-                                    encoding:NSUTF8StringEncoding error:&werr];
-            if (!saved) NSLog(@"jbPersistLog: fallback write failed: %@", werr.localizedDescription);
-        }
-        if (!saved) {
-            NSLog(@"jbPersistLog: both saves failed — live log preserved");
+            BOOL bufSaved = [g_logBuffer writeToFile:fn atomically:YES
+                                            encoding:NSUTF8StringEncoding error:&werr];
+            if (!bufSaved) {
+                NSLog(@"jbPersistLog: both saves failed — live log preserved");
+                return;
+            }
+            NSLog(@"jbPersistLog: saved capped buffer only — live log preserved (older entries intact)");
             return;
         }
+        BOOL rotateOK = YES;
         if (g_liveLog) {
-            fflush(g_liveLog); fsync(fileno(g_liveLog));
-            fclose(g_liveLog); g_liveLog = NULL;
+            if (fflush(g_liveLog) != 0) rotateOK = NO;
+            if (fsync(fileno(g_liveLog)) != 0) rotateOK = NO;
+            if (fclose(g_liveLog) != 0) rotateOK = NO;
+            g_liveLog = NULL;
         }
-        FILE *r5tf = fopen(live.fileSystemRepresentation, "w");
-        if (r5tf) fclose(r5tf);
-        else NSLog(@"jbPersistLog: live truncate failed");
+        if (rotateOK) {
+            FILE *r5tf = fopen(live.fileSystemRepresentation, "w");
+            if (r5tf) fclose(r5tf);
+            else NSLog(@"jbPersistLog: live truncate failed");
+        } else {
+            NSLog(@"jbPersistLog: rotation flush/close failed — live log not truncated");
+        }
     });
 }
 
@@ -3998,7 +4034,12 @@ static void runDPrep(void) {
     }
 
     // Snapshot the input surface BEFORE arming
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (!jbLockPB(pb, kCVPixelBufferLock_ReadOnly)) {
+        FAIL(@"snapshot lock failed");
+        CVPixelBufferRelease(pb);
+        g_phase2Running = NO;
+        return;
+    }
     size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
     size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
     size_t ySize = yH * yBpr;
@@ -4122,20 +4163,21 @@ static void runDPrep(void) {
              sid, w2, h2, allocSz, planeCount);
 
         // Lock and snapshot this surface
-        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
-        void *base = IOSurfaceGetBaseAddress(surf);
-        if (base && allocSz > 0 && allocSz < 4*1024*1024) {
-            uint8_t *snap = (uint8_t *)malloc(allocSz);
-            if (snap) {
-                memcpy(snap, base, allocSz);
-                extraSurfs[extraCount] = surf;
-                extraSurfIDs[extraCount] = sid;
-                extraSnapshots[extraCount] = snap;
-                extraSizes[extraCount] = allocSz;
-                extraCount++;
+        if (jbLockSurf(surf, kIOSurfaceLockReadOnly)) {
+            void *base = IOSurfaceGetBaseAddress(surf);
+            if (base && allocSz > 0 && allocSz < 4*1024*1024) {
+                uint8_t *snap = (uint8_t *)malloc(allocSz);
+                if (snap) {
+                    memcpy(snap, base, allocSz);
+                    extraSurfs[extraCount] = surf;
+                    extraSurfIDs[extraCount] = sid;
+                    extraSnapshots[extraCount] = snap;
+                    extraSizes[extraCount] = allocSz;
+                    extraCount++;
+                }
             }
+            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
         }
-        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 
         if (base == NULL || allocSz == 0) {
             CFRelease(surf);
@@ -4177,30 +4219,32 @@ static void runDPrep(void) {
 
     // Re-snapshot input surface AFTER encode submission (firmware may have modified it)
     LOG(@"Re-snapshotting input surface post-encode...");
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    uint8_t *postY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    uint8_t *postUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    int prePostDiffs = 0;
-    for (size_t i = 0; i < ySize; i++) {
-        if (postY[i] != snapshot[i]) prePostDiffs++;
-    }
-    for (size_t i = 0; i < uvSize; i++) {
-        if (postUV[i] != snapshot[ySize + i]) prePostDiffs++;
-    }
-    if (prePostDiffs > 0) {
-        PASS(@"Input surface already modified by encode! %d bytes differ pre→post-arm", prePostDiffs);
-        os_log(dLog, "JBPoC-DPREP-PRE-POST-DIFF %d", prePostDiffs);
+    if (jbLockPB(pb, kCVPixelBufferLock_ReadOnly)) {
+        uint8_t *postY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        uint8_t *postUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        int prePostDiffs = 0;
+        for (size_t i = 0; i < ySize; i++) {
+            if (postY && postY[i] != snapshot[i]) prePostDiffs++;
+        }
+        for (size_t i = 0; i < uvSize; i++) {
+            if (postUV && postUV[i] != snapshot[ySize + i]) prePostDiffs++;
+        }
+        if (prePostDiffs > 0) {
+            PASS(@"Input surface already modified by encode! %d bytes differ pre→post-arm", prePostDiffs);
+            os_log(dLog, "JBPoC-DPREP-PRE-POST-DIFF %d", prePostDiffs);
+        } else {
+            INFO(@"Input surface unchanged by encode submission.");
+        }
+        if (postY) memcpy(snapshot, postY, ySize);
+        if (postUV) memcpy(snapshot + ySize, postUV, uvSize);
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     } else {
-        INFO(@"Input surface unchanged by encode submission.");
+        INFO(@"Post-encode lock failed — using pre-encode baseline");
     }
-    // Use post-encode state as the baseline for the readout loop
-    memcpy(snapshot, postY, ySize);
-    memcpy(snapshot + ySize, postUV, uvSize);
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 
     // Also re-snapshot all extra surfaces post-encode
     for (int si = 0; si < extraCount; si++) {
-        IOSurfaceLock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+        if (!jbLockSurf(extraSurfs[si], kIOSurfaceLockReadOnly)) continue;
         uint8_t *curExtra = (uint8_t *)IOSurfaceGetBaseAddress(extraSurfs[si]);
         if (curExtra) {
             int eDiffs = 0;
@@ -4287,15 +4331,16 @@ static void runDPrep(void) {
                    elapsed, yDiffs, uvDiffs, firstYOff, firstUVOff);
 
             // Dump first 64 changed bytes for analysis
-            if (yDiffs > 0) {
-                CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            if (yDiffs > 0 && jbLockPB(pb, kCVPixelBufferLock_ReadOnly)) {
                 uint8_t *dumpY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
                 NSMutableString *hex = [NSMutableString string];
                 int dumped = 0;
-                for (size_t i = (size_t)firstYOff; i < ySize && dumped < 64; i++) {
-                    if (dumpY[i] != snapshot[i]) {
-                        [hex appendFormat:@"%04zx:%02x→%02x ", i, snapshot[i], dumpY[i]];
-                        dumped++;
+                if (dumpY) {
+                    for (size_t i = (size_t)firstYOff; i < ySize && dumped < 64; i++) {
+                        if (dumpY[i] != snapshot[i]) {
+                            [hex appendFormat:@"%04zx:%02x→%02x ", i, snapshot[i], dumpY[i]];
+                            dumped++;
+                        }
                     }
                 }
                 CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
@@ -4303,16 +4348,19 @@ static void runDPrep(void) {
             }
 
             // Update snapshot to track incremental changes
-            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-            memcpy(snapshot, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
-            memcpy(snapshot + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
-            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            if (jbLockPB(pb, kCVPixelBufferLock_ReadOnly)) {
+                void *yP = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+                void *uvP = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+                if (yP) memcpy(snapshot, yP, ySize);
+                if (uvP) memcpy(snapshot + ySize, uvP, uvSize);
+                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            }
 
         }
 
         // Also diff extra IOSurfaces (output/reference surfaces)
         for (int si = 0; si < extraCount; si++) {
-            IOSurfaceLock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+            if (!jbLockSurf(extraSurfs[si], kIOSurfaceLockReadOnly)) continue;
             uint8_t *curExtra = (uint8_t *)IOSurfaceGetBaseAddress(extraSurfs[si]);
             if (curExtra) {
                 int eDiffs = 0;
@@ -4844,20 +4892,23 @@ static void runDPrep2(void) {
     #define DPREP2_TEST_START_S   60
 
     // Snapshot input surface for input-side monitoring
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-    size_t yH = CVPixelBufferGetHeightOfPlane(pb, 0);
-    size_t ySize = yH * yBpr;
-    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-    size_t uvH2 = CVPixelBufferGetHeightOfPlane(pb, 1);
-    size_t uvSize = uvH2 * uvBpr;
-    size_t inputSize = ySize + uvSize;
-    uint8_t *inputSnap = (uint8_t *)malloc(inputSize);
-    if (inputSnap) {
-        memcpy(inputSnap, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
-        memcpy(inputSnap + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
+    size_t yBpr = 0, yH = 0, ySize = 0, uvBpr = 0, uvH2 = 0, uvSize = 0, inputSize = 0;
+    uint8_t *inputSnap = NULL;
+    if (jbLockPB(pb, kCVPixelBufferLock_ReadOnly)) {
+        yBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        yH = CVPixelBufferGetHeightOfPlane(pb, 0);
+        ySize = yH * yBpr;
+        uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        uvH2 = CVPixelBufferGetHeightOfPlane(pb, 1);
+        uvSize = uvH2 * uvBpr;
+        inputSize = ySize + uvSize;
+        inputSnap = (uint8_t *)malloc(inputSize);
+        if (inputSnap) {
+            memcpy(inputSnap, CVPixelBufferGetBaseAddressOfPlane(pb, 0), ySize);
+            memcpy(inputSnap + ySize, CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvSize);
+        }
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     }
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 
     // 48 ticks * 5s = 240s total readout window
     for (int tick = 1; tick <= 48; tick++) {
@@ -5065,8 +5116,7 @@ static void runDPrep2(void) {
         }
 
         // Check input surface
-        if (inputSnap) {
-            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        if (inputSnap && jbLockPB(pb, kCVPixelBufferLock_ReadOnly)) {
             uint8_t *curY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
             uint8_t *curUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
             int inDiffs = 0;
@@ -6357,8 +6407,8 @@ static void runStage1_DartRead(void) {
         spraySnapshots[i] = NULL;
         spraySizes[i] = 0;
         if (!sprayPBs[i]) continue;
+        if (!jbLockPB(sprayPBs[i], kCVPixelBufferLock_ReadOnly)) continue;
 
-        CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
         size_t yH = CVPixelBufferGetHeightOfPlane(sprayPBs[i], 0);
         size_t yBPR = CVPixelBufferGetBytesPerRowOfPlane(sprayPBs[i], 0);
         size_t uvH = CVPixelBufferGetHeightOfPlane(sprayPBs[i], 1);
@@ -6416,7 +6466,10 @@ static void runStage1_DartRead(void) {
             continue;
         }
 
-        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+        if (!jbLockSurf(surf, kIOSurfaceLockReadOnly)) {
+            CFRelease(surf);
+            continue;
+        }
         void *base = IOSurfaceGetBaseAddress(surf);
         BOOL stored = NO;
         if (base) {
@@ -6467,7 +6520,7 @@ static void runStage1_DartRead(void) {
         // Channel A: diff spray input surfaces
         for (int i = 0; i < sprayOK; i++) {
             if (!sprayPBs[i] || !spraySnapshots[i]) continue;
-            CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+            if (!jbLockPB(sprayPBs[i], kCVPixelBufferLock_ReadOnly)) continue;
             uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
             size_t yH = CVPixelBufferGetHeightOfPlane(sprayPBs[i], 0);
             size_t yBPR = CVPixelBufferGetBytesPerRowOfPlane(sprayPBs[i], 0);
@@ -6491,42 +6544,45 @@ static void runStage1_DartRead(void) {
                 os_log(sLog, "STAGE1 SPRAY-HIT session=%d T+%d diffs=%d first=0x%x",
                        i, elapsed, diffs, firstOff);
 
-                CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
-                uint8_t *cur = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
-                NSMutableString *hex = [NSMutableString string];
-                int dumped = 0;
-                for (size_t b = (size_t)firstOff; b < MIN(yTotal, spraySizes[i]) && dumped < 128; b++) {
-                    if (cur && cur[b] != spraySnapshots[i][b]) {
-                        [hex appendFormat:@"%04zx:%02x→%02x ", b, spraySnapshots[i][b], cur[b]];
-                        dumped++;
+                if (jbLockPB(sprayPBs[i], kCVPixelBufferLock_ReadOnly)) {
+                    uint8_t *cur = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+                    NSMutableString *hex = [NSMutableString string];
+                    int dumped = 0;
+                    for (size_t b = (size_t)firstOff; b < MIN(yTotal, spraySizes[i]) && dumped < 128; b++) {
+                        if (cur && cur[b] != spraySnapshots[i][b]) {
+                            [hex appendFormat:@"%04zx:%02x→%02x ", b, spraySnapshots[i][b], cur[b]];
+                            dumped++;
+                        }
                     }
+                    CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                    LOG(@"  Diff: %@", hex);
                 }
-                CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
-                LOG(@"  Diff: %@", hex);
 
-                CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
-                uint8_t *dumpBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
-                if (dumpBase) {
-                    NSData *dumpData = [NSData dataWithBytes:dumpBase length:yTotal];
-                    NSString *dumpPath = [NSHomeDirectory()
-                        stringByAppendingPathComponent:
-                        [NSString stringWithFormat:@"Documents/s1_hit_spray%d_T%d.bin", i, elapsed]];
-                    [dumpData writeToFile:dumpPath atomically:YES];
-                    LOG(@"  Full dump: %@ (%zu bytes)", dumpPath, yTotal);
-                    hitDump = dumpPath;
+                if (jbLockPB(sprayPBs[i], kCVPixelBufferLock_ReadOnly)) {
+                    uint8_t *dumpBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+                    if (dumpBase) {
+                        NSData *dumpData = [NSData dataWithBytes:dumpBase length:yTotal];
+                        NSString *dumpPath = [NSHomeDirectory()
+                            stringByAppendingPathComponent:
+                            [NSString stringWithFormat:@"Documents/s1_hit_spray%d_T%d.bin", i, elapsed]];
+                        [dumpData writeToFile:dumpPath atomically:YES];
+                        LOG(@"  Full dump: %@ (%zu bytes)", dumpPath, yTotal);
+                        hitDump = dumpPath;
+                    }
+                    CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
                 }
-                CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
 
-                CVPixelBufferLockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
-                uint8_t *updY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
-                if (updY) memcpy(spraySnapshots[i], updY, MIN(yTotal, spraySizes[i]));
-                CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                if (jbLockPB(sprayPBs[i], kCVPixelBufferLock_ReadOnly)) {
+                    uint8_t *updY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sprayPBs[i], 0);
+                    if (updY) memcpy(spraySnapshots[i], updY, MIN(yTotal, spraySizes[i]));
+                    CVPixelBufferUnlockBaseAddress(sprayPBs[i], kCVPixelBufferLock_ReadOnly);
+                }
             }
         }
 
         // Channel B: diff extra IOSurfaces
         for (int si = 0; si < extraCount; si++) {
-            IOSurfaceLock(extraSurfs[si], kIOSurfaceLockReadOnly, NULL);
+            if (!jbLockSurf(extraSurfs[si], kIOSurfaceLockReadOnly)) continue;
             uint8_t *cur = (uint8_t *)IOSurfaceGetBaseAddress(extraSurfs[si]);
             if (cur) {
                 int eDiffs = 0;
